@@ -1,12 +1,27 @@
 import { test, expect } from '@playwright/test'
 
+async function completeOnboarding(page:any){
+  await expect(page.getByRole('heading',{name:"Let's build your learning profile"})).toBeVisible()
+  for(const answer of ['IELTS','intermediate','7.0','2027-12-15','8','writing and speaking']){
+    await page.getByRole('textbox',{name:'Your reply'}).fill(answer)
+    await page.getByRole('button',{name:'Send reply'}).click()
+    if(answer!=='writing and speaking')await expect(page.getByRole('textbox',{name:'Your reply'})).toHaveValue('')
+  }
+  await page.getByRole('button',{name:'Confirm profile and create portrait'}).click()
+  await expect(page.getByText(/Demo starting portrait/)).toBeVisible()
+  await page.getByRole('link',{name:'Go to dashboard'}).click()
+}
+
 test('learner plan, verified writing and held instructor review',async({page})=>{
   const email=`learner${Date.now()}@example.com`
   await page.goto('/')
+  await expect(page.getByRole('heading',{name:'Welcome back'})).toBeVisible()
+  await page.getByRole('button',{name:'Sign up'}).click()
   await page.getByLabel('Full name').fill('Browser Learner')
   await page.getByLabel('Email').fill(email)
   await page.getByLabel('Password').fill('Example123!')
   await page.getByRole('button',{name:'Create account',exact:true}).last().click()
+  await completeOnboarding(page)
   await expect(page.getByText('Good to see you, Browser.')).toBeVisible()
   await page.screenshot({path:'test-results/dashboard.png',fullPage:true})
   await page.getByRole('link',{name:'Learning plan'}).click()
@@ -17,8 +32,17 @@ test('learner plan, verified writing and held instructor review',async({page})=>
   await expect(page.getByText('IELTS revised plan')).toBeVisible()
   await page.getByRole('button',{name:'Accept plan'}).click()
   await expect(page.getByText('Active',{exact:true})).toBeVisible()
-  await page.getByRole('link',{name:'Writing',exact:true}).click()
-  await page.getByRole('button',{name:'Generate task'}).click()
+  await page.getByRole('link',{name:'Knowledge graph'}).click()
+  await expect(page.getByRole('heading',{name:'Knowledge graph'})).toBeVisible()
+  await page.getByRole('button',{name:'Show Writing'}).click()
+  await expect(page.getByText('Verified score:')).toBeVisible()
+  await page.getByRole('link',{name:'Question bank'}).click()
+  await expect(page.getByText('Official sample link').first()).toBeVisible()
+  await page.getByLabel('Task topic').fill('public libraries')
+  await page.getByRole('button',{name:'Generate',exact:true}).click()
+  await expect(page.getByText('Demo generated')).toBeVisible()
+  await page.locator('article').filter({hasText:'Demo generated'}).getByRole('button',{name:'Start practice'}).click()
+  await expect(page.getByText('Public Libraries — writing practice')).toBeVisible()
   await page.getByLabel('Essay editor').fill('Remote work saves commuting time. For example, a consultant can use that extra hour to provide more thoughtful advice to clients. Clear communication routines also support teamwork.')
   await page.getByRole('button',{name:'Submit for quality check'}).click()
   await expect(page.getByText('Verified result')).toBeVisible()
@@ -27,11 +51,18 @@ test('learner plan, verified writing and held instructor review',async({page})=>
   await expect(page.getByText('Quality review in progress')).toBeVisible()
   await page.getByRole('link',{name:'Agent activity'}).click()
   await expect(page.getByText('Quality Manager').first()).toBeVisible()
+  await page.getByRole('link',{name:'Mock examination'}).click()
+  await page.getByRole('button',{name:'Start reduced mock'}).click()
+  await expect(page.getByText('Unofficial computer-style practice')).toBeVisible()
+  await page.screenshot({path:'test-results/mock-interface.png',fullPage:true})
+  await page.getByRole('textbox',{name:'Question 1 of 1'}).fill('The workshop is at ten.')
+  await page.getByRole('button',{name:'Save answer'}).click()
+  await page.getByRole('button',{name:'Next'}).click()
+  await expect(page.getByText('Section 2')).toBeVisible()
 })
 
 test('instructor sees seeded escalation and quality operations',async({page})=>{
   await page.goto('/')
-  await page.getByRole('button',{name:'Sign in'}).click()
   await page.getByLabel('Email').fill('instructor@example.com')
   await page.getByLabel('Password').fill('ChangeMe123!')
   await page.getByRole('button',{name:'Sign in'}).last().click()
@@ -49,13 +80,13 @@ test('instructor sees seeded escalation and quality operations',async({page})=>{
 test('learner recovers an account with the demo reset link',async({page})=>{
   const email=`recover${Date.now()}@example.com`
   await page.goto('/')
+  await page.getByRole('button',{name:'Sign up'}).click()
   await page.getByLabel('Full name').fill('Recovery Learner')
   await page.getByLabel('Email').fill(email)
   await page.getByLabel('Password').fill('Example123!')
   await page.getByRole('button',{name:'Create account',exact:true}).last().click()
-  await expect(page.getByText('Good to see you, Recovery.')).toBeVisible()
+  await expect(page.getByRole('heading',{name:"Let's build your learning profile"})).toBeVisible()
   await page.getByRole('button',{name:'Sign out'}).click()
-  await page.getByRole('button',{name:'Sign in',exact:true}).first().click()
   await page.getByRole('button',{name:'Forgot password?'}).click()
   await page.getByLabel('Email').fill(email)
   await page.getByRole('button',{name:'Send reset link'}).click()
@@ -67,5 +98,5 @@ test('learner recovers an account with the demo reset link',async({page})=>{
   await page.getByLabel('Email').fill(email)
   await page.getByLabel('Password').fill('NewPassword123!')
   await page.getByRole('button',{name:'Sign in',exact:true}).last().click()
-  await expect(page.getByText('Good to see you, Recovery.')).toBeVisible()
+  await expect(page.getByRole('heading',{name:"Let's build your learning profile"})).toBeVisible()
 })

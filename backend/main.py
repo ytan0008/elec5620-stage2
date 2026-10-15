@@ -12,9 +12,11 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput
+from backend.models import User, PasswordReset, Profile, OnboardingSession, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
+from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
+from backend.knowledge import build_graph
 from backend.agents import AgentRuntime
 from backend.seed import seed
 
@@ -106,10 +108,12 @@ def register(data: RegisterInput, db: Session = Depends(get_db)):
     user = User(email=data.email.lower(), name=data.name, password_hash=hash_password(data.password), role="learner")
     db.add(user)
     db.flush()
-    db.add(Profile(user_id=user.id, **data.model_dump(exclude={"email", "name", "password"}, mode="json")))
-    db.add(AuditLog(user_id=user.id, action="registered", detail={"exam": data.exam}))
+    profile_input = data.model_dump(exclude={"email", "name", "password"}, exclude_none=True, mode="json")
+    if profile_input:
+        db.add(Profile(user_id=user.id, **profile_input))
+    db.add(AuditLog(user_id=user.id, action="registered", detail={"profile_complete": bool(profile_input)}))
     db.commit()
-    return {"token": token_for(user), "user": dto(user, "id", "email", "name", "role")}
+    return {"token": token_for(user), "user": {**dto(user, "id", "email", "name", "role"), "profile_complete": bool(profile_input)}}
 
 
 @app.post("/api/auth/login")
@@ -117,7 +121,8 @@ def login(data: LoginInput, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == data.email.lower()))
     if not user or not hasher.verify(data.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
-    return {"token": token_for(user), "user": dto(user, "id", "email", "name", "role")}
+    complete = user.role == "instructor" or bool(db.scalar(select(Profile.id).where(Profile.user_id == user.id)))
+    return {"token": token_for(user), "user": {**dto(user, "id", "email", "name", "role"), "profile_complete": complete}}
 
 
 @app.post("/api/auth/password-reset/request")
@@ -170,9 +175,99 @@ def me(user: User = Depends(current_user)):
     return dto(user, "id", "email", "name", "role")
 
 
+@app.get("/api/onboarding")
+def onboarding_state(user: User = Depends(learner), db: Session = Depends(get_db)):
+    session = db.scalar(select(OnboardingSession).where(OnboardingSession.user_id == user.id))
+    profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    draft = profile_data(profile) if profile else (session.draft if session else {})
+    missing = next_field(draft)
+    return {"draft": draft, "messages": session.messages if session else [], "ready": missing is None, "completed": bool(profile), "next_field": missing, "assistant_message": ONBOARDING_QUESTIONS[missing] if missing else "Your profile is ready. Review it and confirm to create your learning portrait.", "mode": "DEMO" if settings().demo_mode else "REAL"}
+
+
+@app.post("/api/onboarding/message")
+def onboarding_message(data: OnboardingTurn, user: User = Depends(learner), db: Session = Depends(get_db)):
+    if db.scalar(select(Profile.id).where(Profile.user_id == user.id)):
+        raise HTTPException(409, "Profile already exists; edit it from My profile")
+    session = db.scalar(select(OnboardingSession).where(OnboardingSession.user_id == user.id))
+    if not session:
+        session = OnboardingSession(user_id=user.id, messages=[], draft={})
+        db.add(session)
+        db.flush()
+    runtime = AgentRuntime(db)
+    extracted = runtime.provider.extract_onboarding(data.message, session.draft).model_dump(exclude_none=True)
+    draft, errors = clean_extraction(extracted, session.draft)
+    missing = next_field(draft)
+    if missing is None:
+        try:
+            ProfileInput.model_validate(draft)
+        except Exception:
+            draft.pop("target_score", None)
+            missing = "target_score"
+            errors.append("Target score does not match the selected exam")
+    reply = ("I couldn't use that detail: " + "; ".join(errors) + ". " if errors else "") + (ONBOARDING_QUESTIONS[missing] if missing else "I have enough to build your starting profile. Review the details and confirm when ready.")
+    session.draft = draft
+    session.messages = (session.messages or [])[-48:] + [{"role": "learner", "text": data.message}, {"role": "assistant", "text": reply}]
+    db.add(AgentEvent(user_id=user.id, workflow="onboarding", agent="Learning Coordinator", phase="decision", detail={"captured_fields": list(extracted), "next_field": missing, "tool": "shared LLM adapter"}, mode=runtime.provider.mode))
+    db.commit()
+    return {"draft": draft, "messages": session.messages, "ready": missing is None, "completed": False, "next_field": missing, "assistant_message": reply, "mode": runtime.provider.mode}
+
+
+@app.post("/api/onboarding/confirm")
+def confirm_onboarding(user: User = Depends(learner), db: Session = Depends(get_db)):
+    if db.scalar(select(Profile.id).where(Profile.user_id == user.id)):
+        raise HTTPException(409, "Profile already exists")
+    session = db.scalar(select(OnboardingSession).where(OnboardingSession.user_id == user.id))
+    if not session:
+        raise HTTPException(409, "Complete the assistant interview first")
+    try:
+        profile_input = ProfileInput.model_validate(session.draft)
+    except Exception:
+        raise HTTPException(409, "Profile interview is incomplete or invalid")
+    profile = Profile(user_id=user.id, **profile_input.model_dump(mode="json"))
+    db.add(profile)
+    package = create_portrait(db, user, profile)
+    session.completed = True
+    db.add(AuditLog(user_id=user.id, action="onboarding_confirmed", detail={"portrait_package_id": package.id}))
+    db.commit()
+    return {"profile": profile_data(profile), "portrait": package_view(package)}
+
+
+def create_portrait(db: Session, user: User, profile: Profile) -> ResultPackage:
+    runtime = AgentRuntime(db)
+    try:
+        portrait = runtime.provider.portrait(profile_data(profile)).model_dump()
+    except Exception as exc:
+        portrait = {"summary": "Portrait generation requires review", "confidence": {}, "error_type": type(exc).__name__}
+    package = runtime.verify_output(user.id, "portrait", portrait)
+    db.add(LearnerPortrait(user_id=user.id, package_id=package.id, content=portrait))
+    db.add(AgentEvent(user_id=user.id, workflow="portrait", agent="Learning Coordinator", phase="handoff", detail={"decision": "submit learner portrait", "next_agent": "Quality Manager", "package_id": package.id}, mode=runtime.provider.mode))
+    return package
+
+
+@app.get("/api/portrait")
+def get_portrait(user: User = Depends(learner), db: Session = Depends(get_db)):
+    portrait = db.scalar(select(LearnerPortrait).where(LearnerPortrait.user_id == user.id).order_by(LearnerPortrait.id.desc()))
+    return package_view(db.get(ResultPackage, portrait.package_id)) if portrait else None
+
+
+@app.post("/api/portrait/generate")
+def generate_portrait(user: User = Depends(learner), db: Session = Depends(get_db)):
+    profile = profile_for(db, user)
+    package = create_portrait(db, user, profile)
+    db.commit()
+    return package_view(package)
+
+
 @app.get("/api/profile")
 def get_profile(user: User = Depends(learner), db: Session = Depends(get_db)):
     return profile_data(profile_for(db, user))
+
+
+@app.get("/api/knowledge-graph")
+def knowledge_graph(user: User = Depends(learner), db: Session = Depends(get_db)):
+    profile = profile_for(db, user)
+    counts = {skill: db.scalar(select(func.count()).select_from(Material).where(Material.exam == profile.exam, Material.skill == skill)) for skill in ("listening", "reading", "writing", "speaking")}
+    return build_graph(profile_data(profile), latest_progress(db, user.id), counts)
 
 
 @app.put("/api/profile")
@@ -260,19 +355,72 @@ def complete_task(task_id: int, user: User = Depends(learner), db: Session = Dep
     return {"complete": True}
 
 
+def question_view(item: QuestionItem, db: Session) -> dict:
+    package = db.get(ResultPackage, item.package_id) if item.package_id else None
+    available = not package or package.state == "RELEASED"
+    return {"id": item.id, "exam": item.exam, "skill": item.skill, "task_type": item.task_type, "title": item.title,
+            "prompt": item.prompt if available else None, "topic": item.topic, "source_kind": item.source_kind,
+            "source_url": item.source_url, "available": available, "verification_state": package.state if package else "CURATED"}
+
+
+@app.get("/api/questions")
+def questions(exam: str = "IELTS", skill: str | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
+    if exam != "IELTS":
+        raise HTTPException(400, "This catalog currently contains IELTS resources only")
+    if skill and skill not in ("writing", "speaking", "reading", "listening"):
+        raise HTTPException(400, "Unknown skill")
+    query = select(QuestionItem).where(QuestionItem.exam == exam)
+    if skill:
+        query = query.where(QuestionItem.skill == skill)
+    items = db.scalars(query.order_by(QuestionItem.id)).all()
+    return [question_view(item, db) for item in items if item.user_id is None or item.user_id == user.id]
+
+
+@app.post("/api/questions/generate")
+def generate_question(data: QuestionGenerationInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    profile = profile_for(db, user)
+    if profile.exam != "IELTS":
+        raise HTTPException(409, "IELTS question generation requires an IELTS profile")
+    runtime = AgentRuntime(db)
+    try:
+        output = runtime.provider.generate_question("IELTS", data.skill, data.topic).model_dump()
+    except Exception as exc:
+        output = {"title": "Question requires review", "confidence": {}, "error_type": type(exc).__name__}
+    package = runtime.verify_output(user.id, "question", output)
+    item = QuestionItem(user_id=user.id, exam="IELTS", skill=data.skill, task_type=output.get("task_type", "Generated task"), title=output.get("title", "Question under review"), prompt=output.get("prompt"), answer_key=None, topic=data.topic, source_kind="DEMO_GENERATED" if settings().demo_mode else "AI_GENERATED", package_id=package.id)
+    db.add(item)
+    db.commit()
+    return question_view(item, db)
+
+
 @app.post("/api/practice/{skill}")
-def start_practice(skill: str, user: User = Depends(learner), db: Session = Depends(get_db)):
+def start_practice(skill: str, question_id: int | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
     if skill not in ("speaking", "writing", "reading", "listening"):
         raise HTTPException(404, "Unknown skill")
     profile = profile_for(db, user)
     runtime = AgentRuntime(db)
-    prompt = runtime.provider.prompt(profile.exam, skill, profile.proficiency)
+    if question_id is not None:
+        item = db.get(QuestionItem, question_id)
+        if not item or item.exam != profile.exam or item.skill != skill or not item.prompt or item.user_id not in (None, user.id):
+            raise HTTPException(404, "Practice question not found")
+        if item.package_id and db.get(ResultPackage, item.package_id).state != "RELEASED":
+            raise HTTPException(409, "Generated question is awaiting quality review")
+        prompt = {"title": item.title, "text": item.prompt, "answer_key": item.answer_key, "mode": item.source_kind,
+                  "task_type": item.task_type, "duration_seconds": 120 if skill == "speaking" else 2400 if skill == "writing" else 600}
+    else:
+        prompt = runtime.provider.prompt(profile.exam, skill, profile.proficiency)
     practice = Practice(user_id=user.id, exam=profile.exam, skill=skill, prompt=prompt)
     db.add(practice)
     db.flush()
-    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "generated practice task", "tool": "LLM adapter", "practice_id": practice.id}, mode=runtime.provider.mode))
+    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "selected question bank task" if question_id else "generated practice task", "tool": "question bank" if question_id else "LLM adapter", "practice_id": practice.id, "question_id": question_id}, mode=runtime.provider.mode))
     db.commit()
     return {"id": practice.id, "prompt": prompt, "skill": skill}
+
+
+@app.get("/api/practice/{practice_id}")
+def get_practice(practice_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    item = owned(db, Practice, practice_id, user)
+    return {"id": item.id, "prompt": item.prompt, "skill": item.skill}
 
 
 @app.get("/api/practice/{practice_id}/attempts")
@@ -362,6 +510,8 @@ def create_mock(user: User = Depends(learner), db: Session = Depends(get_db)):
         raise HTTPException(409, "Accept a learning plan before the mock exam")
     runtime = AgentRuntime(db)
     sections = {skill: runtime.provider.prompt(profile.exam, skill) for skill in ("listening", "reading", "writing", "speaking")}
+    for skill, seconds in {"listening": 300, "reading": 300, "writing": 900, "speaking": 180}.items():
+        sections[skill]["duration_seconds"] = seconds
     exam = MockExam(user_id=user.id, exam=profile.exam, sections=sections)
     db.add(exam)
     db.commit()
@@ -370,7 +520,10 @@ def create_mock(user: User = Depends(learner), db: Session = Depends(get_db)):
 
 def mock_view(exam: MockExam, db: Session):
     answers = {answer.skill: answer.answer for answer in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "reduced_length": True, "sections": exam.sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
+    created_at = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "reduced_length": True, "created_at": created_at,
+            "duration_seconds": sum(section["duration_seconds"] for section in exam.sections.values()),
+            "sections": exam.sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
 
 @app.get("/api/mock-exams")

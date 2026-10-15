@@ -9,23 +9,16 @@ type Props = {
   notify: (message: string, kind?: 'success' | 'error') => void
 }
 
-const skills = ['writing', 'speaking', 'reading', 'listening']
-const nice = (value: string) => value.charAt(0).toUpperCase() + value.slice(1)
-
 export default function AuthPage({ onAuth, notify }: Props) {
   const navigate = useNavigate()
   const initialToken = new URLSearchParams(window.location.search).get('token') || ''
-  const [mode, setMode] = useState<Mode>(initialToken ? 'reset' : 'register')
+  const [mode, setMode] = useState<Mode>(initialToken ? 'reset' : 'login')
   const [token, setToken] = useState(initialToken)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [demoPath, setDemoPath] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
-  const [form, setForm] = useState({
-    name: '', email: '', password: '', exam: 'IELTS', proficiency: 'intermediate',
-    target_score: 7, exam_date: '2026-12-15', weekly_hours: 8,
-    priority_skills: ['writing'] as string[],
-  })
+  const [form, setForm] = useState({ name: '', email: '', password: '' })
   const update = (key: string, value: unknown) => setForm(previous => ({ ...previous, [key]: value }))
   const switchMode = (next: Mode) => { setMode(next); setMessage(''); setDemoPath('') }
 
@@ -83,26 +76,16 @@ export default function AuthPage({ onAuth, notify }: Props) {
       <div className="flex items-center justify-center bg-cream p-5 text-ink md:p-10">
         <form onSubmit={submit} className="card w-full max-w-lg p-7 md:p-9">
           {(mode === 'register' || mode === 'login') && <div className="mb-7 flex rounded-xl bg-slate-100 p-1">
-            <button type="button" onClick={() => switchMode('register')} className={`w-1/2 rounded-lg py-2 text-sm font-bold ${mode === 'register' ? 'bg-white shadow-sm' : 'text-slate-500'}`}>Create account</button>
             <button type="button" onClick={() => switchMode('login')} className={`w-1/2 rounded-lg py-2 text-sm font-bold ${mode === 'login' ? 'bg-white shadow-sm' : 'text-slate-500'}`}>Sign in</button>
+            <button type="button" onClick={() => switchMode('register')} className={`w-1/2 rounded-lg py-2 text-sm font-bold ${mode === 'register' ? 'bg-white shadow-sm' : 'text-slate-500'}`}>Sign up</button>
           </div>}
           <h2 className="heading text-2xl">{{ register: 'Start your learning journey', login: 'Welcome back', forgot: 'Recover your account', reset: 'Set a new password' }[mode]}</h2>
-          <p className="mb-6 mt-2 text-sm text-slate-500">{{ register: 'Tell us your goal so your coordinator can build a plan.', login: 'Pick up where you left off.', forgot: 'Enter the email you used to register.', reset: 'This link can be used once and expires after 30 minutes.' }[mode]}</p>
+          <p className="mb-6 mt-2 text-sm text-slate-500">{{ register: 'Create an account, then your AI coordinator will help build your profile.', login: 'Pick up where you left off.', forgot: 'Enter the email you used to register.', reset: 'This link can be used once and expires after 30 minutes.' }[mode]}</p>
           <div className="space-y-4">
             {mode === 'register' && <label className="block"><span className="label">Full name</span><input className="input" required value={form.name} onChange={event => update('name', event.target.value)} /></label>}
             {mode !== 'reset' && <label className="block"><span className="label">Email</span><input className="input" required type="email" value={form.email} onChange={event => update('email', event.target.value)} /></label>}
             {mode !== 'forgot' && <label className="block"><span className="label">{mode === 'reset' ? 'New password' : 'Password'}</span><input className="input" required minLength={8} maxLength={128} type="password" autoComplete={mode === 'register' || mode === 'reset' ? 'new-password' : 'current-password'} value={form.password} onChange={event => update('password', event.target.value)} /></label>}
             {mode === 'reset' && <label className="block"><span className="label">Confirm new password</span><input className="input" required minLength={8} type="password" autoComplete="new-password" value={confirmPassword} onChange={event => setConfirmPassword(event.target.value)} /></label>}
-            {mode === 'register' && <>
-              <div className="grid grid-cols-2 gap-3">
-                <label><span className="label">Target exam</span><select className="input" value={form.exam} onChange={event => setForm(previous => ({ ...previous, exam: event.target.value, target_score: event.target.value === 'IELTS' ? 7 : 4.5 }))}><option>IELTS</option><option>TOEFL</option></select></label>
-                <label><span className="label">Current level</span><select className="input" value={form.proficiency} onChange={event => update('proficiency', event.target.value)}><option>beginner</option><option>intermediate</option><option>advanced</option></select></label>
-                <label><span className="label">Target score</span><input className="input" type="number" min={form.exam === 'IELTS' ? 0 : 1} max={form.exam === 'IELTS' ? 9 : 6} step="0.5" value={form.target_score} onChange={event => update('target_score', Number(event.target.value))} /></label>
-                <label><span className="label">Exam date</span><input className="input" type="date" required value={form.exam_date} onChange={event => update('exam_date', event.target.value)} /></label>
-              </div>
-              <label className="block"><span className="label">Study hours per week</span><input className="input" type="number" min="1" max="40" value={form.weekly_hours} onChange={event => update('weekly_hours', Number(event.target.value))} /></label>
-              <div><span className="label">Priority skills</span><div className="flex flex-wrap gap-2">{skills.map(skill => <button type="button" key={skill} onClick={() => update('priority_skills', form.priority_skills.includes(skill) ? form.priority_skills.filter(item => item !== skill) : [...form.priority_skills, skill])} className={`pill border ${form.priority_skills.includes(skill) ? 'border-teal bg-mint text-teal' : 'border-slate-200 text-slate-500'}`}>{nice(skill)}</button>)}</div></div>
-            </>}
           </div>
           {message && <p role="status" className="mt-5 rounded-xl bg-mint p-3 text-sm text-teal">{message}</p>}
           {demoPath && <Link to={demoPath} onClick={() => { setToken(new URL(demoPath, window.location.origin).searchParams.get('token') || ''); switchMode('reset') }} className="mt-3 block break-all text-sm font-semibold text-teal underline">Open demo reset link</Link>}

@@ -1,9 +1,9 @@
-export type User={id:number;email:string;name:string;role:'learner'|'instructor'}
+export type User={id:number;email:string;name:string;role:'learner'|'instructor';profile_complete?:boolean}
 export type Profile={exam:'IELTS'|'TOEFL';proficiency:string;target_score:number;exam_date:string;weekly_hours:number;priority_skills:string[]}
 export type Result={id:number;kind:string;state:string;source_mode:string;issues:string[];payload?:Record<string,any>;confidence?:Record<string,number>;message?:string;created_at:string}
 export type Plan={id:number;version:number;kind:string;status:string;content?:Record<string,any>;created_at:string}
 export type Practice={id:number;skill:string;prompt:{title:string;text:string;mode:string;duration_seconds:number}}
-export type Mock={id:number;exam:string;status:string;reduced_length:boolean;sections:Record<string,{title:string;text:string;duration_seconds:number}>;answers:Record<string,string>;result:Result|null}
+export type Mock={id:number;exam:string;status:string;reduced_length:boolean;created_at:string;duration_seconds:number;sections:Record<string,{title:string;text:string;duration_seconds:number}>;answers:Record<string,string>;result:Result|null}
 export type Event={id:number;workflow:string;agent:string;phase:string;detail:Record<string,any>;mode:string;duration_ms:number;created_at:string}
 
 export async function request<T=any>(path:string, options:RequestInit={}):Promise<T>{

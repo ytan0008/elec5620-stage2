@@ -21,10 +21,25 @@ class ProfileInput(BaseModel):
         return self
 
 
-class RegisterInput(ProfileInput):
+class RegisterInput(BaseModel):
     email: EmailStr
     name: str = Field(min_length=2, max_length=120)
     password: str = Field(min_length=8, max_length=128)
+    exam: Literal["IELTS", "TOEFL"] | None = None
+    proficiency: Literal["beginner", "intermediate", "advanced"] | None = None
+    target_score: float | None = None
+    exam_date: date | None = None
+    weekly_hours: int | None = Field(default=None, ge=1, le=40)
+    priority_skills: list[Skill] | None = None
+
+    @model_validator(mode="after")
+    def optional_profile(self):
+        values = [self.exam, self.proficiency, self.target_score, self.exam_date, self.weekly_hours, self.priority_skills]
+        if any(value is not None for value in values):
+            if not all(value is not None for value in values):
+                raise ValueError("Complete all profile fields or set them after sign-up")
+            ProfileInput.model_validate(self.model_dump(exclude={"email", "name", "password"}))
+        return self
 
 
 class LoginInput(BaseModel):
@@ -106,3 +121,38 @@ class ThresholdInput(BaseModel):
 
 class ChangeRequestInput(BaseModel):
     note: str = Field(min_length=5, max_length=1000)
+
+
+class OnboardingTurn(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class OnboardingExtraction(BaseModel):
+    exam: Literal["IELTS", "TOEFL"] | None = None
+    proficiency: Literal["beginner", "intermediate", "advanced"] | None = None
+    target_score: float | None = None
+    exam_date: str | None = None
+    weekly_hours: int | None = None
+    priority_skills: list[Skill] | None = None
+
+
+class PortraitOutput(BaseModel):
+    summary: str = Field(min_length=15)
+    goal: str = Field(min_length=5)
+    focus_areas: list[Skill] = Field(min_length=1)
+    starting_point: str = Field(min_length=5)
+    study_rhythm: str = Field(min_length=5)
+    next_steps: list[str] = Field(min_length=1)
+    confidence: dict[str, float]
+
+
+class QuestionGenerationInput(BaseModel):
+    skill: Literal["writing", "speaking"]
+    topic: str = Field(min_length=3, max_length=80)
+
+
+class QuestionOutput(BaseModel):
+    title: str = Field(min_length=5, max_length=200)
+    prompt: str = Field(min_length=30)
+    task_type: str = Field(min_length=5)
+    confidence: dict[str, float]

@@ -281,3 +281,78 @@ def test_password_recovery_email_delivery_and_failure(monkeypatch):
             assert after == before
     finally:
         config.demo_mode, config.smtp_host, config.smtp_from_email = original
+
+
+def test_conversational_onboarding_portrait_questions_and_graph():
+    with TestClient(app) as client:
+        registered = client.post("/api/auth/register", json={"email": "new-onboarding@example.com", "name": "New Learner", "password": "Example123!"})
+        assert registered.status_code == 200, registered.text
+        assert registered.json()["user"]["profile_complete"] is False
+        headers = {"Authorization": "Bearer " + registered.json()["token"]}
+        assert client.get("/api/profile", headers=headers).status_code == 409
+        assert client.get("/api/onboarding", headers=headers).json()["next_field"] == "exam"
+        for answer in ("IELTS", "intermediate", "7.0", "2027-12-15", "8", "writing and speaking"):
+            turn = client.post("/api/onboarding/message", headers=headers, json={"message": answer})
+            assert turn.status_code == 200, turn.text
+        assert turn.json()["ready"] is True
+        assert len(turn.json()["messages"]) == 12
+        confirmed = client.post("/api/onboarding/confirm", headers=headers)
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["portrait"]["state"] == "RELEASED"
+        assert confirmed.json()["portrait"]["source_mode"] == "DEMO"
+        assert client.get("/api/portrait", headers=headers).json()["payload"]["focus_areas"] == ["writing", "speaking"]
+        assert client.post("/api/onboarding/confirm", headers=headers).status_code == 409
+        logged_in = client.post("/api/auth/login", json={"email": "new-onboarding@example.com", "password": "Example123!"})
+        assert logged_in.json()["user"]["profile_complete"] is True
+
+        graph = client.get("/api/knowledge-graph", headers=headers)
+        assert graph.status_code == 200
+        assert len(graph.json()["nodes"]) == 17
+        assert len(graph.json()["edges"]) == 16
+        assert all(node["score"] is None for node in graph.json()["nodes"])
+        assert next(node for node in graph.json()["nodes"] if node["id"] == "writing")["priority"] is True
+        questions = client.get("/api/questions?skill=writing", headers=headers).json()
+        assert any(item["source_kind"] == "OFFICIAL_LINK" and item["source_url"].startswith("https://ielts.org/") and item["prompt"] is None for item in questions)
+        original = next(item for item in questions if item["source_kind"] == "ORIGINAL")
+        practice = client.post(f"/api/practice/writing?question_id={original['id']}", headers=headers)
+        assert practice.status_code == 200
+        assert practice.json()["prompt"]["text"] == original["prompt"]
+        generated = client.post("/api/questions/generate", headers=headers, json={"skill": "speaking", "topic": "public libraries"})
+        assert generated.status_code == 200, generated.text
+        assert generated.json()["source_kind"] == "DEMO_GENERATED"
+        assert generated.json()["verification_state"] == "RELEASED"
+        assert client.post(f"/api/practice/speaking?question_id={generated.json()['id']}", headers=headers).status_code == 200
+
+        other = auth(client, "question-other@example.com")
+        assert client.post(f"/api/practice/speaking?question_id={generated.json()['id']}", headers=other).status_code == 404
+        active_plan(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers)
+        assert mock.status_code == 200
+        assert mock.json()["duration_seconds"] == 1680
+        assert mock.json()["created_at"]
+
+
+def test_generated_question_is_held_when_quality_fails(monkeypatch):
+    from backend.agents import ProviderAdapter
+    from backend.schemas import QuestionOutput
+
+    with TestClient(app) as client:
+        headers = auth(client, "question-hold@example.com")
+        def uncertain(self, exam, skill, topic):
+            return QuestionOutput(title="A practice discussion task", prompt="Discuss whether libraries should be free and explain your answer with examples.", task_type="Academic Task 2", confidence={"task": .2})
+        monkeypatch.setattr(ProviderAdapter, "generate_question", uncertain)
+        result = client.post("/api/questions/generate", headers=headers, json={"skill": "writing", "topic": "libraries"})
+        assert result.status_code == 200
+        assert result.json()["verification_state"] == "HELD"
+        assert result.json()["prompt"] is None
+        assert client.post(f"/api/practice/writing?question_id={result.json()['id']}", headers=headers).status_code in (404, 409)
+
+
+def test_existing_learner_can_create_a_quality_checked_portrait():
+    with TestClient(app) as client:
+        headers = auth(client, "portrait-existing@example.com")
+        assert client.get("/api/portrait", headers=headers).json() is None
+        created = client.post("/api/portrait/generate", headers=headers)
+        assert created.status_code == 200
+        assert created.json()["state"] == "RELEASED"
+        assert client.get("/api/portrait", headers=headers).json()["id"] == created.json()["id"]

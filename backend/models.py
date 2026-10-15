@@ -42,6 +42,42 @@ class Profile(Base):
     confirmed: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class OnboardingSession(Base):
+    __tablename__ = "onboarding_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    messages: Mapped[list] = mapped_column(JSON, default=list)
+    draft: Mapped[dict] = mapped_column(JSON, default=dict)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class LearnerPortrait(Base):
+    __tablename__ = "learner_portraits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("result_packages.id"))
+    content: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class QuestionItem(Base):
+    __tablename__ = "question_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    exam: Mapped[str] = mapped_column(String(10), index=True)
+    skill: Mapped[str] = mapped_column(String(20), index=True)
+    task_type: Mapped[str] = mapped_column(String(80))
+    title: Mapped[str] = mapped_column(String(200))
+    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    topic: Mapped[str] = mapped_column(String(80))
+    source_kind: Mapped[str] = mapped_column(String(24))
+    source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    package_id: Mapped[int | None] = mapped_column(ForeignKey("result_packages.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Plan(Base):
     __tablename__ = "learning_plans"
     id: Mapped[int] = mapped_column(primary_key=True)

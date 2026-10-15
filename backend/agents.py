@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from backend.config import settings
 from backend.models import AgentEvent, AuditLog, Escalation, QualityCheck, ResultPackage, SystemSetting
-from backend.schemas import FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative
+from backend.schemas import FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput, QuestionOutput
+from backend.onboarding import parse_demo_message
 
 
 class FlowState(TypedDict, total=False):
@@ -59,6 +60,52 @@ class ProviderAdapter:
         except Exception:
             return chain.invoke(messages)  # One bounded retry before the caller holds the result.
 
+    def extract_onboarding(self, message: str, draft: dict) -> OnboardingExtraction:
+        demo = parse_demo_message(message, draft)
+        return self.structured(
+            OnboardingExtraction,
+            "Extract only explicitly stated IELTS/TOEFL learner goals from the latest message. "
+            "Do not invent missing values. Dates must be YYYY-MM-DD. Skills must be writing, speaking, reading or listening. "
+            "Return null for fields not supplied in the latest message.",
+            {"latest_message": message, "current_draft": draft}, demo,
+        )
+
+    def portrait(self, profile: dict) -> PortraitOutput:
+        priorities = profile["priority_skills"]
+        demo = {
+            "summary": f"Demo starting portrait for a {profile['proficiency']} {profile['exam']} learner. This reflects stated goals, not measured ability.",
+            "goal": f"Reach an estimated {profile['target_score']} by {profile['exam_date']}.",
+            "focus_areas": priorities,
+            "starting_point": f"Self-reported {profile['proficiency']} level; confirm with practice results.",
+            "study_rhythm": f"{profile['weekly_hours']} hours per week available.",
+            "next_steps": [f"Complete a {skill} diagnostic practice" for skill in priorities[:2]],
+            "confidence": {"portrait": .84},
+        }
+        return self.structured(
+            PortraitOutput,
+            "You are the Learning Coordinator. Create a concise learning portrait from stated goals only. "
+            "Never claim a measured strength without verified performance. Give a self-reported heuristic confidence.",
+            {"profile": profile}, demo,
+        )
+
+    def generate_question(self, exam: str, skill: str, topic: str) -> QuestionOutput:
+        demo = {
+            "title": f"{topic.title()} — {skill} practice",
+            "prompt": (f"Some people think {topic} should receive greater public support, while others disagree. "
+                       "Discuss both views and give your own opinion with examples." if skill == "writing" else
+                       f"Describe an experience connected with {topic}. Explain what happened, who was involved, "
+                       "and why this experience was memorable."),
+            "task_type": "Academic Task 2" if skill == "writing" else "Part 2 cue card",
+            "confidence": {"task": .84},
+        }
+        return self.structured(
+            QuestionOutput,
+            "Create one ORIGINAL IELTS-style task, never reproduce an official or memorised question. "
+            "Use Academic Writing Task 2 or Speaking Part 2 format as requested. "
+            "Do not call it an official IELTS question. Return a self-reported task confidence.",
+            {"exam": exam, "skill": skill, "topic": topic}, demo,
+        )
+
     def plan(self, profile: dict, progress: dict, adaptation: bool) -> PlanOutput:
         priorities = priority_tool.invoke({"priority_skills": profile["priority_skills"], "weakness_skills": progress.get("weaknesses", [])})
         change_request = progress.get("change_request")
@@ -80,7 +127,7 @@ class ProviderAdapter:
             "reading": "Passage: Flexible working can reduce commuting time, but research also identifies communication challenges. Teams that set clear routines often report stronger collaboration. Question: What can help teams collaborate?",
             "listening": "Transcript for demo listening: The seminar starts at nine, but the workshop has moved to ten. Bring your notes to the workshop. Question: When is the workshop?",
         }
-        guidance = "Start with one clear reason and example." if proficiency == "beginner" else "Include a counterargument or more nuanced example." if proficiency == "advanced" else "Support your answer with a specific example."
+        guidance = ("Start with one clear reason and example." if proficiency == "beginner" else "Include a counterargument or more nuanced example." if proficiency == "advanced" else "Support your answer with a specific example.") if skill in ("writing", "speaking") else ""
         if self.config.demo_mode:
             return {"title": f"{exam} {skill.title()} practice", "text": prompts[skill] + " " + guidance, "answer_key": "clear routines" if skill == "reading" else "ten" if skill == "listening" else None, "mode": "DEMO", "duration_seconds": 120 if skill == "speaking" else 2400 if skill == "writing" else 600}
         # The LLM generates only task text; deterministic answers are kept for objective prototype tasks.
@@ -217,6 +264,12 @@ class AgentRuntime:
             issues.append("Mock exam requires four section scores")
         if state["workflow"] == "mock_exam" and (any(not isinstance(v, (int, float)) or v < 0 or v > (9 if payload.get("score_scale", "").startswith("IELTS") else 6) for v in payload.get("section_scores", {}).values())):
             issues.append("Mock section score outside exam scale")
+        if state["workflow"] == "portrait" and (not payload.get("summary") or not payload.get("focus_areas") or not payload.get("next_steps")):
+            issues.append("Learner portrait is incomplete")
+        if state["workflow"] == "question" and (not payload.get("title") or not payload.get("prompt") or not payload.get("task_type")):
+            issues.append("Generated question is incomplete")
+        if state["workflow"] == "question" and "official ielts" in (str(payload.get("title", "")) + " " + str(payload.get("prompt", ""))).lower():
+            issues.append("Generated question must not claim to be official IELTS content")
         package.state = "CHECKING"
         self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "CHECKING"})
         if any(v < self.threshold() for v in confidence.values() if isinstance(v, (int, float))):
