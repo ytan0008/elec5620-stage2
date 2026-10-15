@@ -13,12 +13,16 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn
+from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
-from backend.agents import AgentRuntime
+from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
+from backend.scoring import grade_objective, strip_answers, overall_band
+from backend.speech import server_speech_available, synthesise, transcribe
+from backend import content as bank
+from backend import examiner
 from backend.seed import seed
 
 
@@ -34,9 +38,12 @@ app.add_middleware(CORSMiddleware, allow_origins=settings().cors_origins.split("
 
 @app.exception_handler(RuntimeError)
 async def runtime_error_handler(request: Request, exc: RuntimeError):
-    if "REAL AI MODE requires OPENAI_API_KEY" in str(exc):
-        return JSONResponse(status_code=503, content={"detail": "AI provider is not configured; set credentials or use DEMO MODE"})
     return JSONResponse(status_code=500, content={"detail": "Workflow execution failed"})
+
+
+@app.exception_handler(LocalGenerationUnavailable)
+async def local_generation_handler(request: Request, exc: LocalGenerationUnavailable):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 def dto(obj, *fields):
@@ -99,14 +106,23 @@ def latest_progress(db: Session, user_id: int):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "mode": "DEMO" if settings().demo_mode else "REAL"}
+    config = settings()
+    return {"status": "ok", "mode": config.ai_mode, "model": config.llm_model if config.ai_mode == "REAL" else "built-in engine",
+            "server_tts": server_speech_available(), "server_stt": server_speech_available()}
+
+
+def user_view(user: User, profile_complete: bool | None = None) -> dict:
+    result = {**dto(user, "id", "email", "name", "role"), "avatar": user.avatar or "witch"}
+    if profile_complete is not None:
+        result["profile_complete"] = profile_complete
+    return result
 
 
 @app.post("/api/auth/register")
 def register(data: RegisterInput, db: Session = Depends(get_db)):
     if db.scalar(select(User.id).where(User.email == data.email.lower())):
         raise HTTPException(409, "Email already registered")
-    user = User(email=data.email.lower(), name=data.name, password_hash=hash_password(data.password), role="learner")
+    user = User(email=data.email.lower(), name=data.name, password_hash=hash_password(data.password), role="learner", avatar="witch")
     db.add(user)
     db.flush()
     profile_input = data.model_dump(exclude={"email", "name", "password"}, exclude_none=True, mode="json")
@@ -114,7 +130,7 @@ def register(data: RegisterInput, db: Session = Depends(get_db)):
         db.add(Profile(user_id=user.id, **profile_input))
     db.add(AuditLog(user_id=user.id, action="registered", detail={"profile_complete": bool(profile_input)}))
     db.commit()
-    return {"token": token_for(user), "user": {**dto(user, "id", "email", "name", "role"), "profile_complete": bool(profile_input)}}
+    return {"token": token_for(user), "user": user_view(user, bool(profile_input))}
 
 
 @app.post("/api/auth/login")
@@ -123,13 +139,14 @@ def login(data: LoginInput, db: Session = Depends(get_db)):
     if not user or not hasher.verify(data.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
     complete = user.role == "instructor" or bool(db.scalar(select(Profile.id).where(Profile.user_id == user.id)))
-    return {"token": token_for(user), "user": {**dto(user, "id", "email", "name", "role"), "profile_complete": complete}}
+    return {"token": token_for(user), "user": user_view(user, complete)}
 
 
 @app.post("/api/auth/password-reset/request")
 def request_password_reset(data: PasswordResetRequest, db: Session = Depends(get_db)):
     config = settings()
-    if not config.demo_mode and not mail_ready():
+    on_screen = not mail_ready() and (config.password_reset_link_on_screen or config.demo_mode)
+    if not mail_ready() and not on_screen:
         raise HTTPException(503, "Password recovery email is not configured")
     response = {"message": "If this email has an account, a reset link has been issued."}
     token = new_reset_token()
@@ -139,17 +156,17 @@ def request_password_reset(data: PasswordResetRequest, db: Session = Depends(get
         for previous in db.scalars(select(PasswordReset).where(PasswordReset.user_id == user.id, PasswordReset.used_at.is_(None))):
             previous.used_at = now
         db.add(PasswordReset(user_id=user.id, token_hash=token_digest(token), expires_at=now + timedelta(minutes=30)))
-        db.add(AuditLog(user_id=user.id, action="password_reset_requested", detail={"delivery": "demo" if config.demo_mode else "email"}))
-        if not config.demo_mode:
+        db.add(AuditLog(user_id=user.id, action="password_reset_requested", detail={"delivery": "screen" if on_screen else "email"}))
+        if not on_screen:
             try:
                 send_reset_email(user.email, token)
             except (OSError, smtplib.SMTPException):
                 db.rollback()
                 raise HTTPException(503, "Recovery email could not be sent; please try again later")
         db.commit()
-    if config.demo_mode:
-        response["demo_reset_path"] = reset_path(token)
-        response["demo_notice"] = "DEMO ONLY: this link is shown on screen because email delivery is not configured."
+    if on_screen:
+        response["reset_path"] = reset_path(token)
+        response["notice"] = "LOCAL SERVER: email delivery is not configured, so the one-time reset link is shown here."
     return response
 
 
@@ -173,7 +190,14 @@ def confirm_password_reset(data: PasswordResetConfirm, db: Session = Depends(get
 
 @app.get("/api/me")
 def me(user: User = Depends(current_user)):
-    return dto(user, "id", "email", "name", "role")
+    return user_view(user)
+
+
+@app.put("/api/me/avatar")
+def set_avatar(data: AvatarInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    user.avatar = data.avatar
+    db.commit()
+    return user_view(user)
 
 
 @app.get("/api/onboarding")
@@ -182,7 +206,7 @@ def onboarding_state(user: User = Depends(learner), db: Session = Depends(get_db
     profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
     draft = profile_data(profile) if profile else (session.draft if session else {})
     missing = next_field(draft)
-    return {"draft": draft, "messages": session.messages if session else [], "ready": missing is None, "completed": bool(profile), "next_field": missing, "assistant_message": ONBOARDING_QUESTIONS[missing] if missing else "Your profile is ready. Review it and confirm to create your learning portrait.", "mode": "DEMO" if settings().demo_mode else "REAL"}
+    return {"draft": draft, "messages": session.messages if session else [], "ready": missing is None, "completed": bool(profile), "next_field": missing, "assistant_message": ONBOARDING_QUESTIONS[missing] if missing else "Your profile is ready. Review it and confirm to create your learning portrait.", "mode": settings().ai_mode}
 
 
 @app.post("/api/onboarding/message")
@@ -225,7 +249,7 @@ def chat_record(db: Session, user_id: int, context: str) -> AgentConversation | 
 @app.get("/api/chat/{context}")
 def chat_history(context: str, user: User = Depends(learner), db: Session = Depends(get_db)):
     record = chat_record(db, user.id, context)
-    return {"context": context, "agent": "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator", "messages": record.messages if record else [], "mode": "DEMO" if settings().demo_mode else "REAL"}
+    return {"context": context, "agent": "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator", "messages": record.messages if record else [], "mode": settings().ai_mode}
 
 
 @app.post("/api/chat/{context}")
@@ -241,7 +265,7 @@ def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), 
             value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email redacted]", value)
             return re.sub(r"(?<!\w)(?:\+?\d[\d ()-]{8,}\d)(?!\w)", "[phone redacted]", value)
         safe_history = [{"role": item.get("role"), "text": safe_text(item.get("text", ""))} for item in (record.messages if record else [])]
-        reply = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history).reply
+        reply = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history, data.persona).reply
     except Exception:
         raise HTTPException(503, "Agent reply unavailable; please try again")
     if not record:
@@ -355,7 +379,7 @@ def plan_decision(plan_id: int, accept: bool, user: User = Depends(learner), db:
         plan.status = "ACTIVE"
         for item in plan.content["activities"]:
             db.add(StudyTask(user_id=user.id, plan_id=plan.id, skill=item["skill"], title=item["title"]))
-        db.add(AgentEvent(user_id=user.id, workflow="adaptation" if plan.kind == "adaptation" else "plan", agent="Learning Coordinator", phase="handoff", detail={"decision": "activated", "next_agent": "AI Tutor + Assessment & Analytics", "plan_id": plan.id}, mode="DEMO" if settings().demo_mode else "REAL"))
+        db.add(AgentEvent(user_id=user.id, workflow="adaptation" if plan.kind == "adaptation" else "plan", agent="Learning Coordinator", phase="handoff", detail={"decision": "activated", "next_agent": "AI Tutor + Assessment & Analytics", "plan_id": plan.id}, mode=settings().ai_mode))
     else:
         plan.status = "REJECTED"
     db.add(AuditLog(user_id=user.id, action="plan_accepted" if accept else "plan_rejected", detail={"plan_id": plan.id}))
@@ -402,13 +426,15 @@ def question_view(item: QuestionItem, db: Session) -> dict:
     available = not package or package.state == "RELEASED"
     return {"id": item.id, "exam": item.exam, "skill": item.skill, "task_type": item.task_type, "title": item.title,
             "prompt": item.prompt if available else None, "topic": item.topic, "source_kind": item.source_kind,
-            "source_url": item.source_url, "available": available, "verification_state": package.state if package else "CURATED"}
+            "source_url": item.source_url, "available": available, "verification_state": package.state if package else "CURATED",
+            "structured": bool(item.content), "chart": (item.content or {}).get("chart") if available else None}
 
 
 @app.get("/api/questions")
-def questions(exam: str = "IELTS", skill: str | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
-    if exam != "IELTS":
-        raise HTTPException(400, "This catalog currently contains IELTS resources only")
+def questions(exam: str | None = None, skill: str | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
+    exam = exam or profile_for(db, user).exam
+    if exam not in ("IELTS", "TOEFL"):
+        raise HTTPException(400, "Unknown exam")
     if skill and skill not in ("writing", "speaking", "reading", "listening"):
         raise HTTPException(400, "Unknown skill")
     query = select(QuestionItem).where(QuestionItem.exam == exam)
@@ -421,18 +447,31 @@ def questions(exam: str = "IELTS", skill: str | None = None, user: User = Depend
 @app.post("/api/questions/generate")
 def generate_question(data: QuestionGenerationInput, user: User = Depends(learner), db: Session = Depends(get_db)):
     profile = profile_for(db, user)
-    if profile.exam != "IELTS":
-        raise HTTPException(409, "IELTS question generation requires an IELTS profile")
     runtime = AgentRuntime(db)
     try:
-        output = runtime.provider.generate_question("IELTS", data.skill, data.topic).model_dump()
+        output = runtime.provider.generate_question(profile.exam, data.skill, data.topic, data.task)
+        output = output.model_dump() if hasattr(output, "model_dump") else output
+    except LocalGenerationUnavailable:
+        raise
     except Exception as exc:
         output = {"title": "Question requires review", "confidence": {}, "error_type": type(exc).__name__}
     package = runtime.verify_output(user.id, "question", output)
-    item = QuestionItem(user_id=user.id, exam="IELTS", skill=data.skill, task_type=output.get("task_type", "Generated task"), title=output.get("title", "Question under review"), prompt=output.get("prompt"), answer_key=None, topic=data.topic, source_kind="DEMO_GENERATED" if settings().demo_mode else "AI_GENERATED", package_id=package.id)
+    item = QuestionItem(user_id=user.id, exam=profile.exam, skill=data.skill, task_type=output.get("task_type", "Generated task"), title=output.get("title", "Question under review")[:200], prompt=output.get("prompt"), answer_key=None, topic=data.topic[:80],
+                        source_kind="LOCAL_GENERATED" if runtime.provider.local else "AI_GENERATED", content=output.get("content"), package_id=package.id)
     db.add(item)
     db.commit()
     return question_view(item, db)
+
+
+def seen_content(db: Session, user_id: int, skill: str) -> set[str]:
+    return {practice.prompt.get("content_id") for practice in db.scalars(select(Practice).where(Practice.user_id == user_id, Practice.skill == skill)) if practice.prompt.get("content_id")}
+
+
+def public_prompt(prompt: dict) -> dict:
+    """Practice prompt as sent to the learner: objective answer keys stay on the server."""
+    if isinstance(prompt.get("test"), dict) and prompt["test"].get("kind") in ("listening", "reading"):
+        return {**prompt, "test": strip_answers(prompt["test"])}
+    return {key: value for key, value in prompt.items() if key != "answer_key"}
 
 
 @app.post("/api/practice/{skill}")
@@ -447,29 +486,32 @@ def start_practice(skill: str, question_id: int | None = None, user: User = Depe
             raise HTTPException(404, "Practice question not found")
         if item.package_id and db.get(ResultPackage, item.package_id).state != "RELEASED":
             raise HTTPException(409, "Generated question is awaiting quality review")
-        prompt = {"title": item.title, "text": item.prompt, "answer_key": item.answer_key, "mode": item.source_kind,
-                  "task_type": item.task_type, "duration_seconds": 120 if skill == "speaking" else 2400 if skill == "writing" else 600}
+        if item.content:
+            prompt = practice_prompt(item.content, item.source_kind)
+        else:
+            prompt = {"title": item.title, "text": item.prompt, "answer_key": item.answer_key, "mode": item.source_kind,
+                      "task_type": item.task_type, "duration_seconds": 900 if skill == "speaking" else 2400 if skill == "writing" else 600}
     else:
-        prompt = runtime.provider.prompt(profile.exam, skill, profile.proficiency)
+        prompt = runtime.provider.prompt(profile.exam, skill, seen_content(db, user.id, skill))
     practice = Practice(user_id=user.id, exam=profile.exam, skill=skill, prompt=prompt)
     db.add(practice)
     db.flush()
-    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "selected question bank task" if question_id else "generated practice task", "tool": "question bank" if question_id else "LLM adapter", "practice_id": practice.id, "question_id": question_id}, mode=runtime.provider.mode))
+    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "selected question bank task", "tool": "question bank", "practice_id": practice.id, "question_id": question_id, "content_id": prompt.get("content_id")}, mode=runtime.provider.mode))
     db.commit()
-    return {"id": practice.id, "prompt": prompt, "skill": skill}
+    return {"id": practice.id, "prompt": public_prompt(prompt), "skill": skill}
 
 
 @app.get("/api/practice/{practice_id}")
 def get_practice(practice_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     item = owned(db, Practice, practice_id, user)
-    return {"id": item.id, "prompt": item.prompt, "skill": item.skill}
+    return {"id": item.id, "prompt": public_prompt(item.prompt), "skill": item.skill}
 
 
 @app.get("/api/practice/{practice_id}/attempts")
 def attempts(practice_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     practice = owned(db, Practice, practice_id, user)
     submissions = db.scalars(select(Submission).where(Submission.practice_id == practice.id).order_by(Submission.attempt)).all()
-    return [{"id": sub.id, "text": sub.text, "attempt": sub.attempt, "audio_available": bool(sub.audio_path), "result": package_view(db.get(ResultPackage, sub.package_id))} for sub in submissions]
+    return [{"id": sub.id, "text": sub.text, "attempt": sub.attempt, "audio_available": bool(sub.audio_path), "created_at": sub.created_at, "result": package_view(db.get(ResultPackage, sub.package_id))} for sub in submissions]
 
 
 @app.get("/api/practice/submissions/{submission_id}/audio")
@@ -480,33 +522,72 @@ def get_submission_audio(submission_id: int, user: User = Depends(learner), db: 
     return FileResponse(sub.audio_path, media_type="audio/webm")
 
 
+AUDIO_TYPES = ("audio/webm", "audio/ogg", "audio/mp4", "audio/wav", "audio/mpeg", "audio/x-wav")
+
+
+async def read_audio(file: UploadFile) -> bytes:
+    if not (file.content_type or "").split(";")[0] in AUDIO_TYPES:
+        raise HTTPException(415, "Unsupported audio type")
+    data = await file.read(25_000_001)
+    if len(data) > 25_000_000:
+        raise HTTPException(413, "Audio exceeds 25 MB")
+    return data
+
+
 @app.post("/api/practice/{practice_id}/audio")
 async def upload_audio(practice_id: int, file: UploadFile = File(...), user: User = Depends(learner), db: Session = Depends(get_db)):
     practice = owned(db, Practice, practice_id, user)
     if practice.skill != "speaking":
         raise HTTPException(400, "Audio is only for speaking practice")
-    if file.content_type not in ("audio/webm", "audio/ogg", "audio/mp4", "audio/wav"):
-        raise HTTPException(415, "Unsupported audio type")
-    data = await file.read(5_000_001)
-    if len(data) > 5_000_000:
-        raise HTTPException(413, "Audio exceeds 5 MB")
+    data = await read_audio(file)
     folder = Path("uploads") / str(user.id)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"practice-{practice.id}-{uuid4().hex}.webm"
     path.write_bytes(data)
     db.add(AuditLog(user_id=user.id, action="audio_uploaded", detail={"practice_id": practice.id, "bytes": len(data)}))
     db.commit()
-    if not settings().demo_mode and settings().transcription_model and settings().openai_api_key:
+    if server_speech_available():
         try:
-            from openai import OpenAI
-            with path.open("rb") as stream:
-                transcript = OpenAI(api_key=settings().openai_api_key, timeout=30).audio.transcriptions.create(model=settings().transcription_model, file=stream)
-            return {"stored": True, "transcription_available": True, "transcript": transcript.text, "message": "Audio transcribed. Review the transcript before submitting."}
+            return {"stored": True, "transcription_available": True, "transcript": transcribe(path), "message": "Recording saved and transcribed. Review the transcript before submitting."}
         except Exception as exc:
             db.add(AuditLog(user_id=user.id, action="transcription_failed", detail={"practice_id": practice.id, "error_type": type(exc).__name__}))
             db.commit()
-            return {"stored": True, "transcription_available": False, "message": "Transcription failed; enter a transcript manually. Audio pronunciation assessment is unavailable."}
-    return {"stored": True, "transcription_available": False, "message": "Audio saved. Configure a transcription service for real transcription; enter a transcript manually for text-based demo feedback."}
+            return {"stored": True, "transcription_available": False, "message": "Recording saved, but cloud transcription failed. Live browser recognition or typing still works."}
+    return {"stored": True, "transcription_available": False, "message": "Recording saved for replay. Your words are captured by live speech recognition in the browser."}
+
+
+def latest_unused_audio(db: Session, user_id: int, practice_id: int) -> str | None:
+    used = {item for item in db.scalars(select(Submission.audio_path).where(Submission.practice_id == practice_id)) if item}
+    folder = Path("uploads") / str(user_id)
+    files = sorted(folder.glob(f"practice-{practice_id}-*.webm"), key=lambda item: item.stat().st_mtime, reverse=True) if folder.exists() else []
+    return next((str(item) for item in files if str(item) not in used), None)
+
+
+def objective_output(prompt: dict, answers: dict, skill: str, exam: str) -> dict:
+    test = prompt["test"]
+    graded = grade_objective(test, answers, skill, exam)
+    wrong = [item for item in graded["items"] if not item["correct"]]
+    comments = [{"issue": f"Question {item['n']}", "suggestion": f"Correct answer: {item['answer']}" + (f" — {item['evidence']}" if item["evidence"] else ""), "sentence": f"Your answer: {item['given'] or '(blank)'}"} for item in wrong[:12]]
+    if not comments:
+        comments = [{"issue": "All answers correct", "suggestion": "Try a harder part or a full test under timed conditions."}]
+    types = {}
+    for item in graded["items"]:
+        bucket = types.setdefault(item["type"], [0, 0])
+        bucket[0] += item["correct"]
+        bucket[1] += 1
+    weakest = min(types.items(), key=lambda pair: pair[1][0] / pair[1][1])[0] if types else None
+    names = {"completion": "completion", "mcq": "multiple choice", "matching": "matching", "tfng": "True/False/Not Given", "ynng": "Yes/No/Not Given", "cwords": "Complete the Words"}
+    summary = (f"You answered {graded['raw']} of {graded['total']} correctly"
+               + (f" (equivalent to about {graded['scaled_40']}/40)" if graded["scaled_40"] is not None else "")
+               + f". Estimated {graded['score_scale'].split(' ')[0]} {skill} score: {graded['band']}."
+               + (f" Your weakest question type was {names.get(weakest, weakest)}." if weakest and len(types) > 1 else ""))
+    output = {"summary": summary, "criteria": {skill: graded["band"]}, "estimated_overall": graded["band"], "score_scale": graded["score_scale"], "official": False,
+              "raw_score": graded["raw"], "total": graded["total"], "review": graded["items"], "confidence": {skill: .92}, "comments": comments,
+              "question_types": {names.get(k, k): f"{v[0]}/{v[1]}" for k, v in types.items()}}
+    if skill == "listening":
+        output["transcript"] = [{"title": section.get("title"), "script": section.get("script", []),
+                                 "clips": [q.get("clip") for g in section.get("groups", []) for q in g.get("questions", []) if q.get("clip")]} for section in test["sections"]]
+    return output
 
 
 @app.post("/api/practice/{practice_id}/submit")
@@ -514,26 +595,29 @@ def submit_practice(practice_id: int, data: SubmitInput, user: User = Depends(le
     practice = owned(db, Practice, practice_id, user)
     profile = profile_for(db, user)
     runtime = AgentRuntime(db)
+    prompt = practice.prompt
+    text = data.text
     if practice.skill in ("writing", "speaking"):
-        if data.scenario == "invalid" and settings().demo_mode:
-            package = runtime.verify_output(user.id, practice.skill, {"summary": "Malformed demo output", "criteria": {}, "confidence": {}})
+        if data.scenario == "invalid" and runtime.provider.local:
+            package = runtime.verify_output(user.id, practice.skill, {"summary": "Malformed output", "criteria": {}, "confidence": {}})
         else:
-            state = runtime.practice_graph().invoke({"user_id": user.id, "workflow": practice.skill, "profile": profile_data(profile), "skill": practice.skill, "text": data.text, "scenario": data.scenario})
+            state = runtime.practice_graph().invoke({"user_id": user.id, "workflow": practice.skill, "profile": profile_data(profile), "skill": practice.skill, "text": text,
+                                                     "prompt": prompt.get("text", ""), "task": data.task or prompt.get("task") or ("speaking" if practice.skill == "speaking" else "task2"),
+                                                     "metrics": data.metrics, "scenario": data.scenario})
             package = db.get(ResultPackage, state["package_id"])
+    elif isinstance(prompt.get("test"), dict):
+        answers = {str(k): str(v)[:200] for k, v in (data.answers or {}).items()}
+        output = objective_output(prompt, answers, practice.skill, profile.exam)
+        text = json.dumps(answers)
+        package = runtime.verify_output(user.id, practice.skill, output)
     else:
-        key = practice.prompt["answer_key"]
-        correct = key in data.text.lower()
-        score = 6.5 if profile.exam == "IELTS" else 4.5
-        if not correct:
-            score = 4.5 if profile.exam == "IELTS" else 3.0
-        package = runtime.verify_output(user.id, practice.skill, {"summary": "Correct answer supported by passage" if correct else f"Review the evidence and try identifying: {key}", "criteria": {practice.skill: score}, "estimated_overall": score, "official": False, "confidence": {practice.skill: .90}, "comments": [{"issue": "Check source evidence", "suggestion": key}]})
+        key = prompt.get("answer_key") or ""
+        correct = bool(key) and key in text.lower()
+        score = (6.5 if correct else 4.5) if profile.exam == "IELTS" else (4.5 if correct else 3.0)
+        package = runtime.verify_output(user.id, practice.skill, {"summary": "Correct answer supported by the text" if correct else f"Review the evidence and try identifying: {key}", "criteria": {practice.skill: score}, "estimated_overall": score, "official": False, "confidence": {practice.skill: .90}, "comments": [{"issue": "Check source evidence", "suggestion": key}]})
     attempt = (db.scalar(select(func.max(Submission.attempt)).where(Submission.practice_id == practice.id)) or 0) + 1
-    audio_path = None
-    if practice.skill == "speaking":
-        used = {item for item in db.scalars(select(Submission.audio_path).where(Submission.practice_id == practice.id)) if item}
-        files = sorted((Path("uploads") / str(user.id)).glob(f"practice-{practice.id}-*.webm"), key=lambda item: item.stat().st_mtime, reverse=True) if (Path("uploads") / str(user.id)).exists() else []
-        audio_path = next((str(item) for item in files if str(item) not in used), None)
-    sub = Submission(practice_id=practice.id, user_id=user.id, text=data.text, audio_path=audio_path, attempt=attempt, package_id=package.id)
+    audio_path = latest_unused_audio(db, user.id, practice.id) if practice.skill == "speaking" else None
+    sub = Submission(practice_id=practice.id, user_id=user.id, text=text or "(no answers)", audio_path=audio_path, attempt=attempt, package_id=package.id)
     db.add(sub)
     practice.status = "SUBMITTED"
     db.commit()
@@ -545,27 +629,168 @@ def result(package_id: int, user: User = Depends(learner), db: Session = Depends
     return package_view(owned(db, ResultPackage, package_id, user))
 
 
+# ---------------------------------------------------------------- live speaking examiner
+
+def speaking_view(session: SpeakingSession) -> dict:
+    return {"id": session.id, "exam": session.exam, "status": session.status, "practice_id": session.practice_id, "mock_id": session.mock_id, "persona": session.persona,
+            "log": [{k: v for k, v in item.items() if k != "repeat_target" or session.status == "COMPLETED"} for item in session.log],
+            "ui": examiner.ui(session.test, session.state), "test_title": session.test.get("title")}
+
+
+@app.post("/api/speaking/sessions")
+def start_speaking(data: SpeakingStartInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    profile = profile_for(db, user)
+    runtime = AgentRuntime(db)
+    practice_id = None
+    if data.mock_id is not None:
+        exam = owned(db, MockExam, data.mock_id, user)
+        if exam.status != "IN_PROGRESS" or "test" not in exam.sections.get("speaking", {}):
+            raise HTTPException(409, "This mock exam has no open speaking section")
+        test = exam.sections["speaking"]["test"]
+    else:
+        practice = start_practice("speaking", data.question_id, user, db)
+        practice_id = practice["id"]
+        test = db.get(Practice, practice_id).prompt.get("test")
+        if not test:
+            raise HTTPException(409, "This speaking task does not support the live examiner")
+    state, text, _ = examiner.start(test, data.persona)
+    session = SpeakingSession(user_id=user.id, practice_id=practice_id, mock_id=data.mock_id, exam=test["exam"], persona=data.persona, test=test, state=state,
+                              log=[{"role": "examiner", "text": text, "stage": state["stage"], "part": examiner.ui(test, state)["part"]}])
+    db.add(session)
+    db.add(AgentEvent(user_id=user.id, workflow="speaking", agent="AI Tutor", phase="action", detail={"decision": "start live speaking examiner", "exam": test["exam"], "mock_id": data.mock_id}, mode=runtime.provider.mode))
+    db.commit()
+    return speaking_view(session)
+
+
+@app.get("/api/speaking/sessions/{session_id}")
+def get_speaking(session_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    return speaking_view(owned(db, SpeakingSession, session_id, user))
+
+
+@app.post("/api/speaking/sessions/{session_id}/turn")
+def speaking_turn(session_id: int, data: SpeakingTurnInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    session = owned(db, SpeakingSession, session_id, user)
+    if session.status != "ACTIVE":
+        raise HTTPException(409, "This speaking test has finished")
+    stage = session.state["stage"]
+    if stage == "p2_prep" and data.event != "ready":
+        raise HTTPException(409, "Finish preparing, then start your long turn")
+    if stage != "p2_prep" and not data.text.strip():
+        raise HTTPException(422, "No speech was captured; please answer again")
+    runtime = AgentRuntime(db)
+    part = examiner.ui(session.test, session.state)["part"]
+    rephrase = (lambda st, scripted, said, follow: runtime.provider.examiner_rephrase(st, scripted, said, follow, session.persona)) if not runtime.provider.local else None
+    state, reply, ui, done, meta = examiner.advance(session.test, session.state, data.text, data.event, rephrase)
+    log = list(session.log)
+    if data.event == "answer":
+        log.append({"role": "learner", "text": data.text.strip(), "seconds": round(data.seconds, 1), "stage": stage, "part": part,
+                    **{k: v for k, v in meta.items() if k in ("repeat_accuracy", "repeat_target")}})
+    log.append({"role": "examiner", "text": reply, "stage": state["stage"], "part": ui["part"], **({"follow_up": True} if meta.get("follow_up") else {})})
+    session.state, session.log = state, log
+    if done:
+        session.status = "FINISHED"
+    db.commit()
+    return {**speaking_view(session), "reply": reply, "done": done}
+
+
+@app.post("/api/speaking/sessions/{session_id}/finish")
+def finish_speaking(session_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    session = owned(db, SpeakingSession, session_id, user)
+    if session.status == "COMPLETED":
+        raise HTTPException(409, "Feedback was already requested for this test")
+    text, metrics = examiner.transcript_for_assessment(session.test, session.log)
+    if len(text.split()) < 5:
+        raise HTTPException(409, "Answer at least one examiner question before requesting feedback")
+    session.status = "COMPLETED"
+    if session.mock_id is not None:
+        exam = owned(db, MockExam, session.mock_id, user)
+        if exam.status != "IN_PROGRESS":
+            raise HTTPException(409, "Mock exam already submitted")
+        payload = json.dumps({"session_id": session.id, "transcript": text, "metrics": metrics})
+        response = db.scalar(select(ExamResponse).where(ExamResponse.exam_id == exam.id, ExamResponse.skill == "speaking"))
+        if response:
+            response.answer = payload
+        else:
+            db.add(ExamResponse(exam_id=exam.id, skill="speaking", answer=payload))
+        db.commit()
+        return {**speaking_view(session), "saved_to_mock": True, "metrics": metrics}
+    practice = owned(db, Practice, session.practice_id, user)
+    profile = profile_for(db, user)
+    runtime = AgentRuntime(db)
+    test = session.test
+    question = (test.get("part2", {}).get("cue") or "") + " " + " ".join(test.get("part3", {}).get("questions", []) or test.get("interview", {}).get("questions", []))
+    state = runtime.practice_graph().invoke({"user_id": user.id, "workflow": "speaking", "profile": profile_data(profile), "skill": "speaking", "text": text,
+                                             "prompt": question, "task": "speaking", "metrics": metrics})
+    package = db.get(ResultPackage, state["package_id"])
+    attempt = (db.scalar(select(func.max(Submission.attempt)).where(Submission.practice_id == practice.id)) or 0) + 1
+    sub = Submission(practice_id=practice.id, user_id=user.id, text=text, audio_path=latest_unused_audio(db, user.id, practice.id), attempt=attempt, package_id=package.id)
+    db.add(sub)
+    practice.status = "SUBMITTED"
+    db.commit()
+    return {**speaking_view(session), "submission_id": sub.id, "attempt": attempt, "metrics": metrics, "result": package_view(package)}
+
+
+# ---------------------------------------------------------------- speech services
+
+@app.post("/api/tts")
+def text_to_speech(data: TTSInput, user: User = Depends(current_user)):
+    if not server_speech_available():
+        raise HTTPException(404, "Server voice is not configured; the browser voice will be used")
+    try:
+        return FileResponse(synthesise(data.text, data.voice, data.speed), media_type="audio/mpeg")
+    except Exception as exc:
+        raise HTTPException(503, f"Voice service unavailable ({type(exc).__name__}); the browser voice will be used")
+
+
+@app.post("/api/stt")
+async def speech_to_text(file: UploadFile = File(...), user: User = Depends(current_user)):
+    if not server_speech_available():
+        raise HTTPException(404, "Server transcription is not configured")
+    data = await read_audio(file)
+    folder = Path("uploads") / "stt"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{uuid4().hex}.webm"
+    path.write_bytes(data)
+    try:
+        return {"text": transcribe(path)}
+    except Exception as exc:
+        raise HTTPException(503, f"Transcription failed ({type(exc).__name__})")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- mock examinations
+
 @app.post("/api/mock-exams")
-def create_mock(user: User = Depends(learner), db: Session = Depends(get_db)):
+def create_mock(data: MockCreateInput | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
     profile = profile_for(db, user)
     if not db.scalar(select(Plan.id).where(Plan.user_id == user.id, Plan.status == "ACTIVE")):
         raise HTTPException(409, "Accept a learning plan before the mock exam")
-    runtime = AgentRuntime(db)
-    sections = {skill: runtime.provider.prompt(profile.exam, skill) for skill in ("listening", "reading", "writing", "speaking")}
-    for skill, seconds in {"listening": 300, "reading": 300, "writing": 900, "speaking": 180}.items():
-        sections[skill]["duration_seconds"] = seconds
+    length = (data or MockCreateInput()).length
+    sections = bank.mock_sections(profile.exam, length)
+    sections["length"] = length
     exam = MockExam(user_id=user.id, exam=profile.exam, sections=sections)
     db.add(exam)
     db.commit()
     return mock_view(exam, db)
 
 
+SKILLS = ("listening", "reading", "writing", "speaking")
+
+
 def mock_view(exam: MockExam, db: Session):
     answers = {answer.skill: answer.answer for answer in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
     created_at = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "reduced_length": True, "created_at": created_at,
-            "duration_seconds": sum(section["duration_seconds"] for section in exam.sections.values()),
-            "sections": exam.sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
+    legacy = "test" not in exam.sections.get("speaking", {})
+    sections = {}
+    for skill in SKILLS:
+        section = exam.sections.get(skill, {})
+        if skill in ("listening", "reading") and "sections" in section and exam.status == "IN_PROGRESS":
+            section = strip_answers(section)
+        sections[skill] = section
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at,
+            "duration_seconds": sum(exam.sections[skill].get("duration_seconds", 0) for skill in SKILLS if skill in exam.sections),
+            "sections": sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
 
 @app.get("/api/mock-exams")
@@ -581,7 +806,7 @@ def get_mock(exam_id: int, user: User = Depends(learner), db: Session = Depends(
 @app.put("/api/mock-exams/{exam_id}/{skill}")
 def save_exam_answer(exam_id: int, skill: str, data: ExamAnswerInput, user: User = Depends(learner), db: Session = Depends(get_db)):
     exam = owned(db, MockExam, exam_id, user)
-    if exam.status != "IN_PROGRESS" or skill not in exam.sections:
+    if exam.status != "IN_PROGRESS" or skill not in SKILLS:
         raise HTTPException(409, "Section cannot be edited")
     response = db.scalar(select(ExamResponse).where(ExamResponse.exam_id == exam.id, ExamResponse.skill == skill))
     if response:
@@ -592,24 +817,55 @@ def save_exam_answer(exam_id: int, skill: str, data: ExamAnswerInput, user: User
     return {"saved": True}
 
 
+def parse_json(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 @app.post("/api/mock-exams/{exam_id}/submit")
 def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already submitted")
-    answers = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
-    if set(answers) != set(exam.sections) or any(not answer.strip() for answer in answers.values()):
-        raise HTTPException(409, "Complete all four sections")
+    raw = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
+    answers = {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
+    missing = [skill for skill in SKILLS if not raw.get(skill, "").strip() or (skill == "writing" and not any(str(v).strip() for v in answers["writing"].values()))
+               or (skill == "speaking" and not answers["speaking"].get("transcript"))]
+    if missing:
+        raise HTTPException(409, "Complete all four sections: " + ", ".join(missing) + " still missing")
     runtime = AgentRuntime(db)
-    scores = {}
+    scores, details = {}, {}
     for skill in ("listening", "reading"):
-        correct = exam.sections[skill]["answer_key"] in answers[skill].lower()
-        scores[skill] = (6.5 if correct else 4.5) if exam.exam == "IELTS" else (4.5 if correct else 3.0)
-    for skill in ("writing", "speaking"):
-        feedback = runtime.provider.feedback(exam.exam, skill, answers[skill], "normal")
-        scores[skill] = round(sum(feedback.criteria.values()) / len(feedback.criteria) * 2) / 2
-    overall = round(sum(scores.values()) / 4 * 2) / 2
-    output = {"summary": "Reduced-length prototype exam estimate; not an official score or full-length exam. Speaking audio delivery/pronunciation was not assessed from text.", "section_scores": scores, "estimated_overall": overall, "readiness": "On track" if overall >= (6.5 if exam.exam == "IELTS" else 4.5) else "Needs further practice", "score_scale": "IELTS 0-9 bands" if exam.exam == "IELTS" else "TOEFL 2026 1-6 sections", "official": False, "confidence": {skill: .82 for skill in scores}}
+        graded = objective_output(exam.sections[skill] | {"test": exam.sections[skill]}, answers[skill], skill, exam.exam)
+        scores[skill] = graded["estimated_overall"]
+        details[skill] = {k: graded[k] for k in ("raw_score", "total", "review", "summary")} | ({"transcript": graded["transcript"]} if skill == "listening" else {})
+    task_scores, writing_feedback = [], {}
+    for task in exam.sections["writing"]["tasks"]:
+        response = str(answers["writing"].get(task["task"], "")).strip()
+        if len(response.split()) < 3:
+            task_scores.append((task["task"], 1.0 if exam.exam == "IELTS" else 1.0))
+            continue
+        feedback = runtime.provider.feedback(exam.exam, "writing", response, "normal", task["prompt"], task["task"])
+        band = round(sum(feedback.criteria.values()) / len(feedback.criteria) * 2) / 2
+        task_scores.append((task["task"], band))
+        writing_feedback[task["task"]] = {"criteria": feedback.criteria, "summary": feedback.summary, "comments": feedback.comments[:4], "band": band}
+    weights = {"task2": 2, "task1": 1}
+    total_weight = sum(weights.get(task, 1) for task, _ in task_scores)
+    scores["writing"] = round(sum(band * weights.get(task, 1) for task, band in task_scores) / total_weight * 2) / 2
+    details["writing"] = writing_feedback
+    spoken = answers["speaking"]
+    speaking = runtime.provider.feedback(exam.exam, "speaking", spoken["transcript"], "normal", "", "speaking", spoken.get("metrics"))
+    scores["speaking"] = round(sum(speaking.criteria.values()) / len(speaking.criteria) * 2) / 2
+    details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments[:4], "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note}
+    overall = overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / 4 * 2) / 2
+    target = db.scalar(select(Profile.target_score).where(Profile.user_id == user.id))
+    output = {"summary": f"{'Full-length' if exam.sections.get('length') == 'full' else 'Short-format'} mock estimate. Listening and Reading are marked against answer keys; Writing and Speaking are assessed against the rubric. Pronunciation is not scored from a transcript.",
+              "section_scores": scores, "estimated_overall": overall, "readiness": "On track" if target is not None and overall >= target else "Needs further practice",
+              "score_scale": "IELTS 0-9 bands" if exam.exam == "IELTS" else "TOEFL 2026 1-6 sections", "official": False,
+              "details": details, "confidence": {skill: .82 for skill in scores}}
     package = runtime.verify_output(user.id, "mock_exam", output)
     exam.package_id = package.id
     exam.status = "SUBMITTED"

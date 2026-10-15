@@ -22,6 +22,21 @@ def auth(client, email="learner@example.com"):
     return {"Authorization": "Bearer " + response.json()["token"]}
 
 
+def speak_mock(client, headers, mock_id):
+    session = client.post("/api/speaking/sessions", headers=headers, json={"mock_id": mock_id})
+    assert session.status_code == 200, session.text
+    sid = session.json()["id"]
+    for _ in range(40):
+        stage = client.get(f"/api/speaking/sessions/{sid}", headers=headers).json()["ui"]["stage"]
+        if stage == "done":
+            break
+        body = {"event": "ready"} if stage == "p2_prep" else {"text": "I would say it is important because it helps people grow, for example when I learned to cook with my grandmother.", "seconds": 12}
+        assert client.post(f"/api/speaking/sessions/{sid}/turn", headers=headers, json=body).status_code == 200
+    finished = client.post(f"/api/speaking/sessions/{sid}/finish", headers=headers)
+    assert finished.status_code == 200, finished.text
+    assert finished.json()["saved_to_mock"] is True
+
+
 def active_plan(client, headers):
     response = client.post("/api/plans/generate", headers=headers)
     assert response.status_code == 200, response.text
@@ -41,7 +56,8 @@ def test_contextual_agent_chat_persists_and_respects_roles():
         follow_up = client.post("/api/chat/speaking", headers=headers, json={"message": "Hello, let's practice."})
         assert follow_up.status_code == 200, follow_up.text
         assert follow_up.json()["agent"] == "AI Tutor"
-        assert "DEMO assistant" in follow_up.json()["messages"][-1]["text"]
+        assert follow_up.json()["mode"] == "LOCAL"
+        assert follow_up.json()["messages"][-1]["text"].endswith("?")
         assert len(client.get("/api/chat/profile", headers=headers).json()["messages"]) == 2
         assert len(client.get("/api/chat/speaking", headers=headers).json()["messages"]) == 2
         other = auth(client, "otherchat@example.com")
@@ -107,9 +123,13 @@ def test_speaking_mock_resume_recommendations_ownership():
         mock = client.post("/api/mock-exams", headers=headers)
         assert mock.status_code == 200, mock.text
         exam_id = mock.json()["id"]
+        assert all("answer" not in q for g in mock.json()["sections"]["listening"]["sections"][0]["groups"] for q in g["questions"])
         assert client.post(f"/api/mock-exams/{exam_id}/submit", headers=headers).status_code == 409
-        for skill, answer in {"reading": "clear routines", "listening": "ten", "writing": "I think remote work offers meaningful flexibility while teams need clear routines to collaborate effectively.", "speaking": "I prefer teamwork because collaboration brings a wider set of ideas and gives useful feedback."}.items():
-            assert client.put(f"/api/mock-exams/{exam_id}/{skill}", headers=headers, json={"answer": answer}).status_code == 200
+        import json
+        tasks = {task["task"]: "I think remote work offers meaningful flexibility while teams need clear routines to collaborate effectively." for task in mock.json()["sections"]["writing"]["tasks"]}
+        for skill, answer in {"reading": {"1": "TRUE"}, "listening": {"1": "Kowalski"}, "writing": tasks}.items():
+            assert client.put(f"/api/mock-exams/{exam_id}/{skill}", headers=headers, json={"answer": json.dumps(answer)}).status_code == 200
+        speak_mock(client, headers, exam_id)
         with TestClient(app) as resumed_client:
             assert len(resumed_client.get(f"/api/mock-exams/{exam_id}", headers=headers).json()["answers"]) == 4
         assert len(client.get(f"/api/mock-exams/{exam_id}", headers=headers).json()["answers"]) == 4
@@ -197,7 +217,7 @@ def test_plan_change_request_changes_priority():
         assert client.post(f"/api/plans/{new_plan['id']}/decision?accept=true", headers=headers).status_code == 200
 
 
-def test_missing_real_provider_returns_service_unavailable():
+def test_without_api_key_the_local_engine_runs_everything():
     from backend.config import settings
     with TestClient(app) as client:
         headers = auth(client, "no-key@example.com")
@@ -206,9 +226,14 @@ def test_missing_real_provider_returns_service_unavailable():
         try:
             config.demo_mode = False
             config.openai_api_key = ""
-            unavailable = client.post("/api/practice/writing", headers=headers)
-            assert unavailable.status_code == 503
-            assert "not configured" in unavailable.json()["detail"]
+            assert client.get("/api/health").json()["mode"] == "LOCAL"
+            practice = client.post("/api/practice/writing", headers=headers)
+            assert practice.status_code == 200
+            assert practice.json()["prompt"]["mode"] == "ORIGINAL"
+            unavailable = client.post("/api/questions/generate", headers=headers, json={"skill": "listening", "topic": "museums"})
+            assert unavailable.status_code == 409
+            assert "cloud AI" in unavailable.json()["detail"]
+            assert client.post("/api/tts", headers=headers, json={"text": "Hello"}).status_code == 404
         finally:
             config.demo_mode, config.openai_api_key = original_mode, original_key
 
@@ -227,11 +252,11 @@ def test_password_recovery_is_one_use_and_revokes_existing_sessions():
         issued = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"})
         assert issued.status_code == 200
         assert unknown.json()["message"] == issued.json()["message"]
-        assert "DEMO ONLY" in issued.json()["demo_notice"]
-        old_token = parse_qs(urlparse(issued.json()["demo_reset_path"]).query)["token"][0]
+        assert "LOCAL SERVER" in issued.json()["notice"]
+        old_token = parse_qs(urlparse(issued.json()["reset_path"]).query)["token"][0]
         assert client.post("/api/auth/password-reset/confirm", json={"token": "x" * 32, "password": "NewPassword123!"}).status_code == 400
         second = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"}).json()
-        token = parse_qs(urlparse(second["demo_reset_path"]).query)["token"][0]
+        token = parse_qs(urlparse(second["reset_path"]).query)["token"][0]
         assert client.post("/api/auth/password-reset/confirm", json={"token": old_token, "password": "NewPassword123!"}).status_code == 400
         assert client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "short"}).status_code == 422
         changed = client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "NewPassword123!"})
@@ -241,7 +266,7 @@ def test_password_recovery_is_one_use_and_revokes_existing_sessions():
         assert client.post("/api/auth/login", json={"email": "recover@example.com", "password": "NewPassword123!"}).status_code == 200
         assert client.get("/api/me", headers=headers).status_code == 401
         expired = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"}).json()
-        expired_token = parse_qs(urlparse(expired["demo_reset_path"]).query)["token"][0]
+        expired_token = parse_qs(urlparse(expired["reset_path"]).query)["token"][0]
         with SessionLocal.begin() as db:
             record = db.scalar(select(PasswordReset).where(PasswordReset.token_hash == token_digest(expired_token)))
             record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -251,16 +276,17 @@ def test_password_recovery_is_one_use_and_revokes_existing_sessions():
 def test_password_recovery_requires_mail_delivery_outside_demo():
     from backend.config import settings
     config = settings()
-    original_mode, original_host = config.demo_mode, config.smtp_host
+    original_mode, original_host, original_screen = config.demo_mode, config.smtp_host, config.password_reset_link_on_screen
     try:
         config.demo_mode = False
         config.smtp_host = ""
+        config.password_reset_link_on_screen = False
         with TestClient(app) as client:
             response = client.post("/api/auth/password-reset/request", json={"email": "someone@example.com"})
             assert response.status_code == 503
             assert "not configured" in response.json()["detail"]
     finally:
-        config.demo_mode, config.smtp_host = original_mode, original_host
+        config.demo_mode, config.smtp_host, config.password_reset_link_on_screen = original_mode, original_host, original_screen
 
 
 def test_password_recovery_email_delivery_and_failure(monkeypatch):
@@ -282,7 +308,7 @@ def test_password_recovery_email_delivery_and_failure(monkeypatch):
             register(client, "mail-recover@example.com")
             issued = client.post("/api/auth/password-reset/request", json={"email": "mail-recover@example.com"})
             assert issued.status_code == 200
-            assert "demo_reset_path" not in issued.json()
+            assert "reset_path" not in issued.json()
             assert delivered[0][0] == "mail-recover@example.com"
             assert client.post("/api/auth/password-reset/confirm", json={"token": delivered[0][1], "password": "MailedPassword123!"}).status_code == 200
             assert client.post("/api/auth/login", json={"email": "mail-recover@example.com", "password": "MailedPassword123!"}).status_code == 200
@@ -319,7 +345,7 @@ def test_conversational_onboarding_portrait_questions_and_graph():
         confirmed = client.post("/api/onboarding/confirm", headers=headers)
         assert confirmed.status_code == 200, confirmed.text
         assert confirmed.json()["portrait"]["state"] == "RELEASED"
-        assert confirmed.json()["portrait"]["source_mode"] == "DEMO"
+        assert confirmed.json()["portrait"]["source_mode"] == "LOCAL"
         assert client.get("/api/portrait", headers=headers).json()["payload"]["focus_areas"] == ["writing", "speaking"]
         assert client.post("/api/onboarding/confirm", headers=headers).status_code == 409
         logged_in = client.post("/api/auth/login", json={"email": "new-onboarding@example.com", "password": "Example123!"})
@@ -339,7 +365,7 @@ def test_conversational_onboarding_portrait_questions_and_graph():
         assert practice.json()["prompt"]["text"] == original["prompt"]
         generated = client.post("/api/questions/generate", headers=headers, json={"skill": "speaking", "topic": "public libraries"})
         assert generated.status_code == 200, generated.text
-        assert generated.json()["source_kind"] == "DEMO_GENERATED"
+        assert generated.json()["source_kind"] == "LOCAL_GENERATED"
         assert generated.json()["verification_state"] == "RELEASED"
         assert client.post(f"/api/practice/speaking?question_id={generated.json()['id']}", headers=headers).status_code == 200
 
@@ -348,7 +374,11 @@ def test_conversational_onboarding_portrait_questions_and_graph():
         active_plan(client, headers)
         mock = client.post("/api/mock-exams", headers=headers)
         assert mock.status_code == 200
-        assert mock.json()["duration_seconds"] == 1680
+        assert mock.json()["duration_seconds"] == (16 + 20 + 40 + 14) * 60
+        full = client.post("/api/mock-exams", headers=headers, json={"length": "full"})
+        assert len(full.json()["sections"]["listening"]["sections"]) == 4
+        assert len(full.json()["sections"]["reading"]["sections"]) == 3
+        assert [task["task"] for task in full.json()["sections"]["writing"]["tasks"]] == ["task1", "task2"]
         assert mock.json()["created_at"]
 
 
@@ -358,8 +388,8 @@ def test_generated_question_is_held_when_quality_fails(monkeypatch):
 
     with TestClient(app) as client:
         headers = auth(client, "question-hold@example.com")
-        def uncertain(self, exam, skill, topic):
-            return QuestionOutput(title="A practice discussion task", prompt="Discuss whether libraries should be free and explain your answer with examples.", task_type="Academic Task 2", confidence={"task": .2})
+        def uncertain(self, exam, skill, topic, task="auto"):
+            return {"title": "A practice discussion task", "prompt": "Discuss whether libraries should be free and explain your answer with examples.", "task_type": "Academic Task 2", "confidence": {"task": .2}}
         monkeypatch.setattr(ProviderAdapter, "generate_question", uncertain)
         result = client.post("/api/questions/generate", headers=headers, json={"skill": "writing", "topic": "libraries"})
         assert result.status_code == 200
@@ -376,3 +406,71 @@ def test_existing_learner_can_create_a_quality_checked_portrait():
         assert created.status_code == 200
         assert created.json()["state"] == "RELEASED"
         assert client.get("/api/portrait", headers=headers).json()["id"] == created.json()["id"]
+
+
+def test_listening_and_reading_are_marked_against_hidden_keys():
+    from backend import content
+    with TestClient(app) as client:
+        headers = auth(client, "objective@example.com")
+        bank = client.get("/api/questions?skill=listening", headers=headers).json()
+        part = next(item for item in bank if item["title"] == "Evening course enrolment")
+        practice = client.post(f"/api/practice/listening?question_id={part['id']}", headers=headers)
+        assert practice.status_code == 200, practice.text
+        test = practice.json()["prompt"]["test"]
+        assert test["sections"][0]["script"], "script is needed for text-to-speech"
+        assert all("answer" not in q and "accepts" not in q for g in test["sections"][0]["groups"] for q in g["questions"])
+        answers = {"1": "kowalski", "2": "Elmfield", "3": "07946 381 552", "4": "the newspaper", "5": "£95", "6": "apron", "7": "three", "8": "7:15", "9": "Library", "10": "wrong"}
+        submitted = client.post(f"/api/practice/{practice.json()['id']}/submit", headers=headers, json={"answers": answers})
+        assert submitted.status_code == 200, submitted.text
+        result = submitted.json()["result"]
+        assert result["state"] == "RELEASED"
+        assert result["payload"]["raw_score"] == 9
+        assert result["payload"]["estimated_overall"] == 8.0
+        assert result["payload"]["transcript"][0]["script"]
+        assert not next(item for item in result["payload"]["review"] if item["n"] == 10)["correct"]
+        reading = client.post("/api/practice/reading", headers=headers).json()
+        assert reading["prompt"]["test"]["sections"][0]["passage"]
+        empty = client.post(f"/api/practice/{reading['id']}/submit", headers=headers, json={"answers": {}})
+        assert empty.json()["result"]["payload"]["raw_score"] == 0
+
+
+def test_live_ielts_speaking_examiner_runs_all_three_parts():
+    with TestClient(app) as client:
+        headers = auth(client, "examiner@example.com")
+        session = client.post("/api/speaking/sessions", headers=headers, json={"persona": "boy"})
+        assert session.status_code == 200, session.text
+        sid = session.json()["id"]
+        assert "Kai" in session.json()["log"][0]["text"]
+        parts = []
+        for _ in range(40):
+            view = client.get(f"/api/speaking/sessions/{sid}", headers=headers).json()
+            parts.append(view["ui"]["part"])
+            if view["ui"]["stage"] == "done":
+                break
+            if view["ui"]["stage"] == "p2_prep":
+                assert client.post(f"/api/speaking/sessions/{sid}/turn", headers=headers, json={"text": "too early"}).status_code == 409
+                body = {"event": "ready"}
+            else:
+                body = {"text": "Well, I really enjoy it because it gives me a chance to relax, and for example last weekend I spent the afternoon there with my friends.", "seconds": 9}
+            turn = client.post(f"/api/speaking/sessions/{sid}/turn", headers=headers, json=body)
+            assert turn.status_code == 200, turn.text
+        assert {"Part 1", "Part 2", "Part 3", "Complete"} <= set(parts)
+        finished = client.post(f"/api/speaking/sessions/{sid}/finish", headers=headers)
+        assert finished.status_code == 200, finished.text
+        payload = finished.json()["result"]["payload"]
+        assert set(payload["criteria"]) == {"fluency", "lexical_resource", "grammar"}
+        assert payload["pronunciation_available"] is False
+        assert finished.json()["metrics"]["words_per_minute"] > 100
+        assert client.post(f"/api/speaking/sessions/{sid}/finish", headers=headers).status_code == 409
+        assert client.put("/api/me/avatar", headers=headers, json={"avatar": "boy"}).json()["avatar"] == "boy"
+
+
+def test_local_writing_analysis_flags_real_errors():
+    from backend.scoring import analyse_response
+    weak = analyse_response("IELTS", "writing", "i think peoples is more better when they works at home. the informations is easy.", "", "task2")
+    issues = " ".join(c["issue"] for c in weak["comments"])
+    assert "people" in issues and "comparative" in issues and "uncountable" in issues
+    assert max(weak["criteria"].values()) <= 4.5
+    toefl = analyse_response("TOEFL", "writing", "Dear Ms Lin, I am writing because the meetings clash with my class. " * 6, "", "email")
+    assert set(toefl["criteria"]) == {"task_fulfillment", "organisation", "language_use"}
+    assert all(1 <= value <= 6 for value in toefl["criteria"].values())

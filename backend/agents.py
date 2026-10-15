@@ -1,7 +1,15 @@
-"""Executable StateGraphs. All model access goes through ProviderAdapter."""
+"""Executable StateGraphs. All model access goes through ProviderAdapter.
+
+ProviderAdapter runs in one of two modes:
+  REAL  - a configured OpenAI-compatible chat model produces structured output.
+  LOCAL - the built-in engine: curated exam content, rule-based language
+          analysis and a scripted examiner. No network access is needed.
+"""
+import json
+import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypedDict
+from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -9,8 +17,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from backend.config import settings
 from backend.models import AgentEvent, AuditLog, Escalation, QualityCheck, ResultPackage, SystemSetting
-from backend.schemas import FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput, QuestionOutput, AgentChatReply
+from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput,
+                             QuestionOutput, AgentChatReply, ExaminerTurn, ListeningGen, ReadingGen, SpeakingGen)
 from backend.onboarding import parse_demo_message
+from backend import content as bank
+from backend import local_tutor
+from backend.scoring import analyse_response, validate_test
+
+
+class LocalGenerationUnavailable(Exception):
+    """Raised when a request needs a cloud model in LOCAL mode."""
 
 
 class FlowState(TypedDict, total=False):
@@ -20,6 +36,9 @@ class FlowState(TypedDict, total=False):
     progress: dict
     skill: str
     text: str
+    prompt: str
+    task: str
+    metrics: dict
     scenario: str
     output: dict
     package_id: int
@@ -40,19 +59,35 @@ def criterion_average(scores: dict[str, float]) -> float:
     return round((sum(scores.values()) / len(scores)) * 2) / 2 if scores else 0.0
 
 
+PERSONA_STYLE = {
+    "witch": "You are Luna, a warm, witty pixel-art witch who tutors English with a light touch of magic metaphors.",
+    "boy": "You are Kai, a friendly, upbeat pixel-art boy who tutors English like an encouraging study buddy.",
+}
+RUBRICS = {
+    "IELTS": "IELTS band descriptors (0-9): Task Response/Achievement (addresses all parts, clear position or overview, developed ideas), "
+             "Coherence and Cohesion (logical paragraphing, range of cohesive devices without overuse), Lexical Resource (range, precision, collocation, spelling), "
+             "Grammatical Range and Accuracy (mix of complex structures, frequency of errors). Speaking Fluency and Coherence covers length of turn, hesitation and discourse markers.",
+    "TOEFL": "TOEFL iBT 2026 section scale 1-6: task fulfilment (addresses all requirements, elaborated ideas), organisation (clear progression), "
+             "language use (range and accuracy of vocabulary and grammar). Speaking topic development covers relevance, elaboration and coherence.",
+}
+
+
 class ProviderAdapter:
     def __init__(self):
         self.config = settings()
-        self.mode = "DEMO" if self.config.demo_mode else "REAL"
-        if not self.config.demo_mode and not self.config.openai_api_key:
-            raise RuntimeError("REAL AI MODE requires OPENAI_API_KEY")
-        self.llm = None if self.config.demo_mode else ChatOpenAI(model=self.config.llm_model, api_key=self.config.openai_api_key, timeout=30, max_retries=1)
+        self.mode = self.config.ai_mode
+        self.llm = None
+        if self.mode == "REAL":
+            self.llm = ChatOpenAI(model=self.config.llm_model, api_key=self.config.openai_api_key, base_url=self.config.openai_base_url or None, timeout=60, max_retries=1)
 
-    def structured(self, schema, system: str, user: dict, demo: dict):
-        if self.config.demo_mode:
-            return schema.model_validate(demo)
-        # Caller passes only exam goals, learning text and scores; account identity is excluded.
-        import json
+    @property
+    def local(self) -> bool:
+        return self.mode == "LOCAL"
+
+    def structured(self, schema, system: str, user: dict, local: dict):
+        if self.local:
+            return schema.model_validate(local)
+        # Callers pass only exam goals, learning text and scores; account identity is excluded.
         chain = self.llm.with_structured_output(schema)
         messages = [("system", system), ("human", json.dumps(user, ensure_ascii=False))]
         try:
@@ -61,85 +96,170 @@ class ProviderAdapter:
             return chain.invoke(messages)  # One bounded retry before the caller holds the result.
 
     def extract_onboarding(self, message: str, draft: dict) -> OnboardingExtraction:
-        demo = parse_demo_message(message, draft)
         return self.structured(
             OnboardingExtraction,
             "Extract only explicitly stated IELTS/TOEFL learner goals from the latest message. "
             "Do not invent missing values. Dates must be YYYY-MM-DD. Skills must be writing, speaking, reading or listening. "
             "Return null for fields not supplied in the latest message.",
-            {"latest_message": message, "current_draft": draft}, demo,
+            {"latest_message": message, "current_draft": draft, "today": datetime.now(timezone.utc).date().isoformat()}, parse_demo_message(message, draft),
         )
 
-    def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict]) -> AgentChatReply:
+    def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch") -> AgentChatReply:
         """Instructional conversation; formal scores and plans use the verified workflows."""
+        local = local_tutor.reply(context, message, profile, plan, history, persona)
+        if self.local:
+            return AgentChatReply(reply=local)
         skill = context if context in ("speaking", "writing", "reading", "listening") else None
-        lower = message.lower()
-        if skill == "speaking":
-            if any(word in lower for word in ("hello", "start", "question", "practice")):
-                reply = "Let's practise speaking. Tell me about a skill you learned recently. What was difficult at first, and how did you improve? Record your answer with the microphone, then I can ask a follow-up."
-            elif len(message.split()) < 8:
-                reply = "Can you add one concrete example? Describe what happened and why it mattered. You can answer aloud using the microphone."
-            else:
-                reply = "Thanks. What would you do differently if you had to learn that skill again? Give one reason and an example. For assessed feedback, submit your recorded practice response."
-        elif skill:
-            tips = {"writing": "State a clear position, then support each paragraph with a reason and example.", "reading": "Find the sentence in the passage that supports your answer before choosing it.", "listening": "Listen for corrections and signposts, then write down the final detail."}
-            reply = f"For {skill} practice, {tips[skill]} Tell me which part is difficult, or submit a task for quality-checked feedback."
-        else:
-            priorities = ", ".join(profile.get("priority_skills", [])) or "your chosen skills"
-            if "plan" in lower or "schedule" in lower:
-                reply = f"Your current focus is {priorities}. You have {profile.get('weekly_hours', 0)} study hours per week. Use the Learning plan page to create or request a verified plan change."
-            elif "profile" in lower or "goal" in lower:
-                reply = f"Your stated goal is {profile.get('exam')} {profile.get('target_score')} by {profile.get('exam_date')}. Your self-reported level is {profile.get('proficiency')}. You can edit these details on My profile."
-            else:
-                reply = f"I can help you understand your {profile.get('exam')} goal, profile and learning plan. Your stated priorities are {priorities}. What would you like to work on?"
-        if self.config.demo_mode:
-            return AgentChatReply(reply="DEMO assistant: " + reply)
+        role = "AI Tutor" if skill else "Learning Coordinator"
+        speaking_rules = ("This is a spoken conversation practice: reply in 1-3 short natural sentences (under 70 words) that will be read aloud. "
+                          "React to what the learner said, gently correct at most one clear grammar or vocabulary mistake by recasting it, then ask one follow-up question. "
+                          "Use IELTS Speaking Part 1/3 style topics. No markdown, lists or emojis.") if skill == "speaking" else \
+                         "Be concise (under 150 words), practical and warm; ask at most one follow-up. Plain text only, no markdown tables."
         return self.structured(
             AgentChatReply,
-            f"You are the {'AI Tutor' if skill else 'Learning Coordinator'} in a learner-facing conversation about {context}. "
-            "Be concise, warm and ask at most one follow-up. Do not claim an official IELTS/TOEFL score, calibrated confidence, "
-            "verified plan or pronunciation analysis. Formal evaluations and recommendations require a separate quality-checked workflow. "
-            "Never ask for passwords or personal identity details.",
-            {"message": message, "profile": profile, "active_plan": plan, "recent_messages": history[-8:]},
-            {"reply": reply},
+            f"{PERSONA_STYLE.get(persona, PERSONA_STYLE['witch'])} You act as the {role} of an IELTS/TOEFL preparation platform; the current page is '{context}'. "
+            f"{speaking_rules} Do not claim an official IELTS/TOEFL score or calibrated confidence. Formal evaluations come from the separate quality-checked "
+            "workflow. If the learner writes in another language, answer in simple English and optionally add a brief translation. Never ask for passwords or identity details.",
+            {"message": message, "profile": profile, "active_plan": plan, "recent_messages": history[-10:]},
+            {"reply": local},
         )
+
+    def examiner_rephrase(self, stage: str, scripted: str, learner_text: str, allow_followup: bool, persona: str):
+        """Let a cloud model phrase the next examiner turn naturally. LOCAL mode keeps the script."""
+        if self.local:
+            return None
+        rules = ("You are a certified IELTS Speaking examiner. Never give feedback, praise or scores during the test. "
+                 "Reply with exactly what the examiner says next in under 45 words, plain text.")
+        task = (f"Stage: {stage}. The candidate just said: \"{learner_text[:600]}\". The next scripted question is: \"{scripted}\". "
+                + ("The answer was short: you may ask ONE brief natural follow-up about what they said instead (set follow_up true), or move on with the scripted question. "
+                   if allow_followup else "You must move on by asking the scripted question, optionally preceded by a two-to-four word acknowledgement such as 'Thank you.'. Set follow_up false."))
+        result = self.llm.with_structured_output(ExaminerTurn).invoke([("system", rules), ("human", task)])
+        if not result.follow_up and scripted and scripted.split("?")[0][-25:].lower() not in result.say.lower():
+            return (scripted, False)  # The model must not drop the scripted question.
+        return (result.say, result.follow_up)
 
     def portrait(self, profile: dict) -> PortraitOutput:
         priorities = profile["priority_skills"]
-        demo = {
-            "summary": f"Demo starting portrait for a {profile['proficiency']} {profile['exam']} learner. This reflects stated goals, not measured ability.",
+        local = {
+            "summary": f"Starting portrait for a {profile['proficiency']} {profile['exam']} learner aiming for {profile['target_score']}. It reflects stated goals until verified practice results arrive.",
             "goal": f"Reach an estimated {profile['target_score']} by {profile['exam_date']}.",
             "focus_areas": priorities,
-            "starting_point": f"Self-reported {profile['proficiency']} level; confirm with practice results.",
-            "study_rhythm": f"{profile['weekly_hours']} hours per week available.",
-            "next_steps": [f"Complete a {skill} diagnostic practice" for skill in priorities[:2]],
+            "starting_point": f"Self-reported {profile['proficiency']} level; confirm with a first practice task in each priority skill.",
+            "study_rhythm": f"{profile['weekly_hours']} hours per week, about {round(profile['weekly_hours'] * 60 / 6)} minutes on six days.",
+            "next_steps": [f"Complete a {skill} diagnostic task from the question bank" for skill in priorities[:2]] + ["Take a short mock test after two weeks"],
             "confidence": {"portrait": .84},
         }
         return self.structured(
             PortraitOutput,
             "You are the Learning Coordinator. Create a concise learning portrait from stated goals only. "
             "Never claim a measured strength without verified performance. Give a self-reported heuristic confidence.",
-            {"profile": profile}, demo,
+            {"profile": profile}, local,
         )
 
-    def generate_question(self, exam: str, skill: str, topic: str) -> QuestionOutput:
-        demo = {
-            "title": f"{topic.title()} — {skill} practice",
-            "prompt": (f"Some people think {topic} should receive greater public support, while others disagree. "
-                       "Discuss both views and give your own opinion with examples." if skill == "writing" else
-                       f"Describe an experience connected with {topic}. Explain what happened, who was involved, "
-                       "and why this experience was memorable."),
-            "task_type": "Academic Task 2" if skill == "writing" else "Part 2 cue card",
-            "confidence": {"task": .84},
-        }
-        return self.structured(
-            QuestionOutput,
-            "Create one ORIGINAL IELTS-style task, never reproduce an official or memorised question. "
-            "Use Academic Writing Task 2 or Speaking Part 2 format as requested. "
-            "Do not call it an official IELTS question. Return a self-reported task confidence.",
-            {"exam": exam, "skill": skill, "topic": topic}, demo,
-        )
+    # ---------------------------------------------------------------- content
+    def generate_question(self, exam: str, skill: str, topic: str, task: str = "auto") -> dict:
+        """Return {title, task_type, prompt, content, confidence} for a new original item."""
+        rng = random.Random(hash((exam, skill, topic, task, time.time())))
+        if skill == "writing":
+            return self._generate_writing(exam, topic, task, rng)
+        if skill == "speaking":
+            return self._generate_speaking(exam, topic, rng)
+        if self.local:
+            raise LocalGenerationUnavailable("Generating brand-new listening or reading tests needs a cloud AI model. Configure OPENAI_API_KEY, or practise with the built-in tests.")
+        part = {"auto": 0, "part1": 1, "part2": 2, "part3": 3, "part4": 4}.get(task, 0) or rng.choice([1, 2, 3, 4])
+        if skill == "listening":
+            spec = {1: "Part 1: a phone or face-to-face conversation between two people in an everyday social context (booking, enquiry); 10 form/note completion questions, ONE WORD AND/OR A NUMBER, answers include spelled names and numbers.",
+                    2: "Part 2: a monologue in an everyday context (tour guide, radio talk); 5 multiple-choice (A-C) questions then 5 matching questions with a shared A-G option box.",
+                    3: "Part 3: a discussion between two students and a tutor about an academic assignment; 5 multiple-choice questions then 5 matching questions.",
+                    4: "Part 4: an academic lecture by one speaker; 10 note-completion questions, ONE WORD ONLY."}[part] if exam == "IELTS" else \
+                "A TOEFL 2026 listening set: a campus conversation or academic talk (300-450 words) with 5 multiple-choice (A-D) questions."
+            output = self.structured(ListeningGen,
+                f"Write ONE ORIGINAL {exam} Listening section about '{topic}'. {spec} The script must be 450-750 words of natural spoken English with "
+                "hesitations, corrections and distractors (a speaker mentions a wrong detail and then corrects it). Start with a narrator line introducing the situation "
+                "and add narrator lines for reading time. Every completion answer must appear verbatim in the script and respect the word limit; put alternative spellings in accepts. "
+                "Use voices: narrator, female, male, female2, male2 (different speakers different voices). Number questions from 1. Evidence must quote the script. "
+                "Never copy published test material. Return a self-reported confidence {\"test\": 0-1}.",
+                {"exam": exam, "topic": topic, "part": part}, {}).model_dump()
+            item = {"id": f"gen-listening-{int(time.time())}", "kind": "listening", "exam": exam, "part": part, "topic": topic, **{k: output[k] for k in ("title", "context", "script", "groups")}}
+            return {"title": output["title"], "task_type": f"Listening Part {part}" if exam == "IELTS" else "Listening set", "prompt": output["context"], "content": item, "confidence": output["confidence"]}
+        output = self.structured(ReadingGen,
+            f"Write ONE ORIGINAL {exam} Academic Reading passage about '{topic}' (650-850 words, 5-7 paragraphs labelled A-G when using heading matching). "
+            "Then write 13 questions in 2-3 groups using authentic types: TRUE/FALSE/NOT GIVEN (tfng), YES/NO/NOT GIVEN (ynng), matching headings (matching, roman numeral keys with 2 extra headings), "
+            "multiple choice A-D (mcq) and sentence/summary completion (completion, answers copied verbatim from the passage, max two words). Include believable distractors. "
+            "Evidence must quote the passage. Never copy published material. Return a self-reported confidence {\"test\": 0-1}." if exam == "IELTS" else
+            f"Write ONE ORIGINAL TOEFL 2026 'Read an Academic Passage' text about '{topic}' (about 200-280 words, 3 paragraphs) with 5 multiple-choice (A-D) questions including one vocabulary-in-context item. "
+            "Evidence must quote the passage. Return a self-reported confidence {\"test\": 0-1}.",
+            {"exam": exam, "topic": topic}, {}).model_dump()
+        item = {"id": f"gen-reading-{int(time.time())}", "kind": "reading", "exam": exam, "part": 1, "topic": topic, "minutes": 20 if exam == "IELTS" else 8,
+                **{k: output[k] for k in ("title", "passage", "groups")}}
+        return {"title": output["title"], "task_type": "Academic Reading passage" if exam == "IELTS" else "Academic passage", "prompt": f"{output['title']}: {sum(len(g['questions']) for g in output['groups'])} questions.", "content": item, "confidence": output["confidence"]}
 
+    def _generate_writing(self, exam: str, topic: str, task: str, rng: random.Random) -> dict:
+        if exam == "TOEFL":
+            task = task if task in ("email", "discussion") else rng.choice(["email", "discussion"])
+            local_prompt = (f"You are a member of a university society about {topic}, and an upcoming event has been changed in a way that causes you a problem.\n\nWrite an email to the organiser. In your email, do the following:\n- Explain the problem.\n- Suggest a solution.\n- Ask a related question.\n\nWrite as much as you can and in complete sentences."
+                            if task == "email" else
+                            f"Your professor is leading a discussion about {topic}. Write a post responding to the professor's question, giving and supporting your opinion.\n\nProfessor: Should governments invest more public money in {topic}? Why or why not?\n\nStudent A: Yes. Public funding makes it available to everyone, not just people who can afford it.\n\nStudent B: I disagree. Private organisations are usually more efficient, and public money is needed elsewhere.")
+            out = self.structured(QuestionOutput, f"Write one ORIGINAL TOEFL 2026 '{'Write an Email' if task == 'email' else 'Academic Discussion'}' task about '{topic}' in the official layout "
+                                  "(email: situation + three bullet requirements; discussion: professor question and two short student posts with opposing views). Return a self-reported confidence {\"task\": 0-1}.",
+                                  {"topic": topic}, {"title": f"{topic.title()} - {'email' if task == 'email' else 'discussion'}", "prompt": local_prompt, "task_type": "Write an Email" if task == "email" else "Academic Discussion", "confidence": {"task": .84}}).model_dump()
+            item = {"id": f"gen-writing-{int(time.time())}", "kind": "writing", "exam": exam, "task": task, "title": out["title"], "topic": topic, "prompt": out["prompt"], "min_words": 100, "minutes": 7 if task == "email" else 10}
+            return {**out, "content": item}
+        task = task if task in ("task1", "task2") else "task2"
+        if task == "task1":
+            categories = rng.sample(["2000", "2005", "2010", "2015", "2020", "2025"], 4) if rng.random() < .5 else ["City A", "City B", "City C", "City D"]
+            categories.sort()
+            base = [rng.randint(20, 70) for _ in categories]
+            series = [{"name": "Men", "values": base}, {"name": "Women", "values": [max(5, v + rng.randint(-20, 20)) for v in base]}]
+            local = {"title": f"{topic.title()} participation", "task_type": "Academic Writing Task 1", "confidence": {"task": .82},
+                     "prompt": f"The chart below shows the percentage of men and women involved in {topic} in four {'years' if categories[0].isdigit() else 'cities'}. Summarise the information by selecting and reporting the main features, and make comparisons where relevant."}
+            out = self.structured(QuestionOutput, "Write the rubric sentence for one ORIGINAL IELTS Academic Writing Task 1 bar chart about the given topic and data. Return a self-reported confidence.",
+                                  {"topic": topic, "categories": categories, "series": series}, local).model_dump()
+            item = {"id": f"gen-writing-{int(time.time())}", "kind": "writing", "exam": exam, "task": "task1", "title": out["title"], "topic": topic, "prompt": out["prompt"],
+                    "chart": {"type": "bar", "title": out["title"], "unit": "%", "categories": categories, "series": series}, "min_words": 150, "minutes": 20}
+            return {**out, "content": item}
+        templates = [
+            "Some people think that {t} should receive more public funding, while others believe the money would be better spent elsewhere. Discuss both these views and give your own opinion.",
+            "In many countries, attitudes towards {t} have changed significantly in recent years. What are the reasons for this? Is it a positive or negative development?",
+            "{T} has become a major issue in many cities. What problems does it cause, and what solutions can you suggest?",
+            "To what extent do you agree or disagree that governments, rather than individuals, are responsible for {t}?",
+            "Some argue that {t} brings more advantages than disadvantages for society. Do the advantages outweigh the disadvantages?",
+        ]
+        prompt = rng.choice(templates).format(t=topic, T=topic[:1].upper() + topic[1:]) + "\n\nGive reasons for your answer and include any relevant examples from your own knowledge or experience."
+        out = self.structured(QuestionOutput, "Create one ORIGINAL IELTS Writing Task 2 question about the topic using an authentic question type (opinion, discussion, problem-solution, "
+                              "advantages-disadvantages or two-part) and the standard closing instruction. Never reproduce a published question. Return a self-reported confidence.",
+                              {"topic": topic}, {"title": f"{topic.title()} - Task 2", "prompt": prompt, "task_type": "Writing Task 2", "confidence": {"task": .84}}).model_dump()
+        item = {"id": f"gen-writing-{int(time.time())}", "kind": "writing", "exam": exam, "task": "task2", "title": out["title"], "topic": topic, "prompt": out["prompt"], "min_words": 250, "minutes": 40}
+        return {**out, "content": item}
+
+    def _generate_speaking(self, exam: str, topic: str, rng: random.Random) -> dict:
+        if exam == "TOEFL":
+            base = dict(bank.pick("TOEFL", "speaking", rng=rng))
+            questions = [f"Thanks for talking with me. How often do you encounter {topic} in your daily life?",
+                         f"What do you think is the most important benefit of {topic} for students?",
+                         f"Some people believe {topic} should be regulated more strictly. What is your view, and why?",
+                         f"Finally, how do you think {topic} will change over the next ten years?"]
+            out = self.structured(QuestionOutput, "Write four ORIGINAL TOEFL 2026 'Take an Interview' questions about the topic, from personal to abstract, separated by newlines. Return a self-reported confidence.",
+                                  {"topic": topic}, {"title": f"Interview: {topic}", "prompt": "\n".join(questions), "task_type": "Listen and Repeat + Interview", "confidence": {"task": .84}}).model_dump()
+            lines = [line.strip() for line in out["prompt"].split("\n") if line.strip().endswith("?")][:4] or questions
+            item = {**base, "id": f"gen-speaking-{int(time.time())}", "title": out["title"], "topic": topic, "interview": {"scenario": f"A researcher is interviewing students about {topic}.", "questions": lines}}
+            return {**out, "content": item}
+        local = {"title": f"Speaking test: {topic}", "cue": f"Describe an experience you had that was connected with {topic}.",
+                 "bullets": ["what happened", "when and where it happened", "who was involved", f"and explain how you felt about it"],
+                 "closing": f"Would you like to have a similar experience again?", "part3_theme": topic,
+                 "part3_questions": [f"Why do you think {topic} matters to people today?", f"How has {topic} changed compared with the past?",
+                                     f"Should governments do more to support {topic}?", f"What might {topic} look like in the future?"],
+                 "confidence": {"task": .84}}
+        out = self.structured(SpeakingGen, "Create an ORIGINAL IELTS Speaking Part 2 cue card ('Describe ...' + 3-4 'You should say' bullets, the last starting 'and explain') "
+                              "with a short rounding-off question, plus 4 related Part 3 discussion questions from concrete to abstract. Never reproduce published cue cards. Return a self-reported confidence.",
+                              {"topic": topic}, local).model_dump()
+        test = bank.ielts_production.speaking_test(rng.randrange(1000))
+        item = {**test, "id": f"gen-speaking-{int(time.time())}", "title": out["title"], "topic": topic,
+                "part2": {"topic": topic, "cue": out["cue"], "bullets": out["bullets"], "closing": out["closing"]},
+                "part3": {"theme": out["part3_theme"], "questions": out["part3_questions"]}}
+        return {"title": out["title"], "task_type": "Full Speaking test (Parts 1-3)", "prompt": out["cue"], "content": item, "confidence": out["confidence"]}
+
+    # ---------------------------------------------------------------- plans and assessment
     def plan(self, profile: dict, progress: dict, adaptation: bool) -> PlanOutput:
         priorities = priority_tool.invoke({"priority_skills": profile["priority_skills"], "weakness_skills": progress.get("weaknesses", [])})
         change_request = progress.get("change_request")
@@ -150,63 +270,86 @@ class ProviderAdapter:
                     priorities.insert(0 if "less " + skill not in change_request.lower() else len(priorities), skill)
                     break
         total_minutes = profile["weekly_hours"] * 60
-        activities = [{"skill": skill, "title": f"{skill.title()} practice", "minutes_per_week": round(total_minutes * (.4 if index == 0 else .2)), "reason": "Priority from learner goals, change request or recent performance"} for index, skill in enumerate(priorities)]
-        demo = {"title": f"{profile['exam']} {'adapted' if adaptation else 'revised' if change_request else 'starter'} plan", "rationale": f"Focus on {', '.join(priorities[:2])} within {profile['weekly_hours']} study hours each week before {profile['exam_date']}." + (f" Learner requested: {change_request}." if change_request else ""), "priorities": priorities, "activities": activities, "changes": (["Increase practice on recent weak skills"] if adaptation else []) + ([f"Consider learner request: {change_request}"] if change_request else []), "confidence": {"plan": .87}}
-        return self.structured(PlanOutput, "You are the Learning Coordinator. Propose actionable IELTS or TOEFL study activities. Return confidence as a self-reported heuristic, not a calibrated probability.", {"profile": profile, "progress": progress, "adaptation": adaptation}, demo)
+        detail = {"writing": "Write one Task 2 essay and one Task 1 report; revise using the feedback", "speaking": "Complete a full speaking test with the AI examiner and redo Part 2",
+                  "reading": "Do one timed passage (20 min) and review every wrong answer", "listening": "Do one listening part at exam speed and study the transcript"}
+        activities = [{"skill": skill, "title": detail[skill] if index < 2 else f"{skill.title()} maintenance practice", "minutes_per_week": round(total_minutes * (.4 if index == 0 else .25 if index == 1 else .175)),
+                       "reason": "Weakest verified skill" if skill in progress.get("weaknesses", []) else "Learner priority" if skill in profile["priority_skills"] else "Keep all four skills balanced"}
+                      for index, skill in enumerate(priorities)]
+        local = {"title": f"{profile['exam']} {'adapted' if adaptation else 'revised' if change_request else 'starter'} plan",
+                 "rationale": f"Focus on {', '.join(priorities[:2])} within {profile['weekly_hours']} study hours each week before {profile['exam_date']}." + (f" Learner requested: {change_request}." if change_request else ""),
+                 "priorities": priorities, "activities": activities,
+                 "changes": (["Increase practice on recent weak skills"] if adaptation else []) + ([f"Consider learner request: {change_request}"] if change_request else []), "confidence": {"plan": .87}}
+        return self.structured(PlanOutput, "You are the Learning Coordinator. Propose actionable IELTS or TOEFL weekly study activities (skill, title, minutes_per_week, reason) whose minutes sum to the "
+                               "learner's weekly hours. Return confidence as a self-reported heuristic, not a calibrated probability.", {"profile": profile, "progress": progress, "adaptation": adaptation}, local)
 
-    def prompt(self, exam: str, skill: str, proficiency: str = "intermediate") -> dict:
-        prompts = {
-            "writing": "Some employers allow remote work. Discuss benefits and drawbacks and support your position with examples." if exam == "IELTS" else "In an academic discussion, explain whether flexible work improves productivity and support your view with an example.",
-            "speaking": "Describe a professional skill you learned. Explain how you learned it and why it matters." if exam == "IELTS" else "Do you prefer working alone or in a team? Give reasons and an example.",
-            "reading": "Passage: Flexible working can reduce commuting time, but research also identifies communication challenges. Teams that set clear routines often report stronger collaboration. Question: What can help teams collaborate?",
-            "listening": "Transcript for demo listening: The seminar starts at nine, but the workshop has moved to ten. Bring your notes to the workshop. Question: When is the workshop?",
-        }
-        guidance = ("Start with one clear reason and example." if proficiency == "beginner" else "Include a counterargument or more nuanced example." if proficiency == "advanced" else "Support your answer with a specific example.") if skill in ("writing", "speaking") else ""
-        if self.config.demo_mode:
-            return {"title": f"{exam} {skill.title()} practice", "text": prompts[skill] + " " + guidance, "answer_key": "clear routines" if skill == "reading" else "ten" if skill == "listening" else None, "mode": "DEMO", "duration_seconds": 120 if skill == "speaking" else 2400 if skill == "writing" else 600}
-        # The LLM generates only task text; deterministic answers are kept for objective prototype tasks.
-        if skill in ("reading", "listening"):
-            return {"title": f"{exam} {skill.title()} practice", "text": prompts[skill] + " " + guidance, "answer_key": "clear routines" if skill == "reading" else "ten", "mode": "REAL", "duration_seconds": 600}
-        response = self.llm.invoke([("system", f"Write one original {exam} {skill} practice task. Return only the task text."), ("human", f"Level: {proficiency}")])
-        return {"title": f"{exam} {skill.title()} practice", "text": response.content, "answer_key": None, "mode": "REAL", "duration_seconds": 120 if skill == "speaking" else 2400}
+    def prompt(self, exam: str, skill: str, avoid: set[str] | None = None) -> dict:
+        """Pick an item from the curated bank, preferring ones the learner has not seen."""
+        item = bank.pick(exam, skill, avoid)
+        return practice_prompt(item, "ORIGINAL")
 
-    def feedback(self, exam: str, skill: str, text: str, scenario: str) -> FeedbackOutput:
-        words = text.split()
-        if exam == "IELTS":
-            labels = ["task_response", "coherence", "lexical_resource", "grammar"] if skill == "writing" else ["fluency", "lexical_resource", "grammar", "pronunciation"]
-            base = 6.0 if len(words) >= 20 else 5.5
-            scores = {label: base for label in labels}
-        else:
-            labels = ["task_fulfillment", "organisation", "language_use"] if skill == "writing" else ["delivery", "language_use", "topic_development"]
-            base = 4.0 if len(words) >= 20 else 3.5
-            scores = {label: base for label in labels}
-        if skill == "speaking":
-            scores.pop("pronunciation" if exam == "IELTS" else "delivery")  # Audio delivery cannot be inferred from text.
-        demo = {"summary": "Demo heuristic feedback: the response addresses the task; add more specific evidence and clearer transitions.", "criteria": scores, "comments": [{"sentence": text.split(".")[0][:160], "issue": "Develop the supporting example", "suggestion": "Add one concrete example and explain how it supports your claim."}], "improvements": ["Use a specific example", "Check paragraph transitions"], "confidence": {label: (.42 if scenario == "low_confidence" else .84) for label in scores}, "pronunciation_available": False, "pronunciation_note": "Audio pronunciation/delivery assessment is unavailable. Transcript-based fluency is approximate; timing and acoustics are not assessed." if skill == "speaking" else None}
-        if scenario == "contradiction":
-            first = next(iter(scores))
-            demo["summary"] = f"Excellent {first.replace('_', ' ')} with no weaknesses."
-            demo["criteria"][first] = 2.0
-        if scenario == "invalid":
-            demo["confidence"] = {}
-        system = f"You are an exam practice tutor and assessor. Use distinct {exam} {skill} criteria. Return exactly these criterion keys: {', '.join(scores)}. TOEFL 2026 uses 1-6 section scale; IELTS uses 0-9 bands. Never infer pronunciation or audio delivery from text. For speaking mark pronunciation_available false and explain the missing audio assessment. Provide sentence-specific feedback and self-reported confidence for every criterion. These are unofficial estimates."
-        return self.structured(FeedbackOutput, system, {"exam": exam, "skill": skill, "response": text[:12000]}, demo)
+    def feedback(self, exam: str, skill: str, text: str, scenario: str, prompt: str = "", task: str = "task2", metrics: dict | None = None) -> FeedbackOutput:
+        local = analyse_response(exam, skill, text, prompt, task, metrics)
+        if self.local:
+            if scenario == "low_confidence":
+                local["confidence"] = {key: .42 for key in local["criteria"]}
+            if scenario == "contradiction":
+                first = next(iter(local["criteria"]))
+                local["summary"] = f"Excellent {first.replace('_', ' ')} with no weaknesses."
+                local["criteria"][first] = 2.0
+            if scenario == "invalid":
+                local["confidence"] = {}
+        keys = ", ".join(local["criteria"])
+        system = (f"You are an experienced {exam} examiner and tutor assessing {skill} ({task}). {RUBRICS[exam]} "
+                  f"Return exactly these criterion keys: {keys}. IELTS uses 0-9 half bands; TOEFL 2026 uses a 1-6 scale in half points. "
+                  "Base scores on the response; the 'measured_features' are objective counts you may use as evidence. "
+                  "Give 3-6 sentence-specific comments (quote the sentence, name the issue, give a concrete fix), 3-4 improvements, up to 5 improved_sentences "
+                  "({original, improved}), and a short model_answer paragraph showing a higher-band version of one part. "
+                  "Never infer pronunciation from a transcript: set pronunciation_available false and explain that audio was not assessed. "
+                  "Provide self-reported confidence (0-1) for every criterion. These are unofficial estimates.")
+        output = self.structured(FeedbackOutput, system, {"exam": exam, "skill": skill, "task": task, "question": prompt[:3000], "response": text[:12000],
+                                                          "measured_features": local["analysis"], "delivery_metrics": metrics or {}}, local)
+        if not self.local:
+            output.analysis = local["analysis"]
+            if skill != "speaking":
+                output.pronunciation_note = None
+        return output
 
     def consistency(self, payload: dict) -> VerdictOutput:
         scores = payload.get("criteria", {})
         summary = payload.get("summary", "").lower()
         issues = bool(scores) and ("excellent" in summary or "no weaknesses" in summary) and min(scores.values()) <= 3
-        demo = {"consistent": not issues, "reason": "Praise conflicts with a very low criterion score" if issues else "No obvious score and feedback contradiction", "confidence": .85}
-        return self.structured(VerdictOutput, "Check whether feedback statements contradict criterion scores. Be conservative and return a short reason.", {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, demo)
+        local = {"consistent": not issues, "reason": "Praise conflicts with a very low criterion score" if issues else "No obvious score and feedback contradiction", "confidence": .85}
+        return self.structured(VerdictOutput, "Check whether feedback statements contradict criterion scores. Be conservative and return a short reason.", {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local)
 
     def recommendations(self, catalog: list[dict], priorities: list[str]) -> RecommendationOutput:
         ranked = sorted(catalog, key=lambda item: item["skill"] not in priorities)[:4]
-        demo = {"items": [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": "Targets a priority or recent weak skill", "confidence": .84} for item in ranked], "summary": "Ranked study material suggestions", "confidence": {str(item["id"]): .84 for item in ranked}}
-        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only catalog IDs provided, explain each match and return self-reported confidence per item.", {"catalog": catalog, "priorities": priorities}, demo)
+        local = {"items": [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": f"Targets your {'priority' if item['skill'] in priorities else 'supporting'} skill: {item['skill']}", "confidence": .84} for item in ranked],
+                 "summary": "Ranked study material suggestions", "confidence": {str(item["id"]): .84 for item in ranked}}
+        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only catalog IDs provided, explain each match and return self-reported confidence per item.", {"catalog": catalog, "priorities": priorities}, local)
 
     def report(self, progress: dict) -> ReportNarrative:
-        demo = {"summary": "Demo estimate from verified practice results. Continue work on the lowest-scoring skills.", "recommendations": [f"Practise {skill} twice this week" for skill in progress.get("weaknesses", [])] or ["Collect more practice results"], "confidence": {"report": .81}}
-        return self.structured(ReportNarrative, "You are the Assessment and Analytics agent. Explain observed scores conservatively; readiness is an estimate and never an official score. Return self-reported confidence.", progress, demo)
+        scores = progress.get("skill_scores", {})
+        best = max(scores, key=scores.get) if scores else None
+        local = {"summary": (f"Across {progress.get('sample_count', 0)} verified results, your strongest skill is {best} ({scores[best]}). " if best else "")
+                 + (f"Focus next on {', '.join(progress.get('weaknesses', []))}." if progress.get("weaknesses") else "Collect more practice results for a clearer picture."),
+                 "recommendations": [f"Practise {skill} twice this week and review every feedback comment" for skill in progress.get("weaknesses", [])] or ["Collect more practice results"],
+                 "confidence": {"report": .81}}
+        return self.structured(ReportNarrative, "You are the Assessment and Analytics agent. Explain observed scores conservatively; readiness is an estimate and never an official score. Return self-reported confidence.", progress, local)
+
+
+def practice_prompt(item: dict, source: str) -> dict:
+    """Shape a bank item into the Practice.prompt record (answer keys stay server-side)."""
+    kind = item["kind"]
+    if kind in ("listening", "reading"):
+        test = bank.wrap(kind, [item])
+        minutes = item.get("minutes") or (10 if kind == "listening" else 20)
+        return {"title": item["title"], "text": item.get("context") or item["title"], "mode": source, "task_type": bank.task_type(item) if item["id"] in bank.ALL else kind,
+                "duration_seconds": minutes * 60, "test": test, "content_id": item["id"]}
+    if kind == "writing":
+        return {"title": item["title"], "text": item["prompt"], "mode": source, "task_type": bank.task_type(item) if item["id"] in bank.ALL else item["task"], "task": item["task"],
+                "duration_seconds": item.get("minutes", 40) * 60, "min_words": item.get("min_words", 250), "chart": item.get("chart"), "content_id": item["id"]}
+    return {"title": item["title"], "text": item.get("part2", {}).get("cue") or item.get("interview", {}).get("scenario", item["title"]), "mode": source,
+            "task_type": "Full Speaking test", "duration_seconds": 900, "test": item, "content_id": item["id"]}
 
 
 class AgentRuntime:
@@ -244,7 +387,8 @@ class AgentRuntime:
         t = time.perf_counter()
         self.event(state, "AI Tutor", "perception", {"skill": state["skill"], "response_length": len(state["text"])})
         try:
-            result = self.provider.feedback(state["profile"]["exam"], state["skill"], state["text"], state.get("scenario", "normal")).model_dump()
+            result = self.provider.feedback(state["profile"]["exam"], state["skill"], state["text"], state.get("scenario", "normal"),
+                                            state.get("prompt", ""), state.get("task") or "task2", state.get("metrics")).model_dump()
         except Exception as exc:
             result = {"summary": "Feedback generation failed structured validation", "criteria": {}, "comments": [], "confidence": {}, "error_type": type(exc).__name__}
         self.event(state, "AI Tutor", "handoff", {"decision": "generate feedback", "next_agent": "Assessment & Analytics", "tool": "LLM adapter"}, t)
@@ -302,6 +446,8 @@ class AgentRuntime:
             issues.append("Learner portrait is incomplete")
         if state["workflow"] == "question" and (not payload.get("title") or not payload.get("prompt") or not payload.get("task_type")):
             issues.append("Generated question is incomplete")
+        if state["workflow"] == "question" and isinstance(payload.get("content"), dict) and payload["content"].get("kind") in ("listening", "reading"):
+            issues.extend(validate_test(payload["content"]))
         if state["workflow"] == "question" and "official ielts" in (str(payload.get("title", "")) + " " + str(payload.get("prompt", ""))).lower():
             issues.append("Generated question must not claim to be official IELTS content")
         package.state = "CHECKING"

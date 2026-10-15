@@ -16,6 +16,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="learner")
     token_version: Mapped[int] = mapped_column(Integer, default=0)
+    avatar: Mapped[str] = mapped_column(String(20), default="witch")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
@@ -84,6 +85,7 @@ class QuestionItem(Base):
     topic: Mapped[str] = mapped_column(String(80))
     source_kind: Mapped[str] = mapped_column(String(24))
     source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    content: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     package_id: Mapped[int | None] = mapped_column(ForeignKey("result_packages.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
@@ -130,6 +132,21 @@ class Submission(Base):
     audio_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer)
     package_id: Mapped[int | None] = mapped_column(ForeignKey("result_packages.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class SpeakingSession(Base):
+    __tablename__ = "speaking_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    practice_id: Mapped[int | None] = mapped_column(ForeignKey("practice_sessions.id"), nullable=True)
+    mock_id: Mapped[int | None] = mapped_column(ForeignKey("mock_examinations.id"), nullable=True)
+    exam: Mapped[str] = mapped_column(String(10))
+    persona: Mapped[str] = mapped_column(String(20), default="witch")
+    test: Mapped[dict] = mapped_column(JSON)
+    state: Mapped[dict] = mapped_column(JSON)
+    log: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

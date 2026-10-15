@@ -1,44 +1,153 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Bookmark, Check, ChevronLeft, ChevronRight, Clock3, FileText, Flag, Save } from 'lucide-react'
-import { Mock, post, put, request } from './api'
+import { Check, ChevronRight, Clock3, FileText, Send } from 'lucide-react'
+import { Mock, ObjectiveTest, WritingTask, post, put, request } from './api'
+import { HeldNotice, Notify, PageTitle, ScoreBar, Spinner, Status, clock, nice, words } from './ui'
+import ListeningPlayer, { useClipPlayer } from './exam/ListeningPlayer'
+import { Answers, ReviewItem, SectionQuestions, answeredCount, questionCount } from './exam/Questions'
+import { Passage, Transcript } from './exam/ObjectivePractice'
+import ChartView from './exam/ChartView'
+import SpeakingStudio from './exam/SpeakingStudio'
 
-type Notify=(message:string,kind?:'success'|'error')=>void
-const sections=['listening','reading','writing','speaking']
-const nice=(value:string)=>value.charAt(0).toUpperCase()+value.slice(1)
-const formatTime=(seconds:number)=>`${Math.floor(seconds/60).toString().padStart(2,'0')}:${(seconds%60).toString().padStart(2,'0')}`
+const SECTIONS = ['listening', 'reading', 'writing', 'speaking'] as const
+const parse = (value?: string) => { try { return JSON.parse(value || '{}') } catch { return {} } }
 
-export default function MockExamPage({notify}:{notify:Notify}){
-  const [exams,setExams]=useState<Mock[]>([])
-  const [current,setCurrent]=useState<Mock|null>(null)
-  const [section,setSection]=useState('listening')
-  const [answer,setAnswer]=useState('')
-  const [busy,setBusy]=useState(false)
-  const [fontSize,setFontSize]=useState(16)
-  const [flags,setFlags]=useState<string[]>([])
-  const [clock,setClock]=useState(Date.now())
-  useEffect(()=>{request<Mock[]>('/mock-exams').then(setExams).catch(e=>notify(e.message,'error'));const id=window.setInterval(()=>setClock(Date.now()),1000);return()=>window.clearInterval(id)},[])
-  const exam=current||exams.find(item=>item.status==='IN_PROGRESS')||exams[0]||null
-  useEffect(()=>{setAnswer(exam?.answers?.[section]||'')},[exam?.id,section,exam?.answers?.[section]])
-  useEffect(()=>{if(exam){try{setFlags(JSON.parse(localStorage.getItem(`mock-flags-${exam.id}`)||'[]'))}catch{setFlags([])}}},[exam?.id])
-  const remaining=exam?Math.max(0,Math.ceil((new Date(exam.created_at).getTime()+exam.duration_seconds*1000-clock)/1000)):0
-  const savedCount=exam?sections.filter(skill=>Boolean(exam.answers?.[skill]?.trim())).length:0
-  const start=async()=>{setBusy(true);try{const created=await post<Mock>('/mock-exams');setCurrent(created);setExams(previous=>[created,...previous]);setSection('listening');notify('Reduced-length mock started')}catch(e){notify((e as Error).message,'error')}finally{setBusy(false)}}
-  const save=async(showToast=true)=>{if(!exam||!answer.trim())return exam;await put(`/mock-exams/${exam.id}/${section}`,{answer});const updated=await request<Mock>(`/mock-exams/${exam.id}`);setCurrent(updated);if(showToast)notify('Answer saved. You can resume later.');return updated}
-  const move=async(next:string)=>{if(!exam)return;try{if(exam.status==='IN_PROGRESS'&&answer.trim()&&answer!==exam.answers?.[section])await save(false);setSection(next)}catch(e){notify((e as Error).message,'error')}}
-  const toggleFlag=()=>{if(!exam)return;const updated=flags.includes(section)?flags.filter(item=>item!==section):[...flags,section];setFlags(updated);localStorage.setItem(`mock-flags-${exam.id}`,JSON.stringify(updated))}
-  const submit=async()=>{if(!exam)return;setBusy(true);try{const updated=await save(false)||exam;const missing=sections.filter(skill=>!(skill===section?answer:updated.answers?.[skill])?.trim());if(missing.length){notify(`Complete these sections before submitting: ${missing.map(nice).join(', ')}`,'error');return}const completed=await post<Mock>(`/mock-exams/${exam.id}/submit`);setCurrent(completed);setExams(previous=>previous.map(item=>item.id===completed.id?completed:item));notify('Mock submitted for quality verification')}catch(e){notify((e as Error).message,'error')}finally{setBusy(false)}}
-  if(!exam)return <div className="space-y-6"><div><span className="eyebrow">Assessment rehearsal</span><h1 className="heading mt-1 text-3xl">Computer-style mock exam</h1></div><div className="card max-w-3xl p-8"><h2 className="heading text-2xl">Before you begin</h2><p className="mt-3 text-slate-600">This is a 28-minute reduced-length practice simulation with one task in each of Listening, Reading, Writing and Speaking. It is not an official IELTS computer test. Accept a learning plan first.</p><ul className="mt-5 list-inside list-disc space-y-1 text-sm text-slate-600"><li>Answers save by section and can be resumed.</li><li>The timer continues across page refreshes.</li><li>All four sections are required before submission.</li><li>Speaking here uses a written response; no live examiner is simulated.</li></ul><div className="mt-7 flex flex-wrap gap-3"><button onClick={start} disabled={busy} className="btn-primary">Start reduced mock<ChevronRight size={18}/></button><Link to="/plans" className="btn-secondary">View learning plan</Link></div></div></div>
-  const sectionData=exam.sections[section]
-  const index=sections.indexOf(section)
-  return <div className="overflow-hidden rounded-2xl border border-slate-300 bg-white shadow-sm">
-    <div className="flex flex-wrap items-center justify-between gap-3 bg-[#17324d] px-5 py-4 text-white"><div><p className="text-xs font-bold uppercase tracking-widest text-cyan-200">Unofficial computer-style practice</p><h1 className="text-lg font-bold">{exam.exam} reduced-length mock</h1></div><div className="flex items-center gap-4"><span className={`flex items-center gap-2 rounded-lg px-3 py-2 font-mono text-lg font-bold ${remaining<300?'bg-red-600':'bg-white/15'}`}><Clock3 size={18}/>{formatTime(remaining)}</span><Link to="/dashboard" className="rounded-lg border border-white/30 px-3 py-2 text-sm font-semibold">Exit and resume later</Link></div></div>
-    <div className="border-b border-slate-200 bg-slate-50 px-5 py-3 text-sm text-slate-600"><strong className="text-ink">Practice format:</strong> Four short sections · {savedCount}/4 saved · Timer persists after leaving · Estimated scores only</div>
-    <nav className="flex overflow-x-auto border-b border-slate-200" aria-label="Exam sections">{sections.map((skill,i)=><button key={skill} onClick={()=>move(skill)} className={`flex min-w-[145px] flex-1 items-center justify-center gap-2 border-b-4 px-4 py-4 text-sm font-bold ${section===skill?'border-teal bg-mint text-teal':'border-transparent text-slate-600 hover:bg-slate-50'}`}><span className="grid h-6 w-6 place-items-center rounded-full border border-current text-xs">{i+1}</span>{nice(skill)}{exam.answers?.[skill]&&<Check size={15}/>}{flags.includes(skill)&&<Flag size={14}/>}</button>)}</nav>
-    <div className="grid min-h-[460px] lg:grid-cols-2"><section className="border-b border-slate-200 p-6 lg:border-b-0 lg:border-r"><div className="flex items-center justify-between"><span className="eyebrow">Section {index+1} · {nice(section)}</span><div className="flex items-center gap-1 text-xs"><button onClick={()=>setFontSize(value=>Math.max(13,value-1))} className="rounded border px-2 py-1" aria-label="Decrease text size">A−</button><button onClick={()=>setFontSize(value=>Math.min(22,value+1))} className="rounded border px-2 py-1" aria-label="Increase text size">A+</button></div></div><h2 className="heading mt-3 text-2xl">{sectionData.title}</h2><p className="mt-2 text-xs text-slate-500">Suggested section time: {Math.round(sectionData.duration_seconds/60)} minutes</p><div className="mt-6 whitespace-pre-wrap leading-relaxed text-slate-800" style={{fontSize}}>{sectionData.text}</div>{section==='listening'&&<p className="mt-5 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">This prototype supplies a transcript instead of official listening audio.</p>}{section==='speaking'&&<p className="mt-5 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">IELTS Speaking is conducted with an examiner. This shortened practice collects a written response only.</p>}</section>
-      <section className="flex flex-col p-6"><div className="flex items-center justify-between"><span className="eyebrow">Your response</span><button onClick={toggleFlag} className={`flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold ${flags.includes(section)?'bg-amber-100 text-amber-800':'text-slate-500 hover:bg-slate-100'}`}><Bookmark size={15}/>{flags.includes(section)?'Flagged':'Flag for review'}</button></div><label htmlFor="mock-answer" className="mt-4 text-sm font-semibold text-slate-700">Question 1 of 1</label><textarea id="mock-answer" className="input mt-2 min-h-[260px] flex-1 resize-y" disabled={exam.status!=='IN_PROGRESS'} value={answer} onChange={event=>setAnswer(event.target.value)} placeholder="Type your answer here…"/><div className="mt-3 flex justify-between text-xs text-slate-500"><span>{answer.trim()?answer.trim().split(/\s+/).length:0} words</span><span>{answer===exam.answers?.[section]?'Saved':'Unsaved changes'}</span></div></section></div>
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 p-4"><div className="flex gap-2"><button disabled={index===0} onClick={()=>move(sections[index-1])} className="btn-secondary"><ChevronLeft size={17}/>Previous</button><button disabled={index===sections.length-1} onClick={()=>move(sections[index+1])} className="btn-secondary">Next<ChevronRight size={17}/></button></div>{exam.status==='IN_PROGRESS'?<div className="flex gap-2"><button disabled={busy||!answer.trim()} onClick={()=>save().catch(e=>notify(e.message,'error'))} className="btn-secondary"><Save size={17}/>Save answer</button><button disabled={busy} onClick={submit} className="btn-primary">Submit all sections<FileText size={17}/></button></div>:<span className="font-bold text-teal">{exam.status}</span>}</div>
-    {exam.result&&<div className="border-t border-slate-200 p-6"><h2 className="heading text-xl">Mock result · {exam.result.state}</h2>{exam.result.state==='RELEASED'?<><p className="mt-2 text-sm text-slate-600">Unofficial {exam.result.source_mode==='DEMO'?'deterministic demo':'AI-generated'} estimate</p><div className="mt-4 grid gap-3 sm:grid-cols-4">{Object.entries(exam.result.payload?.section_scores||{}).map(([skill,score])=><div key={skill} className="rounded-lg bg-mint p-3"><span className="text-xs uppercase text-teal">{skill}</span><p className="text-xl font-bold">{String(score)}</p></div>)}</div></>:<p className="mt-2 text-amber-700">Result held for quality or instructor review.</p>}</div>}
-    <div className="border-t border-slate-100 p-4"><button onClick={start} disabled={busy} className="text-sm font-semibold text-teal underline">Start a new reduced-length mock</button></div>
+function Results({ exam }: { exam: Mock }) {
+  const result = exam.result!
+  const [open, setOpen] = useState<string>('listening')
+  if (result.state !== 'RELEASED') return <HeldNotice result={result} />
+  const p = result.payload || {}
+  const max = exam.exam === 'IELTS' ? 9 : 6
+  const details = p.details || {}
+  return <div className="space-y-6">
+    <div className="panel panel-hot flex flex-wrap items-center gap-6 p-6">
+      <div className="grid h-32 w-32 place-items-center bg-abyss" style={{ boxShadow: '0 0 0 4px #ff4fd8' }}><span className="num text-8xl text-magenta">{p.estimated_overall}</span></div>
+      <div className="min-w-0 flex-1"><span className="eyebrow">Overall estimate · {p.score_scale}</span><p className="mt-3 font-pixel text-2xl">{p.readiness}</p><p className="mt-2 font-read text-sm text-mist">{p.summary}</p></div>
+    </div>
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{Object.entries(p.section_scores || {}).map(([skill, score]) => <ScoreBar key={skill} label={skill} score={Number(score)} max={max} />)}</div>
+    {details.listening && <div className="panel p-6">
+      <div className="flex flex-wrap gap-2">{SECTIONS.map(s => <button key={s} className={open === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setOpen(s)}>{nice(s)}</button>)}</div>
+      <div className="mt-5 space-y-4 font-read">
+        {(open === 'listening' || open === 'reading') && <>
+          <p>{details[open].summary}</p>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{(details[open].review as ReviewItem[]).map(item => <div key={item.n} className={`tile text-sm ${item.correct ? '' : 'tile-hot'}`}><b className="font-pixel">{item.n}.</b> {item.correct ? <span className="text-lime">✓ {item.given}</span> : <><span className="text-rose line-through">{item.given || '—'}</span> → <span className="text-lime">{item.answer}</span></>}</div>)}</div>
+          {open === 'listening' && details.listening.transcript && <details className="tile"><summary className="cursor-pointer font-pixel text-cyan">Transcript</summary><div className="mt-3"><Transcript sections={details.listening.transcript} evidence={(details.listening.review as ReviewItem[]).map(r => r.evidence)} /></div></details>}
+        </>}
+        {open === 'writing' && Object.entries(details.writing || {}).map(([task, fb]: [string, any]) => <div key={task} className="tile space-y-2"><p className="font-pixel text-lg text-sun">{task === 'task1' ? 'Task 1' : task === 'task2' ? 'Task 2' : nice(task)} · band {fb.band}</p><p>{fb.summary}</p>{fb.comments?.map((c: any, i: number) => <p key={i} className="text-sm text-mist">▸ <b>{c.issue}</b>: {c.suggestion}</p>)}</div>)}
+        {open === 'speaking' && details.speaking && <div className="tile space-y-2"><p>{details.speaking.summary}</p><div className="flex flex-wrap gap-2">{Object.entries(details.speaking.criteria || {}).map(([k, v]) => <span key={k} className="pill text-cyan">{nice(k)} {String(v)}</span>)}</div>{details.speaking.comments?.map((c: any, i: number) => <p key={i} className="text-sm text-mist">▸ <b>{c.issue}</b>: {c.suggestion}</p>)}<p className="text-xs text-sun">{details.speaking.pronunciation_note}</p></div>}
+      </div>
+    </div>}
+  </div>
+}
+
+export default function MockExamPage({ notify }: { notify: Notify }) {
+  const [exams, setExams] = useState<Mock[] | null>(null)
+  const [exam, setExam] = useState<Mock | null>(null)
+  const [section, setSection] = useState<typeof SECTIONS[number]>('listening')
+  const [answers, setAnswers] = useState<Record<string, Answers>>({})
+  const [task, setTask] = useState(0)
+  const [part, setPart] = useState(0)
+  const [busy, setBusy] = useState(false)
+  const [now, setNow] = useState(Date.now())
+  const saveTimer = useRef(0)
+  const clips = useClipPlayer('exam')
+
+  const open = (item: Mock) => {
+    setExam(item)
+    setAnswers(Object.fromEntries(SECTIONS.filter(s => s !== 'speaking').map(s => [s, parse(item.answers[s])])))
+  }
+  useEffect(() => {
+    request<Mock[]>('/mock-exams').then(list => { setExams(list); const active = list.find(m => m.status === 'IN_PROGRESS' && !m.legacy); if (active) open(active) }).catch(e => notify(e.message, 'error'))
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [])
+
+  const create = async (length: 'short' | 'full') => {
+    setBusy(true)
+    try { const created = await post<Mock>('/mock-exams', { length }); open(created); setSection('listening'); setExams(prev => [created, ...(prev || [])]); notify(`${length === 'full' ? 'Full-length' : 'Short'} mock started — good luck!`) }
+    catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const save = (skill: string, value: Answers) => {
+    if (!exam) return
+    window.clearTimeout(saveTimer.current)
+    saveTimer.current = window.setTimeout(() => { put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(value) }).catch(e => notify(e.message, 'error')) }, 900)
+  }
+  const setAnswer = (skill: string, key: string, value: string) => setAnswers(prev => { const next = { ...prev, [skill]: { ...(prev[skill] || {}), [key]: value } }; save(skill, next[skill]); return next })
+  const reload = async () => { if (exam) open(await request<Mock>(`/mock-exams/${exam.id}`)) }
+  const submit = async () => {
+    if (!exam) return
+    setBusy(true)
+    try {
+      window.clearTimeout(saveTimer.current)
+      for (const skill of ['listening', 'reading', 'writing']) await put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(answers[skill] || {}) })
+      const done = await post<Mock>(`/mock-exams/${exam.id}/submit`)
+      open(done); notify('Mock exam marked')
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+
+  const listening: ObjectiveTest | undefined = exam?.sections.listening
+  const reading: ObjectiveTest | undefined = exam?.sections.reading
+  const tasks: WritingTask[] = exam?.sections.writing?.tasks || []
+  const remaining = exam ? Math.max(0, Math.round((new Date(exam.created_at).getTime() + exam.duration_seconds * 1000 - now) / 1000)) : 0
+  const progress = useMemo(() => exam ? {
+    listening: listening ? `${answeredCount(listening.sections, answers.listening || {})}/${questionCount(listening.sections)}` : '',
+    reading: reading ? `${answeredCount(reading.sections, answers.reading || {})}/${questionCount(reading.sections)}` : '',
+    writing: tasks.map(t => words(answers.writing?.[t.task] || '')).join(' + ') + ' words',
+    speaking: exam.answers.speaking ? 'saved' : 'not started',
+  } : {}, [exam, answers]) as Record<string, string>
+
+  if (!exams) return <Spinner label="Loading the exam hall…" />
+  if (!exam || exam.legacy) return <>
+    <PageTitle eyebrow="Assessment rehearsal" title="Mock examination" subtitle="A computer-delivered exam in the real format: recorded listening with multiple speakers, authentic reading question types, both writing tasks and a live spoken interview with your pixel examiner." />
+    <div className="grid gap-6 md:grid-cols-2">
+      <div className="panel panel-cyan space-y-4 p-7"><h2 className="heading text-2xl">Short mock · ~90 min</h2><p className="font-read text-mist">2 listening parts (20 questions), 1 reading passage, Writing Task 2, full speaking test. Ideal weekly check-in.</p><button className="btn-cyan" disabled={busy} onClick={() => create('short')}>Start short mock <ChevronRight size={17} /></button></div>
+      <div className="panel panel-hot space-y-4 p-7"><h2 className="heading text-2xl">Full mock · ~2 h 45 min</h2><p className="font-read text-mist">All 4 listening parts (40 questions), 3 reading passages (40 questions), Writing Task 1 + Task 2 and the full speaking test — like test day.</p><button className="btn-primary" disabled={busy} onClick={() => create('full')}>Start full mock <ChevronRight size={17} /></button></div>
+    </div>
+    <p className="mt-4 font-read text-sm text-fog">You need an active learning plan first. <Link to="/plans" className="text-cyan underline">Open learning plan</Link>. Results are unofficial estimates.</p>
+    {exams.filter(m => m.result).length > 0 && <div className="panel mt-8 p-6"><h2 className="section-title">Past mocks</h2><div className="mt-4 space-y-2">{exams.filter(m => m.result).map(m => <button key={m.id} className="tile flex w-full items-center justify-between text-left" onClick={() => open(m)}><span className="font-pixel">#{m.id} · {m.exam} {m.length} · {new Date(m.created_at).toLocaleDateString()}</span><span className="flex items-center gap-3">{m.result?.payload?.estimated_overall !== undefined && <b className="num text-3xl text-magenta">{m.result.payload.estimated_overall}</b>}<Status value={m.result!.state} /></span></button>)}</div></div>}
+  </>
+
+  const submitted = exam.status !== 'IN_PROGRESS'
+  return <div className="space-y-5">
+    <div className="panel panel-hot sticky top-2 z-20 flex flex-wrap items-center justify-between gap-4 p-4">
+      <div><p className="eyebrow">Unofficial computer-delivered practice</p><h1 className="mt-2 font-pixel text-xl">{exam.exam} {exam.length === 'full' ? 'full-length' : 'short'} mock #{exam.id}</h1></div>
+      <div className="flex flex-wrap items-center gap-3">
+        {!submitted && <span className={`flex items-center gap-2 px-3 py-1 ${remaining < 600 ? 'bg-rose text-night' : 'bg-abyss'}`} style={{ boxShadow: '0 0 0 3px #3ef0ff' }}><Clock3 size={18} /><span className="num text-4xl">{clock(remaining)}</span></span>}
+        {!submitted ? <button className="btn-primary" disabled={busy} onClick={submit}><Send size={16} /> {busy ? 'Marking…' : 'Submit all sections'}</button> : <button className="btn-secondary" onClick={() => setExam(null)}>Back to exam hall</button>}
+      </div>
+    </div>
+    {submitted ? (exam.result ? <Results exam={exam} /> : <Spinner />) : <>
+      <nav className="flex flex-wrap gap-1" aria-label="Exam sections">{SECTIONS.map((s, i) => <button key={s} onClick={() => setSection(s)} className={section === s ? 'btn-primary' : 'btn-secondary'}>
+        <span className="font-arcade text-[10px]">{i + 1}</span> {nice(s)} <span className="font-read text-xs normal-case opacity-80">{progress[s]}</span>{s === 'speaking' && exam.answers.speaking && <Check size={15} />}
+      </button>)}</nav>
+
+      <div style={{ display: section === 'listening' ? undefined : 'none' }}>{listening && <div className="space-y-5">
+        <ListeningPlayer sections={listening.sections} mode="exam" />
+        <div className="panel p-6">{listening.sections.map(s => <div key={s.id} className="mb-8"><h3 className="mb-3 font-arcade text-xs text-magenta">{s.title}</h3>
+          <SectionQuestions section={s} answers={answers.listening || {}} setAnswer={(n, v) => setAnswer('listening', String(n), v)} onPlayClip={q => clips.play(q)} /></div>)}</div>
+      </div>}</div>
+
+      {section === 'reading' && reading && <div className="space-y-3">
+        {reading.sections.length > 1 && <div className="flex gap-1">{reading.sections.map((s, i) => <button key={s.id} className={part === i ? 'btn-cyan' : 'btn-secondary'} onClick={() => setPart(i)}>Passage {i + 1}</button>)}</div>}
+        <div className="grid gap-5 lg:grid-cols-2">
+          <div className="panel max-h-[72vh] overflow-y-auto p-6"><Passage section={reading.sections[Math.min(part, reading.sections.length - 1)]} /></div>
+          <div className="panel max-h-[72vh] overflow-y-auto p-6"><SectionQuestions section={reading.sections[Math.min(part, reading.sections.length - 1)]} answers={answers.reading || {}} setAnswer={(n, v) => setAnswer('reading', String(n), v)} /></div>
+        </div>
+      </div>}
+
+      {section === 'writing' && <div className="space-y-3">
+        {tasks.length > 1 && <div className="flex gap-1">{tasks.map((t, i) => <button key={t.id} className={task === i ? 'btn-cyan' : 'btn-secondary'} onClick={() => setTask(i)}>{t.task === 'task1' ? 'Task 1' : t.task === 'task2' ? 'Task 2' : nice(t.task)}</button>)}</div>}
+        {tasks[task] && <div className="grid gap-5 xl:grid-cols-2">
+          <div className="panel panel-sun space-y-4 p-6"><span className="eyebrow">{tasks[task].title} · {tasks[task].minutes} min suggested</span><p className="reading whitespace-pre-line">{tasks[task].prompt}</p>{tasks[task].chart && <ChartView chart={tasks[task].chart!} />}</div>
+          <div className="panel p-6"><label className="label" htmlFor="mock-writing"><FileText size={14} className="mr-1 inline" />Your response</label>
+            <textarea id="mock-writing" className="input min-h-[24rem] leading-7" value={answers.writing?.[tasks[task].task] || ''} onChange={e => setAnswer('writing', tasks[task].task, e.target.value)} spellCheck={false} />
+            <p className={`mt-2 font-pixel ${words(answers.writing?.[tasks[task].task] || '') >= tasks[task].min_words ? 'text-lime' : 'text-sun'}`}>{words(answers.writing?.[tasks[task].task] || '')} / {tasks[task].min_words} words · autosaved</p></div>
+        </div>}
+      </div>}
+
+      {section === 'speaking' && (exam.answers.speaking
+        ? <div className="panel panel-lime p-6 font-pixel text-lime">Speaking section complete and saved. <span className="font-read text-mist">Submit the exam when the other sections are done.</span></div>
+        : <SpeakingStudio notify={notify} mockId={exam.id} onSaved={reload} />)}
+    </>}
   </div>
 }

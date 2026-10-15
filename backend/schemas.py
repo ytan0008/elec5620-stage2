@@ -57,12 +57,26 @@ class PasswordResetConfirm(BaseModel):
 
 
 class SubmitInput(BaseModel):
-    text: str = Field(min_length=8, max_length=20000)
+    text: str = Field(default="", max_length=20000)
+    answers: dict[str, str] | None = None
+    task: str | None = None
+    metrics: dict[str, float] | None = None
+    # Quality-gate test hooks; honoured only by the local engine and never shown in the UI.
     scenario: Literal["normal", "low_confidence", "contradiction", "invalid"] = "normal"
+
+    @model_validator(mode="after")
+    def has_response(self):
+        if self.answers is None and len(self.text.strip()) < 8:
+            raise ValueError("Write at least a short response before submitting")
+        return self
 
 
 class ExamAnswerInput(BaseModel):
-    answer: str = Field(min_length=1, max_length=20000)
+    answer: str = Field(min_length=1, max_length=40000)
+
+
+class MockCreateInput(BaseModel):
+    length: Literal["full", "short"] = "short"
 
 
 class ReviewInput(BaseModel):
@@ -79,6 +93,9 @@ class FeedbackOutput(BaseModel):
     confidence: dict[str, float]
     pronunciation_available: bool = False
     pronunciation_note: str | None = None
+    improved_sentences: list[dict] = []
+    model_answer: str | None = None
+    analysis: dict = {}
 
     @field_validator("confidence")
     @classmethod
@@ -127,12 +144,43 @@ class OnboardingTurn(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
 
+Persona = Literal["witch", "boy"]
+
+
 class AgentChatTurn(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    persona: Persona = "witch"
 
 
 class AgentChatReply(BaseModel):
-    reply: str = Field(min_length=8, max_length=1500)
+    reply: str = Field(min_length=2, max_length=2000)
+
+
+class AvatarInput(BaseModel):
+    avatar: Persona
+
+
+class SpeakingStartInput(BaseModel):
+    question_id: int | None = None
+    mock_id: int | None = None
+    persona: Persona = "witch"
+
+
+class SpeakingTurnInput(BaseModel):
+    text: str = Field(default="", max_length=8000)
+    seconds: float = Field(default=0, ge=0, le=900)
+    event: Literal["answer", "ready"] = "answer"
+
+
+class TTSInput(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    voice: str = Field(default="female", max_length=20)
+    speed: float = Field(default=1.0, ge=0.5, le=1.5)
+
+
+class ExaminerTurn(BaseModel):
+    say: str = Field(min_length=2, max_length=900)
+    follow_up: bool = False
 
 
 class OnboardingExtraction(BaseModel):
@@ -155,8 +203,68 @@ class PortraitOutput(BaseModel):
 
 
 class QuestionGenerationInput(BaseModel):
-    skill: Literal["writing", "speaking"]
+    skill: Skill
     topic: str = Field(min_length=3, max_length=80)
+    task: Literal["task1", "task2", "part1", "part2", "part3", "part4", "email", "discussion", "auto"] = "auto"
+
+
+class GenLine(BaseModel):
+    speaker: str = Field(min_length=1, max_length=40)
+    voice: Literal["narrator", "female", "male", "female2", "male2"]
+    text: str = Field(min_length=2, max_length=1200)
+
+
+class GenOption(BaseModel):
+    key: str = Field(min_length=1, max_length=6)
+    text: str = Field(min_length=1, max_length=300)
+
+
+class GenQuestion(BaseModel):
+    n: int
+    prompt: str = Field(min_length=1, max_length=400)
+    options: list[GenOption] = []
+    answer: str = Field(min_length=1, max_length=80)
+    accepts: list[str] = []
+    evidence: str = Field(default="", max_length=400)
+
+
+class GenGroup(BaseModel):
+    title: str
+    type: Literal["completion", "mcq", "matching", "tfng", "ynng"]
+    instructions: str
+    heading: str | None = None
+    options: list[GenOption] = []
+    questions: list[GenQuestion] = Field(min_length=1)
+
+
+class GenParagraph(BaseModel):
+    label: str = ""
+    text: str = Field(min_length=20)
+
+
+class ListeningGen(BaseModel):
+    title: str = Field(min_length=3, max_length=120)
+    context: str = Field(min_length=5, max_length=300)
+    script: list[GenLine] = Field(min_length=4)
+    groups: list[GenGroup] = Field(min_length=1)
+    confidence: dict[str, float]
+
+
+class ReadingGen(BaseModel):
+    title: str = Field(min_length=3, max_length=120)
+    passage: list[GenParagraph] = Field(min_length=3)
+    groups: list[GenGroup] = Field(min_length=1)
+    confidence: dict[str, float]
+
+
+class SpeakingGen(BaseModel):
+    title: str = Field(min_length=3, max_length=120)
+    cue: str = Field(min_length=10, max_length=200)
+    bullets: list[str] = Field(min_length=3, max_length=4)
+    closing: str = Field(min_length=5, max_length=200)
+    part3_theme: str = Field(min_length=3, max_length=80)
+    part3_questions: list[str] = Field(min_length=3, max_length=5)
+    confidence: dict[str, float]
 
 
 class QuestionOutput(BaseModel):
