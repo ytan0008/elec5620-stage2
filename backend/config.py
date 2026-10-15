@@ -40,9 +40,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
+    def has_api_key(self) -> bool:
+        """False for an empty key or the shared placeholder (e.g. 'xxx' in .env.example)."""
+        key = self.openai_api_key.strip()
+        return bool(key) and key.lower() not in ("xxx", "your-key-here", "sk-xxx") and not set(key.lower()) <= {"x"}
+
+    @property
     def ai_mode(self) -> str:
         """REAL when a cloud model is configured, otherwise the built-in LOCAL engine."""
-        return "REAL" if self.openai_api_key and not self.demo_mode else "LOCAL"
+        return "REAL" if self.has_api_key and not self.demo_mode else "LOCAL"
 
 
 @lru_cache

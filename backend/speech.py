@@ -19,7 +19,7 @@ def _client():
 
 def server_speech_available() -> bool:
     config = settings()
-    return bool(config.openai_api_key) and not config.demo_mode and config.server_speech
+    return config.has_api_key and not config.demo_mode and config.server_speech
 
 
 def synthesise(text: str, voice: str = "female", speed: float = 1.0) -> Path:

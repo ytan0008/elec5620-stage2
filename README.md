@@ -80,7 +80,7 @@ npm.cmd run test:e2e
 docker compose up --build
 ```
 
-Open `http://localhost:8080`. Set `JWT_SECRET`, instructor credentials and (optionally) `OPENAI_API_KEY` in `.env` first.
+Open `http://localhost:8080`. It runs straight after cloning with the defaults in `.env.example` (local engine). To use the cloud model, copy `.env.example` to `.env`, replace `OPENAI_API_KEY=xxx` with your own key and run `docker compose up -d` again. Never commit `.env`.
 
 ## Troubleshooting
 
