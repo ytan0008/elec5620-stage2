@@ -52,6 +52,16 @@ class OnboardingSession(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
+class AgentConversation(Base):
+    __tablename__ = "agent_conversations"
+    __table_args__ = (UniqueConstraint("user_id", "context"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    context: Mapped[str] = mapped_column(String(30))
+    messages: Mapped[list] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
 class LearnerPortrait(Base):
     __tablename__ = "learner_portraits"
     id: Mapped[int] = mapped_column(primary_key=True)

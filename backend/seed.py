@@ -23,8 +23,8 @@ def seed():
             db.add(User(email=settings().instructor_email, name="Demo Instructor", role="instructor", password_hash=hash_password(settings().instructor_password)))
         if not db.scalar(select(Material.id)):
             db.add_all(Material(title=t, exam=e, skill=s, level=l, description=d, content=c) for t,e,s,l,d,c in MATERIALS)
-        if not db.scalar(select(QuestionItem.id)):
-            db.add_all(QuestionItem(exam=e, skill=s, task_type=task, title=title, prompt=prompt, answer_key=key, topic=topic, source_kind=kind, source_url=url) for e,s,task,title,prompt,key,topic,kind,url in QUESTIONS)
+        existing = set(db.scalars(select(QuestionItem.title).where(QuestionItem.user_id.is_(None))).all())
+        db.add_all(QuestionItem(exam=e, skill=s, task_type=task, title=title, prompt=prompt, answer_key=key, topic=topic, source_kind=kind, source_url=url) for e,s,task,title,prompt,key,topic,kind,url in QUESTIONS if title not in existing)
 
 
 if __name__ == "__main__":

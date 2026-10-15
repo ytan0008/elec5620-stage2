@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from backend.config import settings
 from backend.models import AgentEvent, AuditLog, Escalation, QualityCheck, ResultPackage, SystemSetting
-from backend.schemas import FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput, QuestionOutput
+from backend.schemas import FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput, QuestionOutput, AgentChatReply
 from backend.onboarding import parse_demo_message
 
 
@@ -68,6 +68,40 @@ class ProviderAdapter:
             "Do not invent missing values. Dates must be YYYY-MM-DD. Skills must be writing, speaking, reading or listening. "
             "Return null for fields not supplied in the latest message.",
             {"latest_message": message, "current_draft": draft}, demo,
+        )
+
+    def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict]) -> AgentChatReply:
+        """Instructional conversation; formal scores and plans use the verified workflows."""
+        skill = context if context in ("speaking", "writing", "reading", "listening") else None
+        lower = message.lower()
+        if skill == "speaking":
+            if any(word in lower for word in ("hello", "start", "question", "practice")):
+                reply = "Let's practise speaking. Tell me about a skill you learned recently. What was difficult at first, and how did you improve? Record your answer with the microphone, then I can ask a follow-up."
+            elif len(message.split()) < 8:
+                reply = "Can you add one concrete example? Describe what happened and why it mattered. You can answer aloud using the microphone."
+            else:
+                reply = "Thanks. What would you do differently if you had to learn that skill again? Give one reason and an example. For assessed feedback, submit your recorded practice response."
+        elif skill:
+            tips = {"writing": "State a clear position, then support each paragraph with a reason and example.", "reading": "Find the sentence in the passage that supports your answer before choosing it.", "listening": "Listen for corrections and signposts, then write down the final detail."}
+            reply = f"For {skill} practice, {tips[skill]} Tell me which part is difficult, or submit a task for quality-checked feedback."
+        else:
+            priorities = ", ".join(profile.get("priority_skills", [])) or "your chosen skills"
+            if "plan" in lower or "schedule" in lower:
+                reply = f"Your current focus is {priorities}. You have {profile.get('weekly_hours', 0)} study hours per week. Use the Learning plan page to create or request a verified plan change."
+            elif "profile" in lower or "goal" in lower:
+                reply = f"Your stated goal is {profile.get('exam')} {profile.get('target_score')} by {profile.get('exam_date')}. Your self-reported level is {profile.get('proficiency')}. You can edit these details on My profile."
+            else:
+                reply = f"I can help you understand your {profile.get('exam')} goal, profile and learning plan. Your stated priorities are {priorities}. What would you like to work on?"
+        if self.config.demo_mode:
+            return AgentChatReply(reply="DEMO assistant: " + reply)
+        return self.structured(
+            AgentChatReply,
+            f"You are the {'AI Tutor' if skill else 'Learning Coordinator'} in a learner-facing conversation about {context}. "
+            "Be concise, warm and ask at most one follow-up. Do not claim an official IELTS/TOEFL score, calibrated confidence, "
+            "verified plan or pronunciation analysis. Formal evaluations and recommendations require a separate quality-checked workflow. "
+            "Never ask for passwords or personal identity details.",
+            {"message": message, "profile": profile, "active_plan": plan, "recent_messages": history[-8:]},
+            {"reply": reply},
         )
 
     def portrait(self, profile: dict) -> PortraitOutput:

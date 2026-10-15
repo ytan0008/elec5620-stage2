@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 import json
 import smtplib
+import re
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,8 +13,8 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, OnboardingSession, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput
+from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
@@ -210,6 +211,47 @@ def onboarding_message(data: OnboardingTurn, user: User = Depends(learner), db: 
     db.add(AgentEvent(user_id=user.id, workflow="onboarding", agent="Learning Coordinator", phase="decision", detail={"captured_fields": list(extracted), "next_field": missing, "tool": "shared LLM adapter"}, mode=runtime.provider.mode))
     db.commit()
     return {"draft": draft, "messages": session.messages, "ready": missing is None, "completed": False, "next_field": missing, "assistant_message": reply, "mode": runtime.provider.mode}
+
+
+CHAT_CONTEXTS = {"profile", "plan", "speaking", "writing", "reading", "listening", "dashboard", "questions", "materials", "analytics", "knowledge", "portrait", "workflow", "settings"}
+
+
+def chat_record(db: Session, user_id: int, context: str) -> AgentConversation | None:
+    if context not in CHAT_CONTEXTS:
+        raise HTTPException(404, "Unknown conversation context")
+    return db.scalar(select(AgentConversation).where(AgentConversation.user_id == user_id, AgentConversation.context == context))
+
+
+@app.get("/api/chat/{context}")
+def chat_history(context: str, user: User = Depends(learner), db: Session = Depends(get_db)):
+    record = chat_record(db, user.id, context)
+    return {"context": context, "agent": "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator", "messages": record.messages if record else [], "mode": "DEMO" if settings().demo_mode else "REAL"}
+
+
+@app.post("/api/chat/{context}")
+def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), db: Session = Depends(get_db)):
+    record = chat_record(db, user.id, context)
+    profile = profile_for(db, user)
+    plan = db.scalar(select(Plan).where(Plan.user_id == user.id, Plan.status == "ACTIVE").order_by(Plan.id.desc()))
+    runtime = AgentRuntime(db)
+    started = datetime.now(timezone.utc)
+    try:
+        # Remove obvious contact details before any external model call; history is redacted too.
+        def safe_text(value: str) -> str:
+            value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email redacted]", value)
+            return re.sub(r"(?<!\w)(?:\+?\d[\d ()-]{8,}\d)(?!\w)", "[phone redacted]", value)
+        safe_history = [{"role": item.get("role"), "text": safe_text(item.get("text", ""))} for item in (record.messages if record else [])]
+        reply = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history).reply
+    except Exception:
+        raise HTTPException(503, "Agent reply unavailable; please try again")
+    if not record:
+        record = AgentConversation(user_id=user.id, context=context, messages=[])
+        db.add(record)
+    record.messages = (record.messages or [])[-38:] + [{"role": "learner", "text": data.message}, {"role": "assistant", "text": reply}]
+    agent = "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator"
+    db.add(AgentEvent(user_id=user.id, workflow="chat", agent=agent, phase="action", detail={"context": context, "decision": "respond to learner", "tool": "shared LLM adapter", "note": "Instructional chat; no verified score or plan released"}, mode=runtime.provider.mode, duration_ms=int((datetime.now(timezone.utc)-started).total_seconds()*1000)))
+    db.commit()
+    return {"context": context, "agent": agent, "messages": record.messages, "mode": runtime.provider.mode}
 
 
 @app.post("/api/onboarding/confirm")

@@ -36,6 +36,10 @@ Account recovery is available from **Sign in → Forgot password?**. Enter the r
 
 Run `python -m scripts.package_source` to create `ELEC5620-Stage2-Source.zip` for Canvas. It contains the source, migration, tests, documentation and Stage 1 PDF, with no local virtual environment, installed Node packages, database or credentials.
 
+After profile setup, the floating **Ask AI agent** control is available throughout the learner workspace except during Mock examination. My profile and Learning plan use the Learning Coordinator; Speaking, Writing, Reading and Listening use the AI Tutor. Other learner pages use Coordinator guidance. Each page keeps its own conversation history in SQLite. Instructional chat is not a scored or quality-verified result; formal plans and assessed feedback use their separate quality-checked workflows. Demo replies are explicitly labelled deterministic. Speaking chat can use browser speech recognition and spoken replies in supported browsers (such as Chrome or Edge): open **Talk to AI Tutor**, select the microphone, allow access, speak, then listen to the reply. The Speaking practice page separately records and stores audio for submission. Browser speech recognition may use a browser-managed online service and may be unavailable offline; typing and audio recording remain available. No pronunciation score is inferred from a transcript.
+
+The question bank seeds 17 original, directly usable IELTS-style tasks across four skills. These are original practice questions, not official past questions. Official samples remain source links: the [IELTS copyright terms](https://ielts.org/legal/ielts-copyright-and-trade-mark-statement) prohibit republishing publisher material on another website without written permission. Importing the complete official bank would require a licence. Seeding adds new curated tasks to an existing database without deleting generated questions.
+
 ## Docker alternative
 
 Copy `.env.example` to `.env`, set a private `JWT_SECRET` and instructor password, then run:

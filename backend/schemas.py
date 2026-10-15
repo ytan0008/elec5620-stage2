@@ -127,6 +127,14 @@ class OnboardingTurn(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
 
 
+class AgentChatTurn(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class AgentChatReply(BaseModel):
+    reply: str = Field(min_length=8, max_length=1500)
+
+
 class OnboardingExtraction(BaseModel):
     exam: Literal["IELTS", "TOEFL"] | None = None
     proficiency: Literal["beginner", "intermediate", "advanced"] | None = None

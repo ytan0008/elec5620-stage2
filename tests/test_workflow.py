@@ -31,6 +31,26 @@ def active_plan(client, headers):
     return plan_id
 
 
+def test_contextual_agent_chat_persists_and_respects_roles():
+    with TestClient(app) as client:
+        headers = auth(client, "chat@example.com")
+        first = client.post("/api/chat/profile", headers=headers, json={"message": "What is my goal?"})
+        assert first.status_code == 200, first.text
+        assert first.json()["agent"] == "Learning Coordinator"
+        assert "IELTS 7" in first.json()["messages"][-1]["text"]
+        follow_up = client.post("/api/chat/speaking", headers=headers, json={"message": "Hello, let's practice."})
+        assert follow_up.status_code == 200, follow_up.text
+        assert follow_up.json()["agent"] == "AI Tutor"
+        assert "DEMO assistant" in follow_up.json()["messages"][-1]["text"]
+        assert len(client.get("/api/chat/profile", headers=headers).json()["messages"]) == 2
+        assert len(client.get("/api/chat/speaking", headers=headers).json()["messages"]) == 2
+        other = auth(client, "otherchat@example.com")
+        assert client.get("/api/chat/profile", headers=other).json()["messages"] == []
+        assert client.get("/api/chat/mock", headers=headers).status_code == 404
+        instructor_token = client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]
+        assert client.get("/api/chat/profile", headers={"Authorization": "Bearer " + instructor_token}).status_code == 403
+
+
 def test_registration_plan_quality_and_human_review():
     with TestClient(app) as client:
         bad = client.post("/api/auth/register", json={"email": "bad", "name": "X"})
