@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 import json
+import smtplib
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,8 +12,9 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, Profile, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
-from backend.schemas import RegisterInput, LoginInput, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput
+from backend.models import User, PasswordReset, Profile, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput
+from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.agents import AgentRuntime
 from backend.seed import seed
 
@@ -116,6 +118,51 @@ def login(data: LoginInput, db: Session = Depends(get_db)):
     if not user or not hasher.verify(data.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
     return {"token": token_for(user), "user": dto(user, "id", "email", "name", "role")}
+
+
+@app.post("/api/auth/password-reset/request")
+def request_password_reset(data: PasswordResetRequest, db: Session = Depends(get_db)):
+    config = settings()
+    if not config.demo_mode and not mail_ready():
+        raise HTTPException(503, "Password recovery email is not configured")
+    response = {"message": "If this email has an account, a reset link has been issued."}
+    token = new_reset_token()
+    user = db.scalar(select(User).where(User.email == data.email.lower()))
+    if user:
+        now = datetime.now(timezone.utc)
+        for previous in db.scalars(select(PasswordReset).where(PasswordReset.user_id == user.id, PasswordReset.used_at.is_(None))):
+            previous.used_at = now
+        db.add(PasswordReset(user_id=user.id, token_hash=token_digest(token), expires_at=now + timedelta(minutes=30)))
+        db.add(AuditLog(user_id=user.id, action="password_reset_requested", detail={"delivery": "demo" if config.demo_mode else "email"}))
+        if not config.demo_mode:
+            try:
+                send_reset_email(user.email, token)
+            except (OSError, smtplib.SMTPException):
+                db.rollback()
+                raise HTTPException(503, "Recovery email could not be sent; please try again later")
+        db.commit()
+    if config.demo_mode:
+        response["demo_reset_path"] = reset_path(token)
+        response["demo_notice"] = "DEMO ONLY: this link is shown on screen because email delivery is not configured."
+    return response
+
+
+@app.post("/api/auth/password-reset/confirm")
+def confirm_password_reset(data: PasswordResetConfirm, db: Session = Depends(get_db)):
+    record = db.scalar(select(PasswordReset).where(PasswordReset.token_hash == token_digest(data.token)))
+    now = datetime.now(timezone.utc)
+    if not record or record.used_at is not None or record.expires_at.replace(tzinfo=timezone.utc) <= now:
+        raise HTTPException(400, "Reset link is invalid or expired")
+    user = db.get(User, record.user_id)
+    if not user:
+        raise HTTPException(400, "Reset link is invalid or expired")
+    user.password_hash = hash_password(data.password)
+    user.token_version += 1
+    for pending in db.scalars(select(PasswordReset).where(PasswordReset.user_id == user.id, PasswordReset.used_at.is_(None))):
+        pending.used_at = now
+    db.add(AuditLog(user_id=user.id, action="password_reset_completed", detail={"revoked_sessions": True}))
+    db.commit()
+    return {"message": "Password changed. Sign in with your new password."}
 
 
 @app.get("/api/me")

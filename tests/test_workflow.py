@@ -191,3 +191,93 @@ def test_missing_real_provider_returns_service_unavailable():
             assert "not configured" in unavailable.json()["detail"]
         finally:
             config.demo_mode, config.openai_api_key = original_mode, original_key
+
+
+def test_password_recovery_is_one_use_and_revokes_existing_sessions():
+    from urllib.parse import parse_qs, urlparse
+    from datetime import datetime, timedelta, timezone
+    from backend.db import SessionLocal
+    from backend.models import PasswordReset
+    from backend.recovery import token_digest
+    from sqlalchemy import select
+
+    with TestClient(app) as client:
+        headers = auth(client, "recover@example.com")
+        unknown = client.post("/api/auth/password-reset/request", json={"email": "unknown@example.com"})
+        issued = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"})
+        assert issued.status_code == 200
+        assert unknown.json()["message"] == issued.json()["message"]
+        assert "DEMO ONLY" in issued.json()["demo_notice"]
+        old_token = parse_qs(urlparse(issued.json()["demo_reset_path"]).query)["token"][0]
+        assert client.post("/api/auth/password-reset/confirm", json={"token": "x" * 32, "password": "NewPassword123!"}).status_code == 400
+        second = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"}).json()
+        token = parse_qs(urlparse(second["demo_reset_path"]).query)["token"][0]
+        assert client.post("/api/auth/password-reset/confirm", json={"token": old_token, "password": "NewPassword123!"}).status_code == 400
+        assert client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "short"}).status_code == 422
+        changed = client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "NewPassword123!"})
+        assert changed.status_code == 200, changed.text
+        assert client.post("/api/auth/password-reset/confirm", json={"token": token, "password": "AnotherPassword123!"}).status_code == 400
+        assert client.post("/api/auth/login", json={"email": "recover@example.com", "password": "Example123!"}).status_code == 401
+        assert client.post("/api/auth/login", json={"email": "recover@example.com", "password": "NewPassword123!"}).status_code == 200
+        assert client.get("/api/me", headers=headers).status_code == 401
+        expired = client.post("/api/auth/password-reset/request", json={"email": "recover@example.com"}).json()
+        expired_token = parse_qs(urlparse(expired["demo_reset_path"]).query)["token"][0]
+        with SessionLocal.begin() as db:
+            record = db.scalar(select(PasswordReset).where(PasswordReset.token_hash == token_digest(expired_token)))
+            record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        assert client.post("/api/auth/password-reset/confirm", json={"token": expired_token, "password": "AnotherPassword123!"}).status_code == 400
+
+
+def test_password_recovery_requires_mail_delivery_outside_demo():
+    from backend.config import settings
+    config = settings()
+    original_mode, original_host = config.demo_mode, config.smtp_host
+    try:
+        config.demo_mode = False
+        config.smtp_host = ""
+        with TestClient(app) as client:
+            response = client.post("/api/auth/password-reset/request", json={"email": "someone@example.com"})
+            assert response.status_code == 503
+            assert "not configured" in response.json()["detail"]
+    finally:
+        config.demo_mode, config.smtp_host = original_mode, original_host
+
+
+def test_password_recovery_email_delivery_and_failure(monkeypatch):
+    from backend.config import settings
+    from backend.db import SessionLocal
+    from backend.models import PasswordReset, User
+    from sqlalchemy import select, func
+    import backend.main as main_module
+
+    config = settings()
+    original = (config.demo_mode, config.smtp_host, config.smtp_from_email)
+    delivered = []
+    try:
+        config.demo_mode = False
+        config.smtp_host = "smtp.example.com"
+        config.smtp_from_email = "noreply@example.com"
+        monkeypatch.setattr(main_module, "send_reset_email", lambda address, token: delivered.append((address, token)))
+        with TestClient(app) as client:
+            register(client, "mail-recover@example.com")
+            issued = client.post("/api/auth/password-reset/request", json={"email": "mail-recover@example.com"})
+            assert issued.status_code == 200
+            assert "demo_reset_path" not in issued.json()
+            assert delivered[0][0] == "mail-recover@example.com"
+            assert client.post("/api/auth/password-reset/confirm", json={"token": delivered[0][1], "password": "MailedPassword123!"}).status_code == 200
+            assert client.post("/api/auth/login", json={"email": "mail-recover@example.com", "password": "MailedPassword123!"}).status_code == 200
+
+            def failed_delivery(address, token):
+                raise OSError("mail unavailable")
+
+            monkeypatch.setattr(main_module, "send_reset_email", failed_delivery)
+            with SessionLocal() as db:
+                user_id = db.scalar(select(User.id).where(User.email == "mail-recover@example.com"))
+                before = db.scalar(select(func.count()).select_from(PasswordReset).where(PasswordReset.user_id == user_id))
+            failed = client.post("/api/auth/password-reset/request", json={"email": "mail-recover@example.com"})
+            assert failed.status_code == 503
+            with SessionLocal() as db:
+                after = db.scalar(select(func.count()).select_from(PasswordReset).where(PasswordReset.user_id == user_id))
+            assert after == before
+    finally:
+        config.demo_mode, config.smtp_host, config.smtp_from_email = original

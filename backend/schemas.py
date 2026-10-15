@@ -32,6 +32,15 @@ class LoginInput(BaseModel):
     password: str
 
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
 class SubmitInput(BaseModel):
     text: str = Field(min_length=8, max_length=20000)
     scenario: Literal["normal", "low_confidence", "contradiction", "invalid"] = "normal"

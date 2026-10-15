@@ -30,6 +30,8 @@ Demo learner: `demo.learner@example.com` / `DemoLearner123!`. The demo seed crea
 
 The UI also supports registering a fresh learner. In Settings, the current mode is shown. Writing practice has explicit demo controls to produce normal, low confidence, contradictory or malformed outputs. Held results expose only the hold message to the learner; sign in as the instructor to inspect evidence and approve, correct or request more information.
 
+Account recovery is available from **Sign in → Forgot password?**. Enter the registered email and use the single-use link within 30 minutes to set a new password. In demo mode the page explicitly displays a test reset link because no mail server is required; this should only be used for a local demonstration. The same generic request message is returned for registered and unknown addresses. A completed reset invalidates earlier sign-in tokens. In real mode, configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM_EMAIL`, optional `SMTP_USERNAME`/`SMTP_PASSWORD`, `SMTP_USE_TLS`, and `PUBLIC_BASE_URL` (the browser-facing HTTPS origin) in `.env`. If mail is unavailable, recovery returns 503 instead of pretending a message was sent. Configure SMTP and external rate limiting before exposing the service publicly.
+
 Run `python -m scripts.package_source` to create `ELEC5620-Stage2-Source.zip` for Canvas. It contains the source, migration, tests, documentation and Stage 1 PDF, with no local virtual environment, installed Node packages, database or credentials.
 
 ## Docker alternative
@@ -63,7 +65,7 @@ This is an **educational preparation prototype**. Scores and readiness are estim
 ## Verification
 
 ```powershell
-.\.venv\Scripts\python -m pytest -q
+.\.venv\Scripts\python -m pytest tests -q
 Set-Location frontend
 npm.cmd run build
 npm.cmd run test:e2e
@@ -75,7 +77,7 @@ Playwright starts a separate demo database and backend automatically. For a clea
 
 The Stage 1 report in the root is the design source. [Traceability and status](docs/IMPLEMENTATION_STATUS.md) records what each use case actually does and what remains incomplete. The [Jira import backlog](docs/jira-backlog.csv) assigns four one-week sprints; [review templates](docs/agile-evidence.md) support honest sprint evidence.
 
-Current limits: no calibrated score validation, no official full-length examination, no audio listening clips, no configured pronunciation assessor, no live provider verification, and no load or accessibility audit. Draft autosave is in the browser; mock answers persist in SQLite. The frontend currently bundles all routes in one JavaScript chunk. For a production deployment, add email verification, password reset, rate limits, stronger secret management, object storage and security monitoring.
+Current limits: no calibrated score validation, no official full-length examination, no audio listening clips, no configured pronunciation assessor, no live provider verification, and no load or accessibility audit. Draft autosave is in the browser; mock answers persist in SQLite. The frontend currently bundles all routes in one JavaScript chunk. For a production deployment, add email verification, persistent rate limits, stronger secret management, object storage and security monitoring.
 
 ## Troubleshooting
 

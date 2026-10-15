@@ -17,14 +17,14 @@ def hash_password(password: str) -> str:
 
 
 def token_for(user: User) -> str:
-    return jwt.encode({"sub": str(user.id), "role": user.role, "exp": datetime.now(timezone.utc) + timedelta(hours=24)}, settings().jwt_secret, algorithm="HS256")
+    return jwt.encode({"sub": str(user.id), "role": user.role, "version": user.token_version, "exp": datetime.now(timezone.utc) + timedelta(hours=24)}, settings().jwt_secret, algorithm="HS256")
 
 
 def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(credentials.credentials, settings().jwt_secret, algorithms=["HS256"])
         user = db.get(User, int(payload["sub"]))
-        if user is None or user.role != payload["role"]:
+        if user is None or user.role != payload["role"] or user.token_version != payload.get("version"):
             raise ValueError("Account not found")
         return user
     except (jwt.PyJWTError, ValueError, KeyError):

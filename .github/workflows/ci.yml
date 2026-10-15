@@ -9,7 +9,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r requirements.txt
-      - run: pytest -q
+      - run: python -m pytest tests -q
       - run: alembic upgrade head
         env:
           DATABASE_URL: sqlite:///./ci_migration.db
