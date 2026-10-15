@@ -82,6 +82,10 @@ docker compose up --build
 
 Open `http://localhost:8080`. It runs straight after cloning with the defaults in `.env.example` (local engine). To use the cloud model, copy `.env.example` to `.env`, replace `OPENAI_API_KEY=xxx` with your own key and run `docker compose up -d` again. Never commit `.env`.
 
+## Canvas submission package
+
+`python scripts/package_source.py` creates `ELEC5620-Stage2-Source.zip` from every file tracked by git (no `.env`, databases, recordings or dependencies). The zip is not committed; generate it when submitting.
+
 ## Troubleshooting
 
 - **Microphone does nothing**: use Chrome/Edge on `localhost` or HTTPS and allow microphone access. You can always type answers.
