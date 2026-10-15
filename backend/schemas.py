@@ -154,6 +154,8 @@ class AgentChatTurn(BaseModel):
 
 class AgentChatReply(BaseModel):
     reply: str = Field(min_length=2, max_length=2000)
+    # Durable facts about the learner worth remembering (filled by the cloud model).
+    remember: list[str] = []
 
 
 class AvatarInput(BaseModel):
@@ -272,3 +274,51 @@ class QuestionOutput(BaseModel):
     prompt: str = Field(min_length=30)
     task_type: str = Field(min_length=5)
     confidence: dict[str, float]
+
+
+NotebookKind = Literal["mistake", "word", "grammar", "sentence"]
+
+
+class NotebookAddInput(BaseModel):
+    kind: NotebookKind
+    text: str = Field(min_length=1, max_length=4000)
+    context: str | None = Field(default=None, max_length=1200)
+    skill: str = Field(default="", max_length=20)
+    source: str = Field(default="", max_length=200)
+    category: str = Field(default="", max_length=120)
+    note: str | None = Field(default=None, max_length=2000)
+    correction: str | None = Field(default=None, max_length=2000)
+    language: str = Field(default="Chinese (Simplified)", max_length=40)
+
+
+class NotebookUpdateInput(BaseModel):
+    mastered: bool | None = None
+    note: str | None = Field(default=None, max_length=2000)
+    translation: str | None = Field(default=None, max_length=400)
+
+
+class NotebookReviewInput(BaseModel):
+    remembered: bool
+
+
+class NotebookRetryInput(BaseModel):
+    answer: str = Field(min_length=1, max_length=200)
+
+
+class MemoryInput(BaseModel):
+    kind: Literal["about", "goal", "preference", "difficulty", "progress", "note"] = "note"
+    text: str = Field(min_length=2, max_length=500)
+
+
+class WordInfo(BaseModel):
+    phonetic: str = ""
+    part_of_speech: str = ""
+    definition: str = Field(min_length=2, max_length=400)
+    translation: str = Field(default="", max_length=200)
+    example: str = Field(default="", max_length=300)
+    synonyms: list[str] = []
+    collocations: list[str] = []
+
+
+class CoachOutput(BaseModel):
+    message: str = Field(min_length=10, max_length=2500)

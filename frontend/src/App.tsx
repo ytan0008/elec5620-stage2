@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { Activity, ArrowRight, BookOpen, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
+import { Activity, ArrowRight, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Event, Health, Persona, Plan, Profile, Result, User, health, post, put } from './api'
+import { Event, Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
 import { Empty, Metric, Notify, PageTitle, SKILL_COLOR, Spinner, Status, nice, skills, stamp, useLoad } from './ui'
 import { PixelAvatar, personaName } from './pixel/Avatar'
 import Scene from './pixel/Scene'
@@ -18,8 +18,11 @@ import AgentChat from './AgentChat'
 import ObjectivePractice from './exam/ObjectivePractice'
 import WritingPractice from './exam/WritingPractice'
 import SpeakingPage from './exam/SpeakingPage'
+import TutorPage from './notebook/TutorPage'
+import NotebookPage from './notebook/NotebookPage'
+import SelectionCapture from './notebook/SelectionCapture'
 
-const learnerNav = [['/dashboard', 'Overview', LayoutDashboard], ['/practice/listening', 'Listening', Headphones], ['/practice/reading', 'Reading', BookOpen], ['/practice/writing', 'Writing', FileText], ['/practice/speaking', 'Speaking', Mic],
+const learnerNav = [['/dashboard', 'Overview', LayoutDashboard], ['/tutor', 'AI Tutor', GraduationCap], ['/notebook', 'Notebooks', BookMarked], ['/practice/listening', 'Listening', Headphones], ['/practice/reading', 'Reading', BookOpen], ['/practice/writing', 'Writing', FileText], ['/practice/speaking', 'Speaking', Mic],
   ['/mock', 'Mock examination', ClipboardCheck], ['/questions', 'Question bank', Library], ['/plans', 'Learning plan', Target], ['/analytics', 'Performance', TrendingUp], ['/materials', 'Study materials', BookOpen],
   ['/knowledge', 'Knowledge graph', BrainCircuit], ['/portrait', 'Learning portrait', UserRound], ['/profile', 'My profile', UserRound], ['/workflow', 'Agent activity', Activity], ['/settings', 'Settings', Settings]] as const
 const onboardingNav = [['/onboarding', 'Setup assistant', BrainCircuit], ['/settings', 'Settings', Settings]] as const
@@ -65,6 +68,7 @@ function Dashboard({ user, notify }: { user: User; notify: Notify }) {
   const plans = useLoad<Plan[]>('/plans')
   const analytics = useLoad<any>('/analytics')
   const tasks = useLoad<{ id: number; skill: string; title: string; complete: boolean }[]>('/tasks')
+  const book = useLoad<NotebookStats>('/notebook/stats')
   const active = plans.data?.find(p => p.status === 'ACTIVE')
   const greeting = `Welcome back, ${user.name.split(' ')[0]}! Ready for today's quest? Your target is ${profile.data?.exam || 'your exam'} ${profile.data?.target_score ?? ''}.`
   const complete = async (id: number) => { try { await post(`/tasks/${id}/complete`); tasks.reload(); notify('Quest complete! +1 ✦') } catch (e) { notify((e as Error).message, 'error') } }
@@ -114,6 +118,12 @@ function Dashboard({ user, notify }: { user: User; notify: Notify }) {
         <Link to="/materials" className="btn-ghost mt-4">Explore study materials →</Link>
       </div>
     </div>
+    {book.data && <div className="panel panel-cyan mt-6 grid gap-4 p-6 md:grid-cols-[1fr_auto] md:items-center">
+      <div><h2 className="section-title">Notebooks</h2>
+        <p className="mt-2 font-read text-sm text-mist">{book.data.mistakes_by_type[0] ? <>You miss <b className="text-moon">{book.data.mistakes_by_type[0].name}</b> questions most ({book.data.mistakes_by_type[0].count}×). </> : 'Mistakes, unknown words and grammar slips are recorded automatically. '}
+          {book.data.grammar_issues[0] && <>Top grammar slip: <b className="text-moon">{book.data.grammar_issues[0].name}</b>. </>}{book.data.due_words > 0 && <span className="text-cyan">{book.data.due_words} words due for review.</span>}</p></div>
+      <div className="flex flex-wrap gap-2"><Link to="/notebook" className="btn-cyan">Open notebooks</Link><Link to="/tutor" className="btn-primary">Coach me</Link></div>
+    </div>}
   </>
 }
 
@@ -358,6 +368,8 @@ function AppInner() {
             <Route path="/portrait" element={<PortraitPage />} />
             <Route path="/analytics" element={<AnalyticsPage notify={notify} />} />
             <Route path="/materials" element={<MaterialsPage notify={notify} />} />
+            <Route path="/tutor" element={<TutorPage notify={notify} />} />
+            <Route path="/notebook" element={<NotebookPage notify={notify} />} />
           </>) : <>
           <Route path="/instructor" element={<InstructorPage notify={notify} />} />
           <Route path="/quality" element={<QualityPage notify={notify} />} />
@@ -365,7 +377,7 @@ function AppInner() {
         <Route path="/workflow" element={<WorkflowPage />} />
         <Route path="/settings" element={<SettingsPage user={user} />} />
         <Route path="*" element={<Navigate to={home} />} />
-      </Routes>{user.role === 'learner' && user.profile_complete !== false && <AgentChat />}</Shell>
+      </Routes>{user.role === 'learner' && user.profile_complete !== false && <><AgentChat /><SelectionCapture notify={notify} /></>}</Shell>
     </PersonaProvider> : <Routes><Route path="*" element={<AuthPage onAuth={auth} notify={notify} />} /></Routes>}
     {toast && <div role="status" className={`panel fixed bottom-24 left-1/2 z-[80] max-w-md -translate-x-1/2 px-5 py-3 font-pixel ${toast.kind === 'error' ? 'panel-hot text-rose' : 'panel-lime text-lime'}`}>{toast.message}</div>}
   </div>

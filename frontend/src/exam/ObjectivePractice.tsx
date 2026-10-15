@@ -102,6 +102,7 @@ export default function ObjectivePractice({ skill, notify }: { skill: 'listening
         <p className="font-pixel text-2xl">{p.raw_score} / {p.total} correct</p>
         <p className="font-read text-mist">{p.summary}</p>
         <div className="flex flex-wrap gap-2">{Object.entries(p.question_types || {}).map(([k, v]) => <span key={k} className="pill text-cyan">{k}: {String(v)}</span>)}<Status value={result!.state} /></div>
+        {p.raw_score < p.total && <Link to="/notebook?tab=mistake" className="btn-ghost !px-0">{p.total - p.raw_score} wrong answer(s) saved to your Mistake book →</Link>}
       </div>
       <button className="btn-primary" onClick={() => load(true)}>Next test <ArrowRight size={16} /></button>
     </div>}

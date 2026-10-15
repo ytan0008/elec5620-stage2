@@ -13,13 +13,14 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput
+from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
-from backend.scoring import grade_objective, strip_answers, overall_band
+from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
+from backend import notebook
 from backend.speech import server_speech_available, synthesise, transcribe
 from backend import content as bank
 from backend import examiner
@@ -237,7 +238,12 @@ def onboarding_message(data: OnboardingTurn, user: User = Depends(learner), db: 
     return {"draft": draft, "messages": session.messages, "ready": missing is None, "completed": False, "next_field": missing, "assistant_message": reply, "mode": runtime.provider.mode}
 
 
-CHAT_CONTEXTS = {"profile", "plan", "speaking", "writing", "reading", "listening", "dashboard", "questions", "materials", "analytics", "knowledge", "portrait", "workflow", "settings"}
+CHAT_CONTEXTS = {"profile", "plan", "speaking", "writing", "reading", "listening", "dashboard", "questions", "materials", "analytics", "knowledge", "portrait", "workflow", "settings", "tutor", "notebook"}
+TUTOR_CONTEXTS = ("speaking", "writing", "reading", "listening", "tutor", "notebook")
+
+
+def agent_for(context: str) -> str:
+    return "AI Tutor" if context in TUTOR_CONTEXTS else "Learning Coordinator"
 
 
 def chat_record(db: Session, user_id: int, context: str) -> AgentConversation | None:
@@ -249,7 +255,30 @@ def chat_record(db: Session, user_id: int, context: str) -> AgentConversation | 
 @app.get("/api/chat/{context}")
 def chat_history(context: str, user: User = Depends(learner), db: Session = Depends(get_db)):
     record = chat_record(db, user.id, context)
-    return {"context": context, "agent": "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator", "messages": record.messages if record else [], "mode": settings().ai_mode}
+    return {"context": context, "agent": agent_for(context), "messages": record.messages if record else [], "mode": settings().ai_mode}
+
+
+def safe_text(value: str) -> str:
+    """Remove obvious contact details before any external model call."""
+    value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email redacted]", value)
+    return re.sub(r"(?<!\w)(?:\+?\d[\d ()-]{8,}\d)(?!\w)", "[phone redacted]", value)
+
+
+def save_word(db: Session, runtime: AgentRuntime, user: User, word: str, context: str = "", skill: str = "", source: str = "", language: str = "Chinese (Simplified)") -> tuple[NotebookEntry, bool]:
+    existing = db.scalar(select(NotebookEntry).where(NotebookEntry.user_id == user.id, NotebookEntry.kind == "word", NotebookEntry.key == notebook.norm(word)))
+    detail = {"contexts": [context] if context else []}
+    if not existing or not (existing.detail or {}).get("meanings"):
+        dictionary = notebook.dictionary_lookup(word) if " " not in word.strip() or len(word) < 30 else {}
+        try:
+            detail.update(runtime.provider.word_info(word, context, language, dictionary))
+        except Exception:
+            detail.update(dictionary)
+    return notebook.add_entry(db, user.id, "word", word.strip().lower(), skill=skill, source=source, detail=detail)
+
+
+def due_word(db: Session, user_id: int) -> NotebookEntry | None:
+    return db.scalar(select(NotebookEntry).where(NotebookEntry.user_id == user_id, NotebookEntry.kind == "word", NotebookEntry.mastered.is_(False))
+                     .order_by(NotebookEntry.next_review, NotebookEntry.count.desc()))
 
 
 @app.post("/api/chat/{context}")
@@ -259,23 +288,208 @@ def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), 
     plan = db.scalar(select(Plan).where(Plan.user_id == user.id, Plan.status == "ACTIVE").order_by(Plan.id.desc()))
     runtime = AgentRuntime(db)
     started = datetime.now(timezone.utc)
+    history = record.messages if record else []
+    actions, events, quiz = [], [], None
+    # Quiz answer: the previous tutor turn asked the learner to use a saved word.
+    last = history[-1] if history else {}
+    if last.get("quiz"):
+        entry = db.scalar(select(NotebookEntry).where(NotebookEntry.user_id == user.id, NotebookEntry.kind == "word", NotebookEntry.key == notebook.norm(last["quiz"])))
+        used = re.search(rf"\b{re.escape(last['quiz'][:max(3, len(last['quiz']) - 2)])}", data.message, flags=re.I)
+        errors = find_errors(data.message, spoken=True)
+        if entry:
+            notebook.review(entry, bool(used) and not errors)
+        verdict = (f"Nice — you used “{last['quiz']}” correctly. " if used and not errors else
+                   f"You didn't use “{last['quiz']}” — try again later. " if not used else f"Good use of “{last['quiz']}”, but check this: {errors[0]['suggestion']} ")
+        actions.append(verdict + (notebook.word_summary(entry) if entry and not used else "") + " Say “quiz me” for another word.")
+        events.append({"type": "quiz", "word": last["quiz"], "remembered": bool(used) and not errors})
+    elif notebook.is_quiz_request(data.message):
+        entry = due_word(db, user.id)
+        if entry:
+            quiz = entry.text
+            hint = ((entry.detail or {}).get("meanings") or [{}])[0].get("definition", "")
+            actions.append(f"Quiz time! Make your own sentence using “{entry.text}”." + (f" Hint: {hint}" if hint else ""))
+        else:
+            actions.append("Your word book is empty or fully mastered. Select any unfamiliar word on a page, or tell me “I don't know the word …”, and I'll save it for quizzes.")
+    for word in notebook.requested_words(data.message):
+        quoted = re.search(r"sentence[^\"“]*[\"“]([^\"”]{8,600})[\"”]", data.message)
+        entry, created = save_word(db, runtime, user, word, context=quoted.group(1) if quoted else "", skill=context if context in ("speaking", "writing", "reading", "listening") else "", source=f"Chat · {context}")
+        actions.append(f"📒 {'Saved' if created else 'Already in your word book (count +1)'}: {notebook.word_summary(entry)}")
+        events.append({"type": "word", "id": entry.id, "word": entry.text, "created": created})
+    for kind, text in notebook.extract_memories(data.message):
+        notebook.remember(db, user.id, kind, text)
+        events.append({"type": "memory", "text": text})
+    memory_texts = [item.text for item in notebook.memories(db, user.id)]
+    summary = notebook.stats(db, user.id)
     try:
-        # Remove obvious contact details before any external model call; history is redacted too.
-        def safe_text(value: str) -> str:
-            value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email redacted]", value)
-            return re.sub(r"(?<!\w)(?:\+?\d[\d ()-]{8,}\d)(?!\w)", "[phone redacted]", value)
-        safe_history = [{"role": item.get("role"), "text": safe_text(item.get("text", ""))} for item in (record.messages if record else [])]
-        reply = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history, data.persona).reply
+        safe_history = [{"role": item.get("role"), "text": safe_text(item.get("text", ""))} for item in history]
+        result = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history, data.persona,
+                                       memory_texts, {k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "counts")}, actions)
     except Exception:
         raise HTTPException(503, "Agent reply unavailable; please try again")
+    for text in result.remember[:3]:
+        if 4 <= len(text) <= 300:
+            notebook.remember(db, user.id, "note", text, source="tutor")
+            events.append({"type": "memory", "text": text})
     if not record:
         record = AgentConversation(user_id=user.id, context=context, messages=[])
         db.add(record)
-    record.messages = (record.messages or [])[-38:] + [{"role": "learner", "text": data.message}, {"role": "assistant", "text": reply}]
-    agent = "AI Tutor" if context in ("speaking", "writing", "reading", "listening") else "Learning Coordinator"
-    db.add(AgentEvent(user_id=user.id, workflow="chat", agent=agent, phase="action", detail={"context": context, "decision": "respond to learner", "tool": "shared LLM adapter", "note": "Instructional chat; no verified score or plan released"}, mode=runtime.provider.mode, duration_ms=int((datetime.now(timezone.utc)-started).total_seconds()*1000)))
+    reply = {"role": "assistant", "text": result.reply, **({"quiz": quiz} if quiz else {})}
+    record.messages = (record.messages or [])[-58:] + [{"role": "learner", "text": data.message}, reply]
+    db.add(AgentEvent(user_id=user.id, workflow="chat", agent=agent_for(context), phase="action", detail={"context": context, "decision": "respond to learner with memory", "memories_used": len(memory_texts), "notebook_actions": [e["type"] for e in events], "tool": "shared LLM adapter"},
+                      mode=runtime.provider.mode, duration_ms=int((datetime.now(timezone.utc) - started).total_seconds() * 1000)))
     db.commit()
-    return {"context": context, "agent": agent, "messages": record.messages, "mode": runtime.provider.mode}
+    return {"context": context, "agent": agent_for(context), "messages": record.messages, "mode": runtime.provider.mode, "events": events}
+
+
+# ---------------------------------------------------------------- notebooks
+
+def notebook_owned(db: Session, entry_id: int, user: User) -> NotebookEntry:
+    entry = db.get(NotebookEntry, entry_id)
+    if not entry or entry.user_id != user.id:
+        raise HTTPException(404, "Notebook entry not found")
+    return entry
+
+
+@app.get("/api/notebook")
+def list_notebook(kind: str | None = None, skill: str | None = None, include_mastered: bool = True, user: User = Depends(learner), db: Session = Depends(get_db)):
+    query = select(NotebookEntry).where(NotebookEntry.user_id == user.id)
+    if kind:
+        if kind not in notebook.KINDS:
+            raise HTTPException(400, "Unknown notebook")
+        query = query.where(NotebookEntry.kind == kind)
+    if skill:
+        query = query.where(NotebookEntry.skill == skill)
+    if not include_mastered:
+        query = query.where(NotebookEntry.mastered.is_(False))
+    return [notebook.view(entry) for entry in db.scalars(query.order_by(NotebookEntry.updated_at.desc()).limit(500))]
+
+
+@app.get("/api/notebook/stats")
+def notebook_stats(user: User = Depends(learner), db: Session = Depends(get_db)):
+    return notebook.stats(db, user.id)
+
+
+@app.post("/api/notebook")
+def add_notebook(data: NotebookAddInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    runtime = AgentRuntime(db)
+    text = re.sub(r"\s+", " ", data.text).strip()
+    if data.kind == "word":
+        if len(text) > 60 or len(text.split()) > 5:
+            raise HTTPException(422, "Select a single word or short phrase for the word book")
+        entry, created = save_word(db, runtime, user, text.strip(".,;:!?\"'()“”‘’"), data.context or "", data.skill, data.source, data.language)
+    elif data.kind == "sentence":
+        patterns = notebook.sentence_patterns(text)
+        entry, created = notebook.add_entry(db, user.id, "sentence", text, category=data.category or ", ".join(patterns[:3]) or "Useful sentence", skill=data.skill, source=data.source,
+                                            detail={"origin": "saved", "patterns": patterns, **({"note": data.note} if data.note else {})})
+    elif data.kind == "grammar":
+        found = find_errors(text, spoken=False)
+        issue = data.category or (found[0]["issue"] if found else "Grammar note")
+        entry, created = notebook.add_entry(db, user.id, "grammar", text, key=f"{notebook.norm(issue)}|{notebook.norm(text)}", category=issue, skill=data.skill, source=data.source or "Added manually",
+                                            detail={"issue": issue, "suggestion": data.note or (found[0]["suggestion"] if found else ""), "correction": data.correction or (found[0].get("correction", "") if found else "")})
+    else:
+        entry, created = notebook.add_entry(db, user.id, "mistake", text, category=data.category or "Other", skill=data.skill, source=data.source or "Added manually",
+                                            detail={"type": "completion", "answer": data.correction or "", "note": data.note or ""})
+    db.commit()
+    return {**notebook.view(entry), "created": created}
+
+
+@app.patch("/api/notebook/{entry_id}")
+def update_notebook(entry_id: int, data: NotebookUpdateInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    entry = notebook_owned(db, entry_id, user)
+    if data.mastered is not None:
+        entry.mastered = data.mastered
+    detail = dict(entry.detail or {})
+    if data.note is not None:
+        detail["note"] = data.note
+    if data.translation is not None:
+        detail["translation"] = data.translation
+    entry.detail = detail
+    db.commit()
+    return notebook.view(entry)
+
+
+@app.delete("/api/notebook/{entry_id}")
+def delete_notebook(entry_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    db.delete(notebook_owned(db, entry_id, user))
+    db.commit()
+    return {"deleted": True}
+
+
+@app.post("/api/notebook/{entry_id}/review")
+def review_notebook(entry_id: int, data: NotebookReviewInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    entry = notebook.review(notebook_owned(db, entry_id, user), data.remembered)
+    db.commit()
+    return notebook.view(entry)
+
+
+@app.post("/api/notebook/{entry_id}/retry")
+def retry_notebook(entry_id: int, data: NotebookRetryInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    entry = notebook_owned(db, entry_id, user)
+    if entry.kind != "mistake" or not (entry.detail or {}).get("answer"):
+        raise HTTPException(409, "Only recorded test questions can be retried")
+    correct = notebook.retry_mistake(entry, data.answer)
+    db.commit()
+    return {"correct": correct, "entry": notebook.view(entry)}
+
+
+# ---------------------------------------------------------------- tutor memory and coaching
+
+@app.get("/api/tutor/memory")
+def tutor_memory(user: User = Depends(learner), db: Session = Depends(get_db)):
+    return [dto(item, "id", "kind", "text", "source", "updated_at") for item in notebook.memories(db, user.id, 100)]
+
+
+@app.post("/api/tutor/memory")
+def add_memory(data: MemoryInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    item = notebook.remember(db, user.id, data.kind, data.text, source="learner")
+    db.commit()
+    return dto(item, "id", "kind", "text", "source", "updated_at")
+
+
+@app.delete("/api/tutor/memory/{memory_id}")
+def forget_memory(memory_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    item = db.get(LearnerMemory, memory_id)
+    if not item or item.user_id != user.id:
+        raise HTTPException(404, "Memory not found")
+    db.delete(item)
+    db.commit()
+    return {"deleted": True}
+
+
+@app.post("/api/tutor/coach")
+def tutor_coach(persona: str = "witch", user: User = Depends(learner), db: Session = Depends(get_db)):
+    profile = profile_data(profile_for(db, user))
+    memory_texts = [item.text for item in notebook.memories(db, user.id)]
+    summary = notebook.stats(db, user.id)
+    progress = latest_progress(db, user.id)
+    points = notebook.coaching_points(summary, profile, memory_texts)
+    if progress["weaknesses"]:
+        points.append(f"Your weakest verified skill right now is {progress['weaknesses'][0]} ({progress['skill_scores'].get(progress['weaknesses'][0])}). Do one timed {progress['weaknesses'][0]} task today.")
+    runtime = AgentRuntime(db)
+    try:
+        message = runtime.provider.coach(points, profile, memory_texts, {**{k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "due_mistakes")}, "skill_scores": progress["skill_scores"]}, persona)
+    except Exception:
+        message = "Here's your coaching plan for today:\n" + "\n".join(f"{i + 1}. {p}" for i, p in enumerate(points))
+    record = chat_record(db, user.id, "tutor")
+    if not record:
+        record = AgentConversation(user_id=user.id, context="tutor", messages=[])
+        db.add(record)
+    record.messages = (record.messages or [])[-58:] + [{"role": "assistant", "text": message, "coach": True}]
+    db.add(AgentEvent(user_id=user.id, workflow="coaching", agent="AI Tutor", phase="decision", detail={"decision": "personalised coaching from notebooks and memory", "points": len(points)}, mode=runtime.provider.mode))
+    db.commit()
+    return {"message": message, "messages": record.messages, "stats": summary}
+
+
+def record_release(db: Session, user_id: int, package: ResultPackage, skill: str, source: str, test: dict | None = None) -> None:
+    """Feed released results into the notebooks and the tutor's memory."""
+    if package.state != "RELEASED":
+        return
+    payload = package.payload or {}
+    if skill in ("listening", "reading") and test and payload.get("review"):
+        notebook.record_objective_mistakes(db, user_id, test, payload["review"], skill, source)
+    if skill in ("writing", "speaking"):
+        notebook.record_feedback(db, user_id, payload, skill, source)
+    notebook.update_progress_memory(db, user_id, skill, payload)
 
 
 @app.post("/api/onboarding/confirm")
@@ -620,6 +834,7 @@ def submit_practice(practice_id: int, data: SubmitInput, user: User = Depends(le
     sub = Submission(practice_id=practice.id, user_id=user.id, text=text or "(no answers)", audio_path=audio_path, attempt=attempt, package_id=package.id)
     db.add(sub)
     practice.status = "SUBMITTED"
+    record_release(db, user.id, package, practice.skill, prompt.get("title", practice.skill), prompt.get("test"))
     db.commit()
     return {"submission_id": sub.id, "attempt": attempt, "result": package_view(package)}
 
@@ -726,6 +941,7 @@ def finish_speaking(session_id: int, user: User = Depends(learner), db: Session 
     sub = Submission(practice_id=practice.id, user_id=user.id, text=text, audio_path=latest_unused_audio(db, user.id, practice.id), attempt=attempt, package_id=package.id)
     db.add(sub)
     practice.status = "SUBMITTED"
+    record_release(db, user.id, package, "speaking", f"Speaking test · {test.get('title', '')}")
     db.commit()
     return {**speaking_view(session), "submission_id": sub.id, "attempt": attempt, "metrics": metrics, "result": package_view(package)}
 
@@ -869,6 +1085,13 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     package = runtime.verify_output(user.id, "mock_exam", output)
     exam.package_id = package.id
     exam.status = "SUBMITTED"
+    if package.state == "RELEASED":
+        for skill in ("listening", "reading"):
+            notebook.record_objective_mistakes(db, user.id, exam.sections[skill], details[skill]["review"], skill, f"Mock #{exam.id}")
+        for task, fb in details["writing"].items():
+            notebook.record_feedback(db, user.id, fb, "writing", f"Mock #{exam.id} · {task}")
+        notebook.record_feedback(db, user.id, details["speaking"], "speaking", f"Mock #{exam.id}")
+        notebook.remember(db, user.id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {overall}; sections {scores}", key="progress:mock", source="assessment")
     db.commit()
     return mock_view(exam, db)
 
@@ -1011,6 +1234,8 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
         db.add(AgentEvent(user_id=package.user_id, workflow=package.kind, agent="Quality Manager", phase="state", detail={"package_id": package.id, "state": package.state}, mode=package.source_mode))
         db.add(QualityCheck(package_id=package.id, verdict="HUMAN_APPROVED", issues=[], threshold=AgentRuntime(db).threshold(), method="HUMAN"))
         AgentRuntime(db).release_after_human(package)
+        if package.kind in ("writing", "speaking"):
+            notebook.record_feedback(db, package.user_id, package.payload, package.kind, "Instructor-reviewed result")
         case.status = "RESOLVED"
         for plan in db.scalars(select(Plan).where(Plan.package_id == package.id)):
             plan.content = package.payload

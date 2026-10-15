@@ -189,11 +189,17 @@ def find_errors(text: str, spoken: bool = False) -> list[dict]:
     found = []
     for sentence in _sentences(text):
         lower = sentence.lower()
-        for pattern, advice, fix in ERRORS:
-            if re.search(pattern, lower, flags=re.I):
-                corrected = fix(lower) if fix else None
-                found.append({"sentence": sentence[:220], "issue": advice.split(";")[0].split(".")[0], "suggestion": advice,
-                              **({"correction": corrected} if corrected and corrected != lower else {})})
+        hits = [(advice, fix) for pattern, advice, fix in ERRORS if re.search(pattern, lower, flags=re.I)]
+        # One corrected version per sentence with every automatic fix applied, keeping the opening capital.
+        corrected = lower
+        for _, fix in hits:
+            corrected = fix(corrected) if fix else corrected
+        if corrected != lower and sentence[:1].isupper():
+            corrected = corrected[:1].upper() + corrected[1:]
+        corrected = re.sub(r"\bi\b", "I", corrected) if corrected != lower else ""
+        for advice, fix in hits:
+            found.append({"sentence": sentence[:220], "issue": advice.split(";")[0].split(".")[0], "suggestion": advice,
+                          **({"correction": corrected} if fix and corrected else {})})
         if spoken:
             continue  # Recognised speech has no reliable capitals or punctuation.
         if re.search(r"(^|\s)i(\s|'|$)", sentence):

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { ShieldCheck, Sparkles } from 'lucide-react'
 import { Result, request } from './api'
 
@@ -103,6 +104,7 @@ export function FeedbackPanel({ result }: { result: Result | null }) {
     {p.model_answer && <div><h4 className="font-pixel text-lg text-magenta">Higher-band model</h4><p className="tile mt-2 whitespace-pre-wrap font-read text-sm leading-6">{p.model_answer}</p></div>}
     {p.improvements?.length > 0 && <ul className="space-y-1 font-read text-sm text-mist">{p.improvements.map((item: string, i: number) => <li key={i}>▸ {item}</li>)}</ul>}
     {p.pronunciation_note && <p className="font-read text-xs text-sun">{p.pronunciation_note}</p>}
+    {(result.kind === 'writing' || result.kind === 'speaking') && <p className="font-read text-xs text-mist">Grammar errors and rewrites were saved to your <Link to="/notebook?tab=grammar" className="text-cyan underline">Grammar</Link> and <Link to="/notebook?tab=sentence" className="text-cyan underline">Sentence</Link> books. Select any word here to add it to your Word book.</p>}
   </div>
 }
 

@@ -474,3 +474,64 @@ def test_local_writing_analysis_flags_real_errors():
     toefl = analyse_response("TOEFL", "writing", "Dear Ms Lin, I am writing because the meetings clash with my class. " * 6, "", "email")
     assert set(toefl["criteria"]) == {"task_fulfillment", "organisation", "language_use"}
     assert all(1 <= value <= 6 for value in toefl["criteria"].values())
+
+
+def test_notebooks_memory_and_coaching(monkeypatch):
+    from backend import notebook as nb
+    monkeypatch.setattr(nb, "dictionary_lookup", lambda word: {"phonetic": "/test/", "meanings": [{"pos": "adjective", "definition": f"definition of {word}", "example": ""}], "synonyms": []})
+    with TestClient(app) as client:
+        headers = auth(client, "notebook@example.com")
+        # Wrong listening answers go to the mistake book, grouped by question type.
+        bank = client.get("/api/questions?skill=listening", headers=headers).json()
+        part = next(item for item in bank if item["title"] == "Evening course enrolment")
+        practice = client.post(f"/api/practice/listening?question_id={part['id']}", headers=headers).json()
+        client.post(f"/api/practice/{practice['id']}/submit", headers=headers, json={"answers": {"1": "kowalski"}})
+        mistakes = client.get("/api/notebook?kind=mistake", headers=headers).json()
+        assert len(mistakes) == 9 and all(m["category"] == "Completion / gap fill" for m in mistakes)
+        stats = client.get("/api/notebook/stats", headers=headers).json()
+        assert stats["mistakes_by_type"][0] == {"name": "Completion / gap fill", "count": 9}
+        assert stats["mistakes_by_skill"][0]["name"] == "listening"
+        apron = next(m for m in mistakes if "apron" in m["detail"]["answer"])
+        assert client.post(f"/api/notebook/{apron['id']}/retry", headers=headers, json={"answer": "wrong"}).json()["correct"] is False
+        assert client.post(f"/api/notebook/{apron['id']}/retry", headers=headers, json={"answer": "Apron"}).json()["correct"] is True
+        assert client.post(f"/api/notebook/{apron['id']}/retry", headers=headers, json={"answer": "apron"}).json()["entry"]["mastered"] is True
+        # Repeating the same test merges repeated mistakes instead of duplicating them.
+        again = client.post(f"/api/practice/listening?question_id={part['id']}", headers=headers).json()
+        client.post(f"/api/practice/{again['id']}/submit", headers=headers, json={"answers": {}})
+        assert len(client.get("/api/notebook?kind=mistake", headers=headers).json()) == 10
+        # Writing errors become grammar entries; corrections become model sentences.
+        writing = client.post("/api/practice/writing", headers=headers).json()
+        client.post(f"/api/practice/{writing['id']}/submit", headers=headers, json={"text": "I think peoples is more better when they work at home. The informations about this topic is easy to find for everyone."})
+        grammar = client.get("/api/notebook?kind=grammar", headers=headers).json()
+        assert any("people" in g["category"].lower() for g in grammar)
+        assert client.get("/api/notebook?kind=sentence", headers=headers).json()
+        # Words: from the tutor chat in English and Chinese, and from a selection.
+        chat = client.post("/api/chat/tutor", headers=headers, json={"message": "I don't know the word ubiquitous"}).json()
+        assert any(e["type"] == "word" and e["word"] == "ubiquitous" for e in chat["events"])
+        assert "definition of ubiquitous" in chat["messages"][-1]["text"]
+        client.post("/api/chat/reading", headers=headers, json={"message": "serendipity是什么意思"})
+        selected = client.post("/api/notebook", headers=headers, json={"kind": "word", "text": "Brittle,", "context": "paper turns yellow and brittle", "skill": "reading", "source": "Paper passage"}).json()
+        assert selected["text"] == "brittle" and selected["detail"]["contexts"] == ["paper turns yellow and brittle"]
+        words = {w["text"] for w in client.get("/api/notebook?kind=word", headers=headers).json()}
+        assert {"ubiquitous", "serendipity", "brittle"} <= words
+        sentence = client.post("/api/notebook", headers=headers, json={"kind": "sentence", "text": "Although cities are crowded, they offer opportunities which villages cannot match."}).json()
+        assert "Concession" in sentence["category"] and "Relative clause" in sentence["category"]
+        # Quiz uses a saved word and updates its review schedule.
+        quiz = client.post("/api/chat/tutor", headers=headers, json={"message": "quiz me"}).json()
+        word = quiz["messages"][-1]["quiz"]
+        answer = client.post("/api/chat/tutor", headers=headers, json={"message": f"The {word} thing appeared in my essay today."}).json()
+        assert any(e["type"] == "quiz" and e["remembered"] for e in answer["events"])
+        # Memory persists across pages and can be edited.
+        client.post("/api/chat/dashboard", headers=headers, json={"message": "My name is Mai and I struggle with listening for numbers."})
+        memory = [m["text"] for m in client.get("/api/tutor/memory", headers=headers).json()]
+        assert "Name: Mai" in memory and any(m.startswith("Struggles with listening") for m in memory)
+        assert any(m.startswith("Latest verified listening estimate") for m in memory)
+        recalled = client.post("/api/chat/speaking", headers=headers, json={"message": "What do you remember about me?"}).json()
+        assert "Struggles with listening" in recalled["messages"][-1]["text"]
+        coach = client.post("/api/tutor/coach", headers=headers).json()
+        assert "Completion / gap fill" in coach["message"] and coach["messages"][-1]["coach"] is True
+        # Other learners cannot touch these entries.
+        other = auth(client, "notebook-other@example.com")
+        assert client.delete(f"/api/notebook/{selected['id']}", headers=other).status_code == 404
+        assert client.get("/api/notebook", headers=other).json() == []
+        assert client.delete(f"/api/notebook/{selected['id']}", headers=headers).json()["deleted"] is True

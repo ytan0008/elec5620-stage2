@@ -18,7 +18,7 @@ from sqlalchemy import select
 from backend.config import settings
 from backend.models import AgentEvent, AuditLog, Escalation, QualityCheck, ResultPackage, SystemSetting
 from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput,
-                             QuestionOutput, AgentChatReply, ExaminerTurn, ListeningGen, ReadingGen, SpeakingGen)
+                             QuestionOutput, AgentChatReply, ExaminerTurn, ListeningGen, ReadingGen, SpeakingGen, WordInfo, CoachOutput)
 from backend.onboarding import parse_demo_message
 from backend import content as bank
 from backend import local_tutor
@@ -104,25 +104,52 @@ class ProviderAdapter:
             {"latest_message": message, "current_draft": draft, "today": datetime.now(timezone.utc).date().isoformat()}, parse_demo_message(message, draft),
         )
 
-    def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch") -> AgentChatReply:
-        """Instructional conversation; formal scores and plans use the verified workflows."""
-        local = local_tutor.reply(context, message, profile, plan, history, persona)
+    def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch",
+             memory: list[str] | None = None, notebook: dict | None = None, actions: list[str] | None = None) -> AgentChatReply:
+        """Instructional conversation with long-term memory; formal scores and plans use the verified workflows."""
+        memory, notebook, actions = memory or [], notebook or {}, actions or []
+        local = local_tutor.reply(context, message, profile, plan, history, persona, memory, notebook, actions)
         if self.local:
             return AgentChatReply(reply=local)
         skill = context if context in ("speaking", "writing", "reading", "listening") else None
-        role = "AI Tutor" if skill else "Learning Coordinator"
+        role = "AI Tutor" if skill or context in ("tutor", "notebook") else "Learning Coordinator"
         speaking_rules = ("This is a spoken conversation practice: reply in 1-3 short natural sentences (under 70 words) that will be read aloud. "
                           "React to what the learner said, gently correct at most one clear grammar or vocabulary mistake by recasting it, then ask one follow-up question. "
-                          "Use IELTS Speaking Part 1/3 style topics. No markdown, lists or emojis.") if skill == "speaking" else \
-                         "Be concise (under 150 words), practical and warm; ask at most one follow-up. Plain text only, no markdown tables."
+                          "Use IELTS Speaking Part 1/3 style topics. No markdown, lists or emojis.") if skill == "speaking" else                          "Be concise (under 170 words), practical and warm; guide step by step and ask at most one follow-up. Plain text only, no markdown tables."
         return self.structured(
             AgentChatReply,
             f"{PERSONA_STYLE.get(persona, PERSONA_STYLE['witch'])} You act as the {role} of an IELTS/TOEFL preparation platform; the current page is '{context}'. "
-            f"{speaking_rules} Do not claim an official IELTS/TOEFL score or calibrated confidence. Formal evaluations come from the separate quality-checked "
-            "workflow. If the learner writes in another language, answer in simple English and optionally add a brief translation. Never ask for passwords or identity details.",
-            {"message": message, "profile": profile, "active_plan": plan, "recent_messages": history[-10:]},
+            f"{speaking_rules} You have long-term memory: 'memory' lists what you know about this learner from earlier sessions, and 'notebook' summarises their "
+            "mistake book (wrong answers by question type), grammar book (repeated grammar errors), word book (unknown words, reviews due) and sentence book. "
+            "Use them naturally to personalise guidance (e.g. refer to a repeated mistake type or a word they saved) but don't recite them. "
+            "'actions' lists things the platform just did for the learner, such as saving a word with its definition; explain new words simply with one example. "
+            "Put any NEW durable fact about the learner (background, goals, difficulties, preferences) in 'remember' as short third-person notes; leave it empty otherwise. "
+            "Do not claim an official IELTS/TOEFL score or calibrated confidence. If the learner writes in Chinese or another language, answer mainly in simple English "
+            "and add a brief translation. Never ask for passwords or identity details.",
+            {"message": message, "profile": profile, "active_plan": plan, "memory": memory[:30], "notebook": notebook, "actions": actions, "recent_messages": history[-12:]},
             {"reply": local},
         )
+
+    def word_info(self, word: str, context: str, language: str, dictionary: dict) -> dict:
+        """Learner-friendly entry for the word book. The cloud model adds a translation and a context-specific sense."""
+        if self.local:
+            return dictionary
+        info = self.structured(WordInfo, f"You write learner dictionary entries for IELTS/TOEFL students. Give the IPA, part of speech and a simple English definition of the sense used "
+                               f"in the context sentence (if any), a short {language} translation, one natural example sentence, up to 4 synonyms and up to 3 useful collocations.",
+                               {"word": word, "context": context, "dictionary": dictionary}, {}).model_dump()
+        meanings = [{"pos": info["part_of_speech"], "definition": info["definition"], "example": info["example"]}] + [m for m in dictionary.get("meanings", []) if m.get("definition") != info["definition"]][:2]
+        return {"phonetic": info["phonetic"] or dictionary.get("phonetic", ""), "meanings": meanings, "translation": info["translation"],
+                "synonyms": info["synonyms"] or dictionary.get("synonyms", []), "collocations": info["collocations"], "dictionary": "cloud AI"}
+
+    def coach(self, points: list[str], profile: dict, memory: list[str], notebook: dict, persona: str) -> str:
+        name = "Kai" if persona == "boy" else "Luna"
+        local = f"Here's your coaching plan for today from {name}:\n" + "\n".join(f"{i + 1}. {point}" for i, point in enumerate(points))
+        if self.local:
+            return local
+        return self.structured(CoachOutput, f"{PERSONA_STYLE.get(persona, PERSONA_STYLE['witch'])} Write today's personalised coaching message for this IELTS/TOEFL learner: "
+                               "3-5 numbered, concrete steps that use their notebook statistics (most frequent mistake types, repeated grammar errors, words due) and what you remember about them. "
+                               "Each step names a specific action in the app (Mistake book, Word book, Grammar book, a practice skill or the mock exam) and why. Plain text, under 220 words.",
+                               {"profile": profile, "memory": memory[:30], "notebook": notebook, "starting_points": points}, {"message": local}).message
 
     def examiner_rephrase(self, stage: str, scripted: str, learner_text: str, allow_followup: bool, persona: str):
         """Let a cloud model phrase the next examiner turn naturally. LOCAL mode keeps the script."""

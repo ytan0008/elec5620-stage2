@@ -269,3 +269,36 @@ class SystemSetting(Base):
     __tablename__ = "system_settings"
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(String(200))
+
+
+class NotebookEntry(Base):
+    """One learner notebook item: a mistake, an unknown word, a grammar error or a model sentence."""
+    __tablename__ = "notebook_entries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # mistake | word | grammar | sentence
+    text: Mapped[str] = mapped_column(Text)
+    key: Mapped[str] = mapped_column(String(300), index=True)  # normalised text used to merge repeats
+    category: Mapped[str] = mapped_column(String(120), default="")  # question type / grammar issue / sentence pattern
+    skill: Mapped[str] = mapped_column(String(20), default="")
+    source: Mapped[str] = mapped_column(String(200), default="")
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    mastered: Mapped[bool] = mapped_column(Boolean, default=False)
+    review_level: Mapped[int] = mapped_column(Integer, default=0)
+    next_review: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class LearnerMemory(Base):
+    """Long-term facts the AI tutor remembers about a learner across every conversation."""
+    __tablename__ = "learner_memories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # about | goal | preference | difficulty | progress | note
+    key: Mapped[str] = mapped_column(String(120), default="")  # set for facts that are replaced, e.g. progress:writing
+    text: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(40), default="chat")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)

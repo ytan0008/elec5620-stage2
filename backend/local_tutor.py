@@ -52,15 +52,49 @@ def _check_sentence(message: str) -> str | None:
     return f"Small correction: {first['suggestion']}{fix}"
 
 
-def reply(context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch") -> str:
+def _learner_name(memory: list[str]) -> str:
+    for item in memory:
+        if item.startswith("Name: "):
+            return item[6:].split()[0].title()
+    return ""
+
+
+def notebook_summary_text(notebook: dict) -> str:
+    parts = []
+    if notebook.get("mistakes_by_type"):
+        top = notebook["mistakes_by_type"][:2]
+        parts.append("most frequent mistake types: " + ", ".join(f"{item['name']} ({item['count']})" for item in top))
+    if notebook.get("grammar_issues"):
+        parts.append(f"most repeated grammar issue: “{notebook['grammar_issues'][0]['name']}” ({notebook['grammar_issues'][0]['count']}×)")
+    if notebook.get("due_words"):
+        parts.append(f"{notebook['due_words']} word(s) due for review")
+    return "; ".join(parts)
+
+
+def reply(context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch",
+          memory: list[str] | None = None, notebook: dict | None = None, actions: list[str] | None = None) -> str:
     lower = message.lower().strip()
     name = _first_name(persona)
+    memory, notebook, actions = memory or [], notebook or {}, actions or []
     rng = random.Random(len(history) * 7 + len(message))
     skill = context if context in ("speaking", "writing", "reading", "listening") else None
     if re.search(r"[一-鿿]", message):
         prefix = "I'll answer in English so you get extra practice. "
     else:
         prefix = ""
+    learner = _learner_name(memory)
+
+    if actions:
+        return " ".join(actions)
+    if re.search(r"what do you (remember|know) about me|你记得|记得我", lower):
+        if not memory:
+            return prefix + "I don't have any notes about you yet. Tell me about your background, goals or what you find difficult, and I'll remember it."
+        return prefix + "Here's what I remember about you: " + "; ".join(memory[:8]) + ". You can edit these on the AI Tutor page."
+    if re.search(r"(my (mistakes|weakness|weak points|errors)|what (do|did) i (get )?wrong|where am i weak)|错题|错得多|弱点|哪里错", lower):
+        summary = notebook_summary_text(notebook)
+        if not summary:
+            return prefix + "Your notebooks are still empty. Do a listening or reading test and submit some writing; I'll record your mistakes automatically."
+        return prefix + f"From your notebooks: {summary}. Open the Notebook page to retry wrong answers, or say 'quiz me' to review words."
 
     synonym = re.search(r"(?:synonym|another word|other word|instead of|replace)\s+(?:for\s+)?['\"]?([a-z]+)", lower)
     if synonym and synonym.group(1) in SYNONYMS:
@@ -74,7 +108,8 @@ def reply(context: str, message: str, profile: dict, plan: dict | None, history:
     if skill == "speaking":
         if not history or any(word in lower for word in ("start", "hello", "hi ", "practice", "practise", "question")) and len(lower.split()) < 6:
             topic = PART1_TOPICS[rng.randrange(len(PART1_TOPICS))]
-            return prefix + f"Hi, I'm {name}! Let's have a relaxed speaking practice. We'll talk about {topic['topic']}. {topic['questions'][0]}"
+            hello = f"Hi {learner}, welcome back!" if learner else f"Hi, I'm {name}!"
+            return prefix + f"{hello} Let's have a relaxed speaking practice. We'll talk about {topic['topic']}. {topic['questions'][0]}"
         asked = len([item for item in history if item.get("role") == "assistant"])
         correction = _check_sentence(message)
         words = len(message.split())
@@ -103,9 +138,12 @@ def reply(context: str, message: str, profile: dict, plan: dict | None, history:
         return prefix + f"You don't have an active plan yet. Open Learning plan and generate one; I'll build it around {priorities} and your {profile.get('weekly_hours')} hours a week."
     if any(word in lower for word in ("goal", "profile", "target", "score", "band")):
         return prefix + f"Your goal is {profile.get('exam')} {profile.get('target_score')} by {profile.get('exam_date')}, starting from a self-reported {profile.get('proficiency')} level. Your priorities are {priorities}."
-    if any(word in lower for word in ("today", "what should", "next", "start")):
+    if any(word in lower for word in ("today", "what should", "next", "start", "guide", "coach", "help me", "improve")) or "怎么" in message or "指导" in message:
         focus = (profile.get("priority_skills") or ["writing"])[0]
-        return prefix + f"Today, try one {focus} task from the Question bank, then review the feedback and redo your weakest part. Short daily practice beats one long session."
+        summary = notebook_summary_text(notebook)
+        advice = f"Based on your notebooks ({summary}), start by fixing that pattern: retry those items in the Mistake book, then " if summary else "Today, "
+        return prefix + advice + f"do one {focus} task from the Question bank and review every comment. Press “Coach me” on the AI Tutor page for a full plan."
     if skill:
         return prefix + TIPS.get(skill, TIPS["task2"]) + " Tell me which question type you find hardest."
-    return prefix + f"I'm {name}, your study companion. Ask me about question types, strategies, vocabulary, your plan, or type 'check: your sentence' and I'll look for mistakes. Your priorities are {priorities}."
+    greeting = f"Hi {learner}! " if learner else ""
+    return prefix + greeting + f"I'm {name}, your study companion. Ask me about question types, strategies, vocabulary or your plan. Type 'check: your sentence' to find mistakes, tell me a word you don't know to save it to your Word book, or say 'quiz me' to review. Your priorities are {priorities}."
