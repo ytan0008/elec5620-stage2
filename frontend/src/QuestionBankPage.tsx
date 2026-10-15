@@ -52,7 +52,7 @@ export default function QuestionBankPage({ notify }: { notify: Notify }) {
       </div>
     </div>
     <div className="mb-5 flex flex-wrap gap-1">{['all', 'listening', 'reading', 'writing', 'speaking'].map(s => <button key={s} className={skill === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setSkill(s)}>{s === 'all' ? 'All skills' : nice(s)}</button>)}</div>
-    {!items ? <Spinner /> : <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{items.filter(i => skill === 'all' || i.skill === skill).map(item => {
+    {!items ? <Spinner /> : <div key={skill} className="stagger grid gap-5 md:grid-cols-2 xl:grid-cols-3">{items.filter(i => skill === 'all' || i.skill === skill).map(item => {
       const Icon = ICONS[item.skill] || BookOpen
       const [label, color] = SOURCE[item.source_kind] || [nice(item.source_kind), 'text-mist']
       return <article key={item.id} className="panel flex flex-col p-6" style={{ ['--edge' as any]: SKILL_COLOR[item.skill] + '99' }}>

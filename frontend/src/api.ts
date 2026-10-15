@@ -46,7 +46,7 @@ export function health(refresh = false): Promise<Health> {
 }
 
 export type NotebookKind = 'mistake' | 'word' | 'grammar' | 'sentence'
-export type NotebookEntry = { id: number; kind: NotebookKind; text: string; category: string; skill: string; source: string; detail: Record<string, any>; count: number; mastered: boolean; review_level: number; due: boolean; next_review: string; created_at: string; updated_at: string; created?: boolean }
+export type NotebookEntry = { id: number; kind: NotebookKind; text: string; category: string; skill: string; source: string; detail: Record<string, any>; count: number; mastered: boolean; review_level: number; due: boolean; next_review: string; created_at: string; updated_at: string; created?: boolean; hidden?: boolean }
 export type NotebookStats = { counts: Record<NotebookKind, { total: number; active: number; mastered: number }>; mistakes_by_type: { name: string; count: number }[]; mistakes_by_skill: { name: string; count: number }[]; grammar_issues: { name: string; count: number }[]; due_words: number; due_mistakes: number }
 export type Memory = { id: number; kind: string; text: string; source: string; updated_at: string }
 export type ChatEvent = { type: 'word' | 'memory' | 'quiz'; word?: string; text?: string; created?: boolean; remembered?: boolean; id?: number }

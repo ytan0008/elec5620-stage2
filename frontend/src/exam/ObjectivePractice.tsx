@@ -4,6 +4,8 @@ import { ArrowRight, BookOpen, Clock3, Eye, Headphones, RotateCcw, Send } from '
 import { ObjectiveTest, Practice, Result, Section, post, request } from '../api'
 import { Countdown, Empty, HeldNotice, Notify, PageTitle, Spinner, Status } from '../ui'
 import ListeningPlayer, { useClipPlayer } from './ListeningPlayer'
+import { useExamLock } from '../examLock'
+import ReportProblem from '../ReportProblem'
 import { Answers, ReviewItem, SectionQuestions, answeredCount, questionCount } from './Questions'
 
 export function Transcript({ sections, evidence }: { sections: { title: string; script: { speaker: string; text: string }[]; clips?: { speaker: string; text: string }[][] }[]; evidence: string[] }) {
@@ -45,6 +47,7 @@ export default function ObjectivePractice({ skill, notify }: { skill: 'listening
   const [showScript, setShowScript] = useState(false)
   const [error, setError] = useState('')
   const clips = useClipPlayer(mode)
+  useExamLock(`objective-${skill}`, started && !result)
   const isListening = skill === 'listening'
 
   const load = async (fresh = false) => {
@@ -102,7 +105,10 @@ export default function ObjectivePractice({ skill, notify }: { skill: 'listening
         <p className="font-pixel text-2xl">{p.raw_score} / {p.total} correct</p>
         <p className="font-read text-mist">{p.summary}</p>
         <div className="flex flex-wrap gap-2">{Object.entries(p.question_types || {}).map(([k, v]) => <span key={k} className="pill text-cyan">{k}: {String(v)}</span>)}<Status value={result!.state} /></div>
-        {p.raw_score < p.total && <Link to="/notebook?tab=mistake" className="btn-ghost !px-0">{p.total - p.raw_score} wrong answer(s) saved to your Mistake book →</Link>}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+          {p.raw_score < p.total && <Link to="/notebook?tab=mistake" className="btn-ghost !px-0">{p.total - p.raw_score} wrong answer(s) saved to your Mistake book →</Link>}
+          <ReportProblem category="question" context={{ package_id: result!.id, test: practice.prompt.title }} label="Answer key looks wrong?" />
+        </div>
       </div>
       <button className="btn-primary" onClick={() => load(true)}>Next test <ArrowRight size={16} /></button>
     </div>}

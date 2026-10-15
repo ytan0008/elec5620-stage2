@@ -4,6 +4,8 @@ import { Mic, Send, Volume2, VolumeX, X } from 'lucide-react'
 import { ChatEvent, ChatMessage, notebookChanged, post, request } from './api'
 import { PixelAvatar, personaName } from './pixel/Avatar'
 import { moodFor, usePersona } from './persona'
+import { useIsExamLocked } from './examLock'
+import ReportProblem from './ReportProblem'
 import { Listener, listen, prefs, recognitionSupported, speak, stopSpeaking } from './voice'
 
 type Conversation = { agent: string; context: string; mode: string; messages: ChatMessage[]; events?: ChatEvent[] }
@@ -37,6 +39,7 @@ export default function AgentChat() {
   const [voiceOn, setVoiceOn] = useState(!prefs.muted)
   const [fresh, setFresh] = useState(-1)
   const [notes, setNotes] = useState<string[]>([])
+  const examLocked = useIsExamLocked()
   const listener = useRef<Listener | null>(null)
   const bottom = useRef<HTMLDivElement | null>(null)
   useEffect(() => { setError(''); setDraft(''); request<Conversation>(`/chat/${context}`).then(setConversation).catch(e => setError(e.message)) }, [context])
@@ -48,7 +51,7 @@ export default function AgentChat() {
     window.addEventListener('ask-tutor', onAsk)
     return () => window.removeEventListener('ask-tutor', onAsk)
   }, [])
-  if (['/mock', '/onboarding', '/tutor'].includes(location.pathname) || location.pathname === '/practice/speaking') return null
+  if (examLocked || ['/mock', '/onboarding', '/tutor'].includes(location.pathname) || location.pathname === '/practice/speaking') return null
 
   const send = async (value = draft) => {
     const message = value.trim()
@@ -99,6 +102,7 @@ export default function AgentChat() {
         </div>)}
         {notes.length > 0 && !busy && <div className="flex flex-wrap gap-1">{notes.map(note => <span key={note} className="pill text-lime">{note}</span>)}</div>}
         {busy && <p className="font-pixel text-sm text-mist">{name} is thinking…</p>}
+        {(conversation?.messages.length || 0) > 0 && <ReportProblem category="tutor" context={{ chat: context }} label="Tutor said something wrong?" />}
         <div ref={bottom} />
       </div>
       {error && <p role="alert" className="mx-4 mb-2 font-read text-xs text-rose">{error}</p>}

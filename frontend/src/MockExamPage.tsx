@@ -8,6 +8,7 @@ import { Answers, ReviewItem, SectionQuestions, answeredCount, questionCount } f
 import { Passage, Transcript } from './exam/ObjectivePractice'
 import ChartView from './exam/ChartView'
 import SpeakingStudio from './exam/SpeakingStudio'
+import { useExamLock } from './examLock'
 
 const SECTIONS = ['listening', 'reading', 'writing', 'speaking'] as const
 const parse = (value?: string) => { try { return JSON.parse(value || '{}') } catch { return {} } }
@@ -51,6 +52,7 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
   const [now, setNow] = useState(Date.now())
   const saveTimer = useRef(0)
   const clips = useClipPlayer('exam')
+  useExamLock('mock', Boolean(exam && !exam.legacy && exam.status === 'IN_PROGRESS'))
 
   const open = (item: Mock) => {
     setExam(item)

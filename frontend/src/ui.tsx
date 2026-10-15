@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ShieldCheck, Sparkles } from 'lucide-react'
 import { Result, request } from './api'
+import ReportProblem from './ReportProblem'
 
 export type Notify = (message: string, kind?: 'success' | 'error') => void
 export const skills = ['listening', 'reading', 'writing', 'speaking']
@@ -54,10 +55,33 @@ export function Status({ value }: { value: string }) {
   return <span className={`pill ${good ? 'text-lime' : wait ? 'text-sun' : 'text-mist'}`}>{nice(value)}</span>
 }
 
+/* Animates numeric text from 0 to its value; non-numeric text is shown as is. */
+export function useCountUp(value: string, duration = 700) {
+  const match = value.match(/^(\D*)(\d+(?:\.\d+)?)(.*)$/)
+  const target = match ? Number(match[2]) : null
+  const [shown, setShown] = useState(target === null ? value : `${match![1]}0${match![3]}`)
+  useEffect(() => {
+    if (target === null || window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setShown(value); return }
+    const decimals = match![2].includes('.') ? match![2].split('.')[1].length : 0
+    const start = performance.now()
+    let frame = 0
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration)
+      const eased = 1 - Math.pow(1 - t, 3)
+      setShown(`${match![1]}${(target * eased).toFixed(decimals)}${match![3]}`)
+      if (t < 1) frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [value])
+  return shown
+}
+
 export function Metric({ label, value, icon, color = '#3ef0ff' }: { label: string; value: string; icon: React.ReactNode; color?: string }) {
+  const shown = useCountUp(value)
   return <div className="panel panel-flat p-5">
     <div className="flex items-center justify-between font-pixel text-sm uppercase tracking-wider text-mist"><span>{label}</span><span style={{ color }}>{icon}</span></div>
-    <div className="num mt-3 text-5xl" style={{ color }}>{value}</div>
+    <div className="num mt-3 text-5xl" style={{ color }}>{shown}</div>
   </div>
 }
 
@@ -82,10 +106,10 @@ export function FeedbackPanel({ result }: { result: Result | null }) {
   if (result.state !== 'RELEASED') return <HeldNotice result={result} />
   const p = result.payload || {}
   const max = p.score_scale?.includes('TOEFL') ? 6 : 9
-  return <div className="panel panel-cyan space-y-6 p-6 anim-rise">
+  return <div className="panel panel-cyan space-y-6 p-6 anim-page">
     <div className="flex flex-wrap items-center justify-between gap-3">
       <div><span className="eyebrow">Verified feedback</span><h3 className="section-title mt-2">{result.source_mode === 'REAL' ? 'Cloud AI assessment' : 'Built-in rubric analyser'}</h3></div>
-      <Status value={result.state} />
+      <div className="flex items-center gap-3"><ReportProblem category="result" context={{ package_id: result.id, kind: result.kind }} label="Score looks wrong?" /><Status value={result.state} /></div>
     </div>
     {p.estimated_overall !== undefined && <div className="flex items-center gap-5">
       <div className="grid h-24 w-24 place-items-center bg-abyss" style={{ boxShadow: '0 0 0 4px #ff4fd8, 6px 6px 0 4px rgba(0,0,0,.4)' }}><span className="num text-6xl text-magenta">{p.estimated_overall}</span></div>

@@ -13,14 +13,15 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput
+from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
 from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
 from backend import notebook
+from backend import monitoring
 from backend.speech import server_speech_available, synthesise, transcribe
 from backend import content as bank
 from backend import examiner
@@ -284,6 +285,8 @@ def due_word(db: Session, user_id: int) -> NotebookEntry | None:
 @app.post("/api/chat/{context}")
 def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), db: Session = Depends(get_db)):
     record = chat_record(db, user.id, context)
+    if active_mock(db, user.id):
+        raise HTTPException(423, "The tutor is unavailable while a mock exam is in progress")
     profile = profile_for(db, user)
     plan = db.scalar(select(Plan).where(Plan.user_id == user.id, Plan.status == "ACTIVE").order_by(Plan.id.desc()))
     runtime = AgentRuntime(db)
@@ -341,6 +344,30 @@ def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), 
     return {"context": context, "agent": agent_for(context), "messages": record.messages, "mode": runtime.provider.mode, "events": events}
 
 
+# ---------------------------------------------------------------- exam lock and dictionary
+
+def active_mock(db: Session, user_id: int) -> MockExam | None:
+    """A mock exam that is still running locks dictionary meanings and the tutor chat."""
+    now_ = datetime.now(timezone.utc)
+    for exam in db.scalars(select(MockExam).where(MockExam.user_id == user_id, MockExam.status == "IN_PROGRESS")):
+        created = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
+        duration = sum(exam.sections.get(skill, {}).get("duration_seconds", 0) for skill in ("listening", "reading", "writing", "speaking"))
+        if created + timedelta(seconds=duration) > now_:
+            return exam
+    return None
+
+
+@app.get("/api/dictionary")
+def dictionary(word: str, user: User = Depends(learner), db: Session = Depends(get_db)):
+    word = word.strip().strip(".,;:!?\"'()“”‘’").lower()
+    if not word or len(word) > 60 or len(word.split()) > 5:
+        raise HTTPException(422, "Select a single word or short phrase")
+    if active_mock(db, user.id):
+        raise HTTPException(423, "Meanings are hidden while a mock exam is in progress")
+    saved = db.scalar(select(NotebookEntry).where(NotebookEntry.user_id == user.id, NotebookEntry.kind == "word", NotebookEntry.key == notebook.norm(word)))
+    return {"word": word, **notebook.offline_lookup(word), "saved": bool(saved)}
+
+
 # ---------------------------------------------------------------- notebooks
 
 def notebook_owned(db: Session, entry_id: int, user: User) -> NotebookEntry:
@@ -361,7 +388,12 @@ def list_notebook(kind: str | None = None, skill: str | None = None, include_mas
         query = query.where(NotebookEntry.skill == skill)
     if not include_mastered:
         query = query.where(NotebookEntry.mastered.is_(False))
-    return [notebook.view(entry) for entry in db.scalars(query.order_by(NotebookEntry.updated_at.desc()).limit(500))]
+    items = [notebook.view(entry) for entry in db.scalars(query.order_by(NotebookEntry.updated_at.desc()).limit(500))]
+    if active_mock(db, user.id):
+        for item in items:
+            if item["kind"] == "word":
+                item["detail"], item["hidden"] = {"contexts": item["detail"].get("contexts", [])}, True
+    return items
 
 
 @app.get("/api/notebook/stats")
@@ -372,6 +404,7 @@ def notebook_stats(user: User = Depends(learner), db: Session = Depends(get_db))
 @app.post("/api/notebook")
 def add_notebook(data: NotebookAddInput, user: User = Depends(learner), db: Session = Depends(get_db)):
     runtime = AgentRuntime(db)
+    locked = data.exam or active_mock(db, user.id) is not None
     text = re.sub(r"\s+", " ", data.text).strip()
     if data.kind == "word":
         if len(text) > 60 or len(text.split()) > 5:
@@ -390,7 +423,12 @@ def add_notebook(data: NotebookAddInput, user: User = Depends(learner), db: Sess
         entry, created = notebook.add_entry(db, user.id, "mistake", text, category=data.category or "Other", skill=data.skill, source=data.source or "Added manually",
                                             detail={"type": "completion", "answer": data.correction or "", "note": data.note or ""})
     db.commit()
-    return {**notebook.view(entry), "created": created}
+    result = {**notebook.view(entry), "created": created}
+    if locked and entry.kind == "word":
+        # During a test the word is saved, but its meaning stays hidden until the learner finishes.
+        result["detail"] = {"contexts": (entry.detail or {}).get("contexts", [])}
+        result["hidden"] = True
+    return result
 
 
 @app.patch("/api/notebook/{entry_id}")
@@ -1179,11 +1217,79 @@ def material_interaction(material_id: int, relevant: bool | None = None, user: U
 
 
 @app.get("/api/events")
-def events(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    query = select(AgentEvent).order_by(AgentEvent.id.desc()).limit(100)
-    if user.role == "learner":
-        query = query.where(AgentEvent.user_id == user.id)
-    return [dto(event, "id", "workflow", "agent", "phase", "detail", "mode", "duration_ms", "created_at") for event in db.scalars(query)]
+def events(agent: str | None = None, workflow: str | None = None, user_id: int | None = None, slow: bool = False, limit: int = 150,
+           user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """Agent activity trace across all learners — developer (teacher) console only."""
+    query = select(AgentEvent).order_by(AgentEvent.id.desc()).limit(max(1, min(limit, 500)))
+    if agent:
+        query = query.where(AgentEvent.agent == agent)
+    if workflow:
+        query = query.where(AgentEvent.workflow == workflow)
+    if user_id:
+        query = query.where(AgentEvent.user_id == user_id)
+    if slow:
+        query = query.where(AgentEvent.duration_ms > monitoring.SLOW_MS)
+    names = {u.id: u for u in db.scalars(select(User))}
+    return [{**dto(event, "id", "user_id", "workflow", "agent", "phase", "detail", "mode", "duration_ms", "created_at"),
+             "user": names[event.user_id].name if event.user_id in names else "", "email": names[event.user_id].email if event.user_id in names else ""} for event in db.scalars(query)]
+
+
+@app.get("/api/instructor/overview")
+def developer_overview(user: User = Depends(instructor), db: Session = Depends(get_db)):
+    config = settings()
+    return monitoring.overview(db, config.ai_mode, config.llm_model if config.ai_mode == "REAL" else "built-in engine")
+
+
+@app.get("/api/instructor/anomalies")
+def developer_anomalies(days: int = 7, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    return monitoring.anomalies(db, max(1, min(days, 90)))
+
+
+@app.post("/api/instructor/anomalies/ack")
+def acknowledge_anomaly(data: AnomalyAckInput, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    db.add(AuditLog(user_id=user.id, action="anomaly_acknowledged", detail={"anomaly_id": data.anomaly_id}))
+    db.commit()
+    return {"acknowledged": data.anomaly_id}
+
+
+def report_view(report: IssueReport, db: Session) -> dict:
+    owner = db.get(User, report.user_id)
+    return {**dto(report, "id", "category", "message", "context", "status", "response", "created_at", "resolved_at"),
+            "user": owner.name if owner else "", "email": owner.email if owner else ""}
+
+
+@app.post("/api/feedback")
+def report_issue(data: IssueReportInput, user: User = Depends(learner), db: Session = Depends(get_db)):
+    context = {k: v for k, v in (data.context or {}).items() if isinstance(v, (str, int, float, bool)) and len(str(v)) <= 2000}
+    report = IssueReport(user_id=user.id, category=data.category, message=data.message.strip(), context=context, status="OPEN")
+    db.add(report)
+    db.add(AgentEvent(user_id=user.id, workflow="feedback", agent="Learner", phase="report", detail={"category": data.category, "next_agent": "Human Instructor"}, mode=settings().ai_mode))
+    db.commit()
+    return report_view(report, db)
+
+
+@app.get("/api/feedback")
+def my_reports(user: User = Depends(learner), db: Session = Depends(get_db)):
+    return [report_view(r, db) for r in db.scalars(select(IssueReport).where(IssueReport.user_id == user.id).order_by(IssueReport.id.desc()))]
+
+
+@app.get("/api/instructor/feedback")
+def all_reports(status: str | None = None, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    query = select(IssueReport).order_by(IssueReport.status.desc(), IssueReport.id.desc())
+    if status:
+        query = query.where(IssueReport.status == status)
+    return [report_view(r, db) for r in db.scalars(query)]
+
+
+@app.post("/api/instructor/feedback/{report_id}/resolve")
+def resolve_report(report_id: int, data: IssueResolveInput, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    report = db.get(IssueReport, report_id)
+    if not report:
+        raise HTTPException(404, "Report not found")
+    report.status, report.response, report.resolved_by, report.resolved_at = "RESOLVED", data.response.strip(), user.id, datetime.now(timezone.utc)
+    db.add(AuditLog(user_id=user.id, action="learner_report_resolved", detail={"report_id": report.id}))
+    db.commit()
+    return report_view(report, db)
 
 
 @app.get("/api/instructor/cases")

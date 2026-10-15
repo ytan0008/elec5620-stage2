@@ -82,10 +82,12 @@ def test_registration_plan_quality_and_human_review():
         assert low.json()["result"]["state"] == "HELD"
         assert "payload" not in low.json()["result"]
         held_id = low.json()["result"]["id"]
-        assert all("result" not in event["detail"] for event in client.get("/api/events", headers=headers).json() if event["detail"].get("package_id") == held_id)
+        assert client.get("/api/events", headers=headers).status_code == 403
         contradiction = client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": "This third response demonstrates a contradiction in the rubric evaluation.", "scenario": "contradiction"})
         assert contradiction.json()["result"]["state"] == "HELD"
         assert client.get("/api/instructor/cases", headers=headers).status_code == 403
+        dev = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        assert all("result" not in event["detail"] for event in client.get("/api/events", headers=dev).json() if event["detail"].get("package_id") == held_id)
         instructor_token = client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]
         ih = {"Authorization": "Bearer " + instructor_token}
         cases = client.get("/api/instructor/cases", headers=ih).json()
@@ -535,3 +537,44 @@ def test_notebooks_memory_and_coaching(monkeypatch):
         assert client.delete(f"/api/notebook/{selected['id']}", headers=other).status_code == 404
         assert client.get("/api/notebook", headers=other).json() == []
         assert client.delete(f"/api/notebook/{selected['id']}", headers=headers).json()["deleted"] is True
+
+
+def test_developer_console_reports_dictionary_and_exam_lock():
+    with TestClient(app) as client:
+        headers = auth(client, "devconsole@example.com")
+        dev = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        practice = client.post("/api/practice/writing", headers=headers).json()
+        client.post(f"/api/practice/{practice['id']}/submit", headers=headers, json={"text": "A deliberately uncertain answer that must be held for review.", "scenario": "low_confidence"})
+        # Learners cannot see the developer console.
+        for path in ("/api/events", "/api/instructor/overview", "/api/instructor/anomalies", "/api/instructor/feedback"):
+            assert client.get(path, headers=headers).status_code == 403
+        events = client.get("/api/events?agent=Quality%20Manager", headers=dev).json()
+        assert events and all(e["agent"] == "Quality Manager" for e in events) and any(e["user"] == "Test Learner" for e in events)
+        overview = client.get("/api/instructor/overview", headers=dev).json()
+        assert overview["held_7d"] >= 1 and len(overview["timeline"]) == 24 and overview["agents"]
+        anomalies = client.get("/api/instructor/anomalies", headers=dev).json()
+        held = next(a for a in anomalies if a["category"] == "Quality hold" and a["email"] == "devconsole@example.com")
+        assert client.post("/api/instructor/anomalies/ack", headers=dev, json={"anomaly_id": held["id"]}).status_code == 200
+        assert next(a for a in client.get("/api/instructor/anomalies", headers=dev).json() if a["id"] == held["id"])["acknowledged"] is True
+        # Learner feedback reaches the console and the reply comes back.
+        report = client.post("/api/feedback", headers=headers, json={"category": "result", "message": "My writing score looks too low.", "context": {"package_id": 1}}).json()
+        assert any(a["category"] == "Learner report" for a in client.get("/api/instructor/anomalies", headers=dev).json())
+        resolved = client.post(f"/api/instructor/feedback/{report['id']}/resolve", headers=dev, json={"response": "Checked and re-scored."}).json()
+        assert resolved["status"] == "RESOLVED"
+        assert client.get("/api/feedback", headers=headers).json()[0]["response"] == "Checked and re-scored."
+        # Dictionary shows meanings outside exams.
+        looked = client.get("/api/dictionary?word=Mitigate,", headers=headers).json()
+        assert looked["word"] == "mitigate" and looked["translation"] and looked["saved"] is False
+        # During a running mock: meanings and the tutor are locked, but words can still be saved.
+        active_plan(client, headers)
+        assert client.post("/api/mock-exams", headers=headers).status_code == 200
+        assert client.get("/api/dictionary?word=brittle", headers=headers).status_code == 423
+        assert client.post("/api/chat/dashboard", headers=headers, json={"message": "What does brittle mean?"}).status_code == 423
+        saved = client.post("/api/notebook", headers=headers, json={"kind": "word", "text": "brittle", "context": "paper became brittle"}).json()
+        assert saved["hidden"] is True and "translation" not in saved["detail"] and "meanings" not in saved["detail"]
+        listed = client.get("/api/notebook?kind=word", headers=headers).json()
+        assert listed[0]["hidden"] is True and "translation" not in listed[0]["detail"]
+        from backend.db import SessionLocal
+        from backend.models import NotebookEntry
+        with SessionLocal() as db:
+            assert db.get(NotebookEntry, saved["id"]).detail.get("translation")  # stored, revealed after the exam

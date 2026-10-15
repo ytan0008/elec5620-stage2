@@ -42,7 +42,7 @@ function Meta({ entry }: { entry: NotebookEntry }) {
 function Overview({ stats, go }: { stats: NotebookStats; go: (tab: Tab) => void }) {
   const tiles: [NotebookKind, string, string][] = [['mistake', 'Mistakes', '#ff4fd8'], ['word', 'Words', '#3ef0ff'], ['grammar', 'Grammar slips', '#ffd34d'], ['sentence', 'Sentences', '#b8ff5c']]
   return <div className="space-y-6">
-    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{tiles.map(([kind, label, color]) => <button key={kind} onClick={() => go(kind)} className="panel panel-flat p-5 text-left" style={{ ['--edge' as any]: color }}>
+    <div className="stagger grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{tiles.map(([kind, label, color]) => <button key={kind} onClick={() => go(kind)} className="panel panel-flat p-5 text-left" style={{ ['--edge' as any]: color }}>
       <p className="font-pixel text-sm uppercase tracking-wider text-mist">{label}</p>
       <p className="num mt-2 text-5xl" style={{ color }}>{stats.counts[kind]?.active ?? 0}</p>
       <p className="font-read text-xs text-fog">{stats.counts[kind]?.mastered ?? 0} mastered</p>
@@ -109,9 +109,9 @@ function WordCard({ entry, onChange, notify }: { entry: NotebookEntry; onChange:
       <div><p className="flex items-center gap-2"><span className="font-pixel text-2xl text-cyan">{entry.text}</span><button onClick={() => speak(entry.text, persona, { force: true })} aria-label={`Pronounce ${entry.text}`} className="text-mist hover:text-cyan"><Volume2 size={17} /></button>{d.phonetic && <span className="font-read text-sm text-fog">{d.phonetic}</span>}</p><Meta entry={entry} /></div>
       <EntryActions entry={entry} onChange={onChange} notify={notify} />
     </div>
-    {editing ? <form className="mt-3 flex gap-2" onSubmit={e => { e.preventDefault(); void save() }}><input aria-label="My meaning" className="input !py-1.5" value={translation} onChange={e => setTranslation(e.target.value)} placeholder="Meaning in your language" /><button className="btn-cyan !py-1">Save</button></form>
+    {entry.hidden ? <p className="tile mt-3 font-pixel text-sm text-sun">🔒 Meaning hidden until your test ends</p> : editing ? <form className="mt-3 flex gap-2" onSubmit={e => { e.preventDefault(); void save() }}><input aria-label="My meaning" className="input !py-1.5" value={translation} onChange={e => setTranslation(e.target.value)} placeholder="Meaning in your language" /><button className="btn-cyan !py-1">Save</button></form>
       : <p className="mt-3 font-read text-lime">{d.translation || <span className="text-fog">No translation yet</span>} <button className="btn-ghost !inline !px-1 text-xs" onClick={() => setEditing(true)}>edit</button></p>}
-    {d.meanings?.length > 0 ? <ul className="mt-2 space-y-1 font-read text-sm">{d.meanings.slice(0, 3).map((m: any, i: number) => <li key={i}><i className="text-sun">{m.pos}</i> {m.definition}{m.example && <span className="block text-fog">“{m.example}”</span>}</li>)}</ul>
+    {entry.hidden ? null : d.meanings?.length > 0 ? <ul className="mt-2 space-y-1 font-read text-sm">{d.meanings.slice(0, 3).map((m: any, i: number) => <li key={i}><i className="text-sun">{m.pos}</i> {m.definition}{m.example && <span className="block text-fog">“{m.example}”</span>}</li>)}</ul>
       : <p className="mt-2 font-read text-sm text-fog">No dictionary entry was available offline. <button className="btn-ghost !inline !px-1" onClick={() => askTutor(`I don't know the word "${entry.text}". What does it mean?`)}>Ask the tutor</button></p>}
     {d.synonyms?.length > 0 && <p className="mt-2 font-read text-xs text-mist">Synonyms: {d.synonyms.join(', ')}</p>}
     {d.collocations?.length > 0 && <p className="font-read text-xs text-mist">Collocations: {d.collocations.join(' · ')}</p>}
@@ -209,7 +209,7 @@ export default function NotebookPage({ notify }: { notify: Notify }) {
     <nav className="mb-6 flex flex-wrap gap-1" aria-label="Notebooks">{TABS.map(([key, label]) => <button key={key} onClick={() => go(key)} className={tab === key ? 'btn-primary' : 'btn-secondary'}>
       {label}{key !== 'overview' && stats ? <span className="font-read text-xs opacity-80">{stats.counts[key as NotebookKind]?.active ?? 0}</span> : null}
     </button>)}</nav>
-    {tab === 'overview' ? (stats ? <Overview stats={stats} go={go} /> : <Spinner />)
+    <div key={tab} className="anim-fade">{tab === 'overview' ? (stats ? <Overview stats={stats} go={go} /> : <Spinner />)
       : !entries ? <Spinner />
         : reviewing ? <WordReview words={dueWords} notify={notify} onDone={() => { setReviewing(false); reload(); loadStats() }} />
           : <div className="space-y-5">
@@ -220,11 +220,11 @@ export default function NotebookPage({ notify }: { notify: Notify }) {
               {tab !== 'mistake' && <AddForm kind={tab} onAdded={() => { reload(); loadStats() }} notify={notify} />}
             </div>
             {!visible.length ? <Empty title="Nothing here yet" body={{ mistake: 'Wrong answers from listening, reading and mock exams are saved here automatically.', word: 'Select a word on any page and press “Word book”, or tell the tutor “I don’t know the word …”.', grammar: 'Grammar errors from your writing and speaking feedback are saved here, grouped by type.', sentence: 'Corrected rewrites from your feedback are saved here. Select any great sentence and press “Sentence book”.' }[tab]} />
-              : <div className={`grid gap-4 ${tab === 'word' ? 'md:grid-cols-2 xl:grid-cols-3' : 'lg:grid-cols-2'}`}>{visible.map(entry =>
+              : <div key={`${tab}-${filter}`} className={`stagger grid gap-4 ${tab === 'word' ? 'md:grid-cols-2 xl:grid-cols-3' : 'lg:grid-cols-2'}`}>{visible.map(entry =>
                 tab === 'mistake' ? <MistakeCard key={entry.id} entry={entry} onChange={update(entry.id)} notify={notify} />
                   : tab === 'word' ? <WordCard key={entry.id} entry={entry} onChange={update(entry.id)} notify={notify} />
                     : tab === 'grammar' ? <GrammarCard key={entry.id} entry={entry} onChange={update(entry.id)} notify={notify} />
                       : <SentenceCard key={entry.id} entry={entry} onChange={update(entry.id)} notify={notify} />)}</div>}
-          </div>}
+          </div>}</div>
   </>
 }

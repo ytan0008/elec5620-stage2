@@ -289,6 +289,8 @@ class NotebookAddInput(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
     correction: str | None = Field(default=None, max_length=2000)
     language: str = Field(default="Chinese (Simplified)", max_length=40)
+    # Set by the client while a timed test is open: save the word but do not reveal its meaning.
+    exam: bool = False
 
 
 class NotebookUpdateInput(BaseModel):
@@ -322,3 +324,17 @@ class WordInfo(BaseModel):
 
 class CoachOutput(BaseModel):
     message: str = Field(min_length=10, max_length=2500)
+
+
+class IssueReportInput(BaseModel):
+    category: Literal["result", "question", "tutor", "audio", "other"] = "other"
+    message: str = Field(min_length=5, max_length=2000)
+    context: dict = {}
+
+
+class IssueResolveInput(BaseModel):
+    response: str = Field(min_length=3, max_length=2000)
+
+
+class AnomalyAckInput(BaseModel):
+    anomaly_id: str = Field(min_length=3, max_length=120)

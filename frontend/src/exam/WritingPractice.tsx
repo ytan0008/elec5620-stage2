@@ -4,6 +4,7 @@ import { Clock3, RotateCcw, Send } from 'lucide-react'
 import { Practice, Result, post, request } from '../api'
 import { Countdown, Empty, FeedbackPanel, Notify, PageTitle, Spinner, Status, words } from '../ui'
 import ChartView from './ChartView'
+import { useExamLock } from '../examLock'
 
 type Attempt = { id: number; attempt: number; text: string; result: Result; created_at: string }
 
@@ -17,6 +18,7 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
   const [busy, setBusy] = useState(false)
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
+  useExamLock('writing', running && !result)
 
   const load = async (fresh = false) => {
     setBusy(true); setError(''); setResult(null); setRunning(false)

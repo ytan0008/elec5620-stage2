@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { Activity, ArrowRight, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowRight, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Event, Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
+import { Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
 import { Empty, Metric, Notify, PageTitle, SKILL_COLOR, Spinner, Status, nice, skills, stamp, useLoad } from './ui'
 import { PixelAvatar, personaName } from './pixel/Avatar'
 import Scene from './pixel/Scene'
@@ -21,26 +22,30 @@ import SpeakingPage from './exam/SpeakingPage'
 import TutorPage from './notebook/TutorPage'
 import NotebookPage from './notebook/NotebookPage'
 import SelectionCapture from './notebook/SelectionCapture'
+import { AgentActivity, AnomaliesPage, DevOverview, ReportsPage } from './dev/DevConsole'
+import { MyReports } from './ReportProblem'
 
 const learnerNav = [['/dashboard', 'Overview', LayoutDashboard], ['/tutor', 'AI Tutor', GraduationCap], ['/notebook', 'Notebooks', BookMarked], ['/practice/listening', 'Listening', Headphones], ['/practice/reading', 'Reading', BookOpen], ['/practice/writing', 'Writing', FileText], ['/practice/speaking', 'Speaking', Mic],
   ['/mock', 'Mock examination', ClipboardCheck], ['/questions', 'Question bank', Library], ['/plans', 'Learning plan', Target], ['/analytics', 'Performance', TrendingUp], ['/materials', 'Study materials', BookOpen],
-  ['/knowledge', 'Knowledge graph', BrainCircuit], ['/portrait', 'Learning portrait', UserRound], ['/profile', 'My profile', UserRound], ['/workflow', 'Agent activity', Activity], ['/settings', 'Settings', Settings]] as const
+  ['/knowledge', 'Knowledge graph', BrainCircuit], ['/portrait', 'Learning portrait', UserRound], ['/profile', 'My profile', UserRound], ['/settings', 'Settings', Settings]] as const
 const onboardingNav = [['/onboarding', 'Setup assistant', BrainCircuit], ['/settings', 'Settings', Settings]] as const
-const instructorNav = [['/instructor', 'Review queue', ShieldCheck], ['/quality', 'Quality operations', Activity], ['/workflow', 'Agent activity', BrainCircuit], ['/settings', 'Settings', Settings]] as const
+const instructorNav = [['/console', 'Developer console', Gauge], ['/workflow', 'Agent activity', Activity], ['/anomalies', 'Anomalies', AlertTriangle], ['/reports', 'Learner reports', MessageSquareWarning], ['/instructor', 'Review queue', ShieldCheck], ['/quality', 'Quality operations', ClipboardCheck], ['/settings', 'Settings', Settings]] as const
 
 function Logo() {
   return <span className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center bg-magenta text-night" style={{ boxShadow: '0 0 0 3px #140c2e, 4px 4px 0 3px #3ef0ff' }}><Wand2 size={20} /></span>
     <span className="font-arcade text-[13px] leading-5 text-moon">Certify<span className="text-cyan">AI</span><br /><span className="text-[8px] text-magenta">PIXEL ACADEMY</span></span></span>
 }
 
-function Shell({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
+function Shell({ user, onLogout, children, overlays }: { user: User; onLogout: () => void; children: React.ReactNode; overlays?: React.ReactNode }) {
   const [open, setOpen] = useState(false)
   const [info, setInfo] = useState<Health | null>(null)
   const { persona, aiSpeaking } = usePersona()
+  const location = useLocation()
   useEffect(() => { health().then(setInfo).catch(() => {}) }, [])
   const nav = user.role === 'learner' ? (user.profile_complete === false ? onboardingNav : learnerNav) : instructorNav
-  const home = user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/instructor'
-  return <div className="min-h-screen lg:flex">
+  const home = user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/console'
+  const developer = user.role === 'instructor'
+  return <div className={`min-h-screen lg:flex ${developer ? 'dev-mode' : ''}`}>
     <aside className={`fixed inset-y-0 left-0 z-40 flex w-64 flex-col overflow-y-auto bg-abyss/95 p-5 transition-transform lg:sticky lg:top-0 lg:h-screen lg:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`} style={{ boxShadow: '4px 0 0 #2a1d5c' }}>
       <div className="flex items-center justify-between"><Link to={home} onClick={() => setOpen(false)}><Logo /></Link><button className="lg:hidden" aria-label="Close menu" onClick={() => setOpen(false)}><X /></button></div>
       <nav className="mt-8 flex-1 space-y-1">{nav.map(([path, label, Icon]) => <NavLink key={path} to={path} onClick={() => setOpen(false)}
@@ -54,11 +59,12 @@ function Shell({ user, onLogout, children }: { user: User; onLogout: () => void;
     <main className="min-w-0 flex-1">
       <header className="flex h-16 items-center justify-between px-5 md:px-9">
         <button className="lg:hidden" aria-label="Open menu" onClick={() => setOpen(true)}><Menu /></button>
-        <span className="hidden font-pixel text-mist lg:block">✦ Your learning command centre</span>
-        <Link to="/settings" className={`pill ${info?.mode === 'REAL' ? 'text-lime' : 'text-cyan'}`} title={info?.model}>{info ? (info.mode === 'REAL' ? `Cloud AI · ${info.model}` : 'Built-in AI engine') : '…'}</Link>
+        <span className={`hidden font-pixel lg:block ${developer ? 'text-[#7dffb0]' : 'text-mist'}`}>{developer ? '> developer mode · teacher console_' : '✦ Your learning command centre'}</span>
+        <Link to="/settings" className={`pill ${developer ? 'text-[#7dffb0]' : info?.mode === 'REAL' ? 'text-lime' : 'text-cyan'}`} title={info?.model}>{developer ? 'DEV · ' : ''}{info ? (info.mode === 'REAL' ? `Cloud AI · ${info.model}` : 'Built-in AI engine') : '…'}</Link>
       </header>
-      <div className="mx-auto max-w-7xl px-5 pb-28 pt-2 md:px-9">{children}</div>
+      <div key={location.pathname} className="anim-page mx-auto max-w-7xl px-5 pb-28 pt-2 md:px-9">{children}</div>
     </main>
+    {overlays}
   </div>
 }
 
@@ -87,13 +93,13 @@ function Dashboard({ user, notify }: { user: User; notify: Notify }) {
         </div>
       </div>
     </section>
-    <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="stagger mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <Metric label="Target" value={profile.data ? `${profile.data.exam} ${profile.data.target_score}` : '—'} icon={<Target />} color="#ff4fd8" />
       <Metric label="Days left" value={days === null ? '—' : String(days)} icon={<Clock3 />} color="#ffd34d" />
       <Metric label="Hours / week" value={`${profile.data?.weekly_hours ?? '—'}`} icon={<Sparkles />} color="#b8ff5c" />
       <Metric label="Verified results" value={String(analytics.data?.sample_count ?? 0)} icon={<ShieldCheck />} />
     </div>
-    <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{skills.map(skill => {
+    <div className="stagger mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">{skills.map(skill => {
       const Icon = { listening: Headphones, reading: BookOpen, writing: FileText, speaking: Mic }[skill]!
       const score = analytics.data?.skill_scores?.[skill]
       return <Link key={skill} to={`/practice/${skill}`} className="panel group p-5 transition-transform hover:-translate-y-1" style={{ ['--edge' as any]: SKILL_COLOR[skill] }}>
@@ -159,7 +165,7 @@ function PlansPage({ notify }: { notify: Notify }) {
     <PageTitle eyebrow="Learning coordinator" title="Your learning plan" subtitle="A weekly path shaped by your exam goal and verified progress."
       action={<button disabled={busy} onClick={() => act(() => post(`/plans/generate?adapt=${!!active}`), active ? 'Adapted plan proposed' : 'Plan generated')} className="btn-primary">{active ? 'Request adaptation' : 'Generate first plan'}<Sparkles size={16} /></button>} />
     {loading ? <Spinner /> : !data?.length ? <Empty title="No plan yet" body="Generate a personal plan from your confirmed profile." action={<button onClick={() => act(() => post('/plans/generate'), 'Plan generated')} className="btn-primary">Generate plan</button>} />
-      : <div className="space-y-5">{data.map(plan => <div className={`panel p-6 ${plan.status === 'ACTIVE' ? 'panel-lime' : ''}`} key={plan.id}>
+      : <div className="stagger space-y-5">{data.map(plan => <div className={`panel p-6 ${plan.status === 'ACTIVE' ? 'panel-lime' : ''}`} key={plan.id}>
         <div className="flex flex-wrap items-center justify-between gap-3"><div><span className="eyebrow">Version {plan.version} · {plan.kind}</span><h2 className="heading mt-2 text-2xl">{plan.content?.title || 'Plan in quality review'}</h2></div><Status value={plan.status} /></div>
         {plan.content ? <><p className="mt-4 font-read text-mist">{plan.content.rationale}</p>
           <div className="mt-5 grid gap-3 sm:grid-cols-2">{plan.content.activities?.map((a: Record<string, any>, i: number) => <div key={i} className="tile"><span className="font-pixel text-xs uppercase" style={{ color: SKILL_COLOR[a.skill] }}>{a.skill} · {a.minutes_per_week} min / week</span><p className="mt-1 font-read">{a.title}</p><p className="mt-1 font-read text-xs text-fog">{a.reason}</p></div>)}</div>
@@ -212,28 +218,14 @@ function MaterialsPage({ notify }: { notify: Notify }) {
     {recommendations && <div className="panel panel-cyan mb-6 p-5"><div className="flex justify-between"><h2 className="section-title">Quality-checked recommendations</h2><Status value={recommendations.state} /></div>
       {recommendations.payload?.items ? <div className="mt-3 grid gap-3 md:grid-cols-2">{recommendations.payload.items.map((item: any) => <button key={item.id} onClick={() => view(data?.find(m => m.id === item.id))} className="tile text-left font-read text-sm"><b className="font-pixel text-base">{item.title}</b><br />{item.reason}</button>)}</div> : <p className="mt-3 font-read text-sun">Recommendations are held for review.</p>}</div>}
     <div className="mb-5 flex flex-wrap gap-1">{['all', ...skills].map(s => <button key={s} className={skill === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setSkill(s)}>{nice(s)}</button>)}</div>
-    <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-3">{data?.filter(item => skill === 'all' || item.skill === skill).map(item => <button key={item.id} onClick={() => view(item)} className="panel p-6 text-left transition-transform hover:-translate-y-1" style={{ ['--edge' as any]: SKILL_COLOR[item.skill] + 'aa' }}>
+    <div key={skill} className="stagger grid gap-5 md:grid-cols-2 lg:grid-cols-3">{data?.filter(item => skill === 'all' || item.skill === skill).map(item => <button key={item.id} onClick={() => view(item)} className="panel p-6 text-left transition-transform hover:-translate-y-1" style={{ ['--edge' as any]: SKILL_COLOR[item.skill] + 'aa' }}>
       <span className="font-pixel text-xs uppercase" style={{ color: SKILL_COLOR[item.skill] }}>{item.exam} · {item.skill} · {item.level}</span><h3 className="heading mt-3 text-xl">{item.title}</h3><p className="mt-2 font-read text-sm text-mist">{item.description}</p><span className="btn-ghost mt-4 !px-0">Open lesson <ArrowRight size={14} /></span>
     </button>)}</div>
-    {selected && <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-5" onClick={() => setSelected(null)}><div className="panel panel-hot max-h-[85vh] w-full max-w-xl overflow-auto p-7" onClick={e => e.stopPropagation()} role="dialog" aria-label={selected.title}>
+    {selected && createPortal(<div className="anim-fade fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-5" onClick={() => setSelected(null)}><div className="anim-pop panel panel-hot max-h-[85vh] w-full max-w-xl overflow-auto p-7" onClick={e => e.stopPropagation()} role="dialog" aria-label={selected.title}>
       <div className="flex justify-between"><span className="eyebrow">{selected.skill} lesson</span><button onClick={() => setSelected(null)} aria-label="Close lesson"><X /></button></div>
       <h2 className="heading mt-3 text-2xl">{selected.title}</h2><p className="reading mt-5 whitespace-pre-line">{selected.content}</p>
       <div className="mt-7 border-t-4 border-plum pt-5"><p className="mb-3 font-pixel">Was this relevant to your goal?</p><div className="flex gap-2"><button className="btn-lime" onClick={() => rate(true)}>Yes</button><button className="btn-secondary" onClick={() => rate(false)}>Not yet</button></div></div>
-    </div></div>}
-  </>
-}
-
-function WorkflowPage() {
-  const { data, loading, reload } = useLoad<Event[]>('/events')
-  useEffect(() => { const interval = setInterval(reload, 5000); return () => clearInterval(interval) }, [])
-  return <>
-    <PageTitle eyebrow="Live agent trace" title="Agent workflow monitor" subtitle={data?.length ? `Latest: ${data[0].agent} → ${nice(data[0].phase)}. Refreshes every five seconds.` : 'Perception, decisions, handoffs, quality checks and releases from the backend.'} action={<button className="btn-secondary" onClick={reload}>Refresh</button>} />
-    {loading && !data ? <Spinner /> : !data?.length ? <Empty title="No agent activity yet" body="Generate a plan or submit practice to see the workflow here." /> : <div className="panel p-5 md:p-7"><div>{data.map((event, index) => <div key={event.id} className="relative flex gap-4 pb-6">
-      <div className="flex flex-col items-center"><span className={`z-10 grid h-9 w-9 place-items-center ${event.phase === 'release' ? 'bg-lime' : event.phase === 'waiting' ? 'bg-sun' : 'bg-cyan'} text-night`}><Activity size={17} /></span>{index < data.length - 1 && <div className="absolute bottom-0 top-9 w-1 bg-plum" />}</div>
-      <div className="tile min-w-0 flex-1"><div className="flex flex-wrap items-center justify-between gap-2"><div className="font-pixel"><b>{event.agent}</b> <span className="pill ml-2 text-cyan">{nice(event.phase)}</span></div><span className="font-read text-xs text-fog">{stamp(event.created_at)}</span></div>
-        <p className="mt-1 font-read text-xs text-fog">{nice(event.workflow)} · {event.mode} · {event.duration_ms} ms</p>
-        <pre className="mt-3 overflow-auto whitespace-pre-wrap bg-abyss/80 p-3 font-terminal text-base text-mist">{JSON.stringify(event.detail, null, 2)}</pre></div>
-    </div>)}</div></div>}
+    </div></div>, document.body)}
   </>
 }
 
@@ -324,6 +316,7 @@ function SettingsPage({ user }: { user: User }) {
             : 'Running fully offline: curated exam-format tests, rule-based rubric analysis and a scripted examiner. Add OPENAI_API_KEY (and optionally OPENAI_BASE_URL for an OpenAI-compatible provider) to .env and restart the backend for cloud AI.'}</p>
           <p className="font-read text-sm text-mist">Voice: {info?.server_tts ? 'cloud text-to-speech with high-quality voices' : 'your browser’s built-in voices (Edge “Natural” voices sound best)'}. Speech input: browser recognition{info?.server_stt ? ' + cloud transcription' : ''}.</p>
         </div>
+        {user.role === 'learner' && <MyReports />}
         <div className="panel panel-flat p-6"><h2 className="section-title">Quality policy</h2><p className="mt-2 font-read text-sm text-mist">Results stay held when confidence is under the threshold (default 0.70) or feedback conflicts with scores. An instructor can resolve held cases. Scores are unofficial estimates.</p></div>
       </div>
     </div>
@@ -346,14 +339,14 @@ function AppInner() {
   const navigate = useNavigate()
   const notify: Notify = (message, kind = 'success') => { setToast({ message, kind }); window.setTimeout(() => setToast(null), 5000) }
   const store = (u: User) => { localStorage.setItem('certifyai_user', JSON.stringify(u)); setUser(u) }
-  const auth = (u: User, token: string) => { localStorage.setItem('certifyai_token', token); store(u); navigate(u.role === 'learner' ? (u.profile_complete === false ? '/onboarding' : '/dashboard') : '/instructor') }
+  const auth = (u: User, token: string) => { localStorage.setItem('certifyai_token', token); store(u); navigate(u.role === 'learner' ? (u.profile_complete === false ? '/onboarding' : '/dashboard') : '/console') }
   const markProfileComplete = () => setUser(previous => { if (!previous) return previous; const updated = { ...previous, profile_complete: true }; localStorage.setItem('certifyai_user', JSON.stringify(updated)); return updated })
   const logout = () => { ['certifyai_token', 'certifyai_user', 'last-listening', 'last-reading', 'last-writing'].forEach(key => localStorage.removeItem(key)); setUser(null); navigate('/') }
-  const home = user ? (user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/instructor') : '/'
+  const home = user ? (user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/console') : '/'
   return <div className="scanlines">
     <Scene />
     {user ? <PersonaProvider initial={user.avatar || 'witch'} onChange={avatar => store({ ...user, avatar })}>
-      <Shell user={user} onLogout={logout}><Routes>
+      <Shell user={user} onLogout={logout} overlays={user.role === 'learner' && user.profile_complete !== false ? <><AgentChat /><SelectionCapture notify={notify} /></> : null}><Routes>
         {user.role === 'learner' ? (user.profile_complete === false
           ? <Route path="/onboarding" element={<OnboardingPage onComplete={markProfileComplete} notify={notify} />} />
           : <>
@@ -371,15 +364,18 @@ function AppInner() {
             <Route path="/tutor" element={<TutorPage notify={notify} />} />
             <Route path="/notebook" element={<NotebookPage notify={notify} />} />
           </>) : <>
+          <Route path="/console" element={<DevOverview />} />
+          <Route path="/workflow" element={<AgentActivity />} />
+          <Route path="/anomalies" element={<AnomaliesPage notify={notify} />} />
+          <Route path="/reports" element={<ReportsPage notify={notify} />} />
           <Route path="/instructor" element={<InstructorPage notify={notify} />} />
           <Route path="/quality" element={<QualityPage notify={notify} />} />
         </>}
-        <Route path="/workflow" element={<WorkflowPage />} />
         <Route path="/settings" element={<SettingsPage user={user} />} />
         <Route path="*" element={<Navigate to={home} />} />
-      </Routes>{user.role === 'learner' && user.profile_complete !== false && <><AgentChat /><SelectionCapture notify={notify} /></>}</Shell>
+      </Routes></Shell>
     </PersonaProvider> : <Routes><Route path="*" element={<AuthPage onAuth={auth} notify={notify} />} /></Routes>}
-    {toast && <div role="status" className={`panel fixed bottom-24 left-1/2 z-[80] max-w-md -translate-x-1/2 px-5 py-3 font-pixel ${toast.kind === 'error' ? 'panel-hot text-rose' : 'panel-lime text-lime'}`}>{toast.message}</div>}
+    {toast && <div key={toast.message} role="status" className={`panel toast-in fixed bottom-24 left-1/2 z-[80] max-w-md -translate-x-1/2 px-5 py-3 font-pixel ${toast.kind === 'error' ? 'panel-hot text-rose' : 'panel-lime text-lime'}`}>{toast.message}</div>}
   </div>
 }
 

@@ -5,6 +5,7 @@ import { PixelAvatar, personaName } from '../pixel/Avatar'
 import { moodFor, usePersona } from '../persona'
 import { Listener, listen, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
 import { Countdown, FeedbackPanel, Notify, clock } from '../ui'
+import { useExamLock } from '../examLock'
 
 type Props = { notify: Notify; mockId?: number; questionId?: string | null; onSaved?: () => void; onResult?: (result: Result) => void }
 const SILENCE: Record<string, number> = { p2_talk: 6500, repeat: 2200, interview: 4000 }
@@ -34,6 +35,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const sttRecorder = useRef<{ stop: () => Promise<Blob> } | null>(null)
   const alive = useRef(true)
   const supported = recognitionSupported()
+  useExamLock(`speaking-${mockId ?? 'practice'}`, session?.status === 'ACTIVE')
 
   useEffect(() => { health().then(h => setServerStt(h.server_stt)).catch(() => {}) }, [])
   useEffect(() => () => { alive.current = false; listener.current?.abort(); stopSpeaking(); window.clearTimeout(silenceTimer.current); window.clearInterval(tickTimer.current); void recorder.current?.stop() }, [])
