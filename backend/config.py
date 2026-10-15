@@ -10,7 +10,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     # Any OpenAI-compatible chat endpoint (e.g. DeepSeek, Qwen, a local gateway). Empty means api.openai.com.
     openai_base_url: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-6-luna"
+    # GPT-6 models take a reasoning effort (none | low | medium | high). Conversation uses the fast setting;
+    # scoring, plans and quality verdicts use the scoring setting. Leave both empty for models without reasoning.
+    llm_reasoning_effort: str = "none"
+    llm_scoring_effort: str = "low"
+    # The Responses API supports tools together with reasoning. Set false for providers that only offer Chat Completions.
+    llm_use_responses_api: bool = True
+    # Maximum tool-call rounds an agent may take before it must submit its structured answer.
+    agent_tool_rounds: int = 3
     # Cloud speech needs an endpoint with /audio/speech and /audio/transcriptions (OpenAI by default).
     server_speech: bool = True
     speech_base_url: str = ""

@@ -22,14 +22,14 @@ import SpeakingPage from './exam/SpeakingPage'
 import TutorPage from './notebook/TutorPage'
 import NotebookPage from './notebook/NotebookPage'
 import SelectionCapture from './notebook/SelectionCapture'
-import { AgentActivity, AnomaliesPage, DevOverview, ReportsPage } from './dev/DevConsole'
+import { AgentActivity, AgentMemoryPage, AnomaliesPage, DevOverview, ReportsPage } from './dev/DevConsole'
 import { MyReports } from './ReportProblem'
 
 const learnerNav = [['/dashboard', 'Overview', LayoutDashboard], ['/tutor', 'AI Tutor', GraduationCap], ['/notebook', 'Notebooks', BookMarked], ['/practice/listening', 'Listening', Headphones], ['/practice/reading', 'Reading', BookOpen], ['/practice/writing', 'Writing', FileText], ['/practice/speaking', 'Speaking', Mic],
   ['/mock', 'Mock examination', ClipboardCheck], ['/questions', 'Question bank', Library], ['/plans', 'Learning plan', Target], ['/analytics', 'Performance', TrendingUp], ['/materials', 'Study materials', BookOpen],
   ['/knowledge', 'Knowledge graph', BrainCircuit], ['/portrait', 'Learning portrait', UserRound], ['/profile', 'My profile', UserRound], ['/settings', 'Settings', Settings]] as const
 const onboardingNav = [['/onboarding', 'Setup assistant', BrainCircuit], ['/settings', 'Settings', Settings]] as const
-const instructorNav = [['/console', 'Developer console', Gauge], ['/workflow', 'Agent activity', Activity], ['/anomalies', 'Anomalies', AlertTriangle], ['/reports', 'Learner reports', MessageSquareWarning], ['/instructor', 'Review queue', ShieldCheck], ['/quality', 'Quality operations', ClipboardCheck], ['/settings', 'Settings', Settings]] as const
+const instructorNav = [['/console', 'Developer console', Gauge], ['/workflow', 'Agent activity', Activity], ['/agent-memory', 'Agent memory', BrainCircuit], ['/anomalies', 'Anomalies', AlertTriangle], ['/reports', 'Learner reports', MessageSquareWarning], ['/instructor', 'Review queue', ShieldCheck], ['/quality', 'Quality operations', ClipboardCheck], ['/settings', 'Settings', Settings]] as const
 
 function Logo() {
   return <span className="flex items-center gap-3"><span className="grid h-10 w-10 place-items-center bg-magenta text-night" style={{ boxShadow: '0 0 0 3px #140c2e, 4px 4px 0 3px #3ef0ff' }}><Wand2 size={20} /></span>
@@ -366,6 +366,7 @@ function AppInner() {
           </>) : <>
           <Route path="/console" element={<DevOverview />} />
           <Route path="/workflow" element={<AgentActivity />} />
+          <Route path="/agent-memory" element={<AgentMemoryPage />} />
           <Route path="/anomalies" element={<AnomaliesPage notify={notify} />} />
           <Route path="/reports" element={<ReportsPage notify={notify} />} />
           <Route path="/instructor" element={<InstructorPage notify={notify} />} />

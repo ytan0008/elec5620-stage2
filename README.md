@@ -41,7 +41,7 @@ Open `http://localhost:5173` in **Chrome or Edge** (needed for microphone speech
 ## AI engine: local or cloud
 
 - **No API key (default)** — the built-in engine runs fully offline: the curated exam-format test bank (6 IELTS listening parts incl. one complete 4-part test, 3 academic reading passages, 10 writing tasks, 6 full speaking tests, plus a TOEFL 2026 set), a transparent rule-based rubric analyser (length, paragraphing, cohesive devices, lexical diversity, academic vocabulary, sentence complexity, common-error detection with corrections, speech rate and fillers), a scripted examiner that follows the real test structure, and a rule-based tutor for chat. Writing and speaking tasks can be generated from any topic.
-- **Cloud AI** — set `OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL` for any OpenAI-compatible provider such as DeepSeek) and restart the backend. The model then writes natural conversation, examiner follow-ups, rubric feedback with model answers, and brand-new listening/reading tests on any topic. Generated tests pass the Quality Manager (e.g. every completion answer must appear in the audio script) before use.
+- **Cloud AI** — set `OPENAI_API_KEY` in `.env` and restart the backend. The default model is `gpt-6-luna` through the Responses API, with reasoning effort `none` for conversation and `low` for scoring, plans and quality verdicts (`LLM_REASONING_EFFORT`, `LLM_SCORING_EFFORT`). For another OpenAI-compatible provider set `OPENAI_BASE_URL`, `LLM_MODEL`, empty reasoning efforts and `LLM_USE_RESPONSES_API=false`. The model then writes natural conversation, examiner follow-ups, rubric feedback with model answers, and brand-new listening/reading tests on any topic. Generated tests pass the Quality Manager (e.g. every completion answer must appear in the audio script) before use.
 - **Voice** — with an OpenAI key, `SERVER_SPEECH=true` uses cloud text-to-speech (distinct voices per speaker, cached) and Whisper transcription. Otherwise the browser's own voices and speech recognition are used automatically.
 
 The header badge and **Settings** show the active engine.
@@ -51,6 +51,17 @@ The header badge and **Settings** show the active engine.
 ## Architecture and quality invariant
 
 `backend/agents.py` defines the LangGraph `StateGraph` workflows (Coordinator → Quality Manager → release / human wait; Tutor → Assessment & Analytics → Quality Manager). `backend/content/` holds the structured test bank, `backend/scoring.py` objective marking, band conversion and the local analyser, `backend/examiner.py` the speaking-test state machine, `backend/speech.py` server TTS/STT. Answer keys never leave the server before submission.
+
+**Agents, memory and tools** (`backend/agent_core.py`). Each of the four agents has its own memory table (`agent_memories`) and its own tools; the model chooses which tools to call (at most `AGENT_TOOL_ROUNDS` rounds) and then submits its structured answer.
+
+| Agent | Memory | Tools |
+|---|---|---|
+| Learning Coordinator | plans proposed, accepted or rejected, change requests | plan history, verified scores, notebook statistics, material search |
+| AI Tutor | feedback given and its main issues (plus the learner-editable tutor memory) | previous feedback, notebook statistics, dictionary, grammar checker, text measures, question bank |
+| Assessment & Analytics | estimates and score changes per skill | band descriptors, raw-score conversion, score history, text measures |
+| Quality Manager | holds (per learner) and lessons from instructor decisions (cohort-wide) | threshold, instructor decisions, cohort issue counts, hold rate |
+
+Every agent can also `recall_memory` and `save_memory`. Tools are read-only apart from saving a memory, so no model can release a result or change prompts by itself. Tool calls appear in **Agent activity** and memories in **Agent memory** in the teacher console. No fine-tuning is used: the agents rely on rubric tools, memory and the quality gate, which are auditable and need no training data.
 
 `result_packages` is the release boundary: learners see a payload only in `RELEASED`. Held results go to the instructor queue. The 0.70 confidence threshold is adjustable in Quality Operations. Confidence values are self-reports, not calibrated probabilities. Scores are **unofficial estimates**; pronunciation is never scored from a transcript. Exam content is original and written for this project; official IELTS samples are linked, not republished.
 

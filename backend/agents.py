@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
@@ -22,6 +23,8 @@ from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, Recommen
 from backend.onboarding import parse_demo_message
 from backend import content as bank
 from backend import local_tutor
+from backend import agent_core
+from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
 
 
@@ -76,24 +79,61 @@ class ProviderAdapter:
     def __init__(self):
         self.config = settings()
         self.mode = self.config.ai_mode
-        self.llm = None
+        self.llm = self.scorer = None
         if self.mode == "REAL":
-            self.llm = ChatOpenAI(model=self.config.llm_model, api_key=self.config.openai_api_key, base_url=self.config.openai_base_url or None, timeout=60, max_retries=1)
+            self.llm = self._client(self.config.llm_reasoning_effort)
+            self.scorer = self._client(self.config.llm_scoring_effort) if self.config.llm_scoring_effort != self.config.llm_reasoning_effort else self.llm
+
+    def _client(self, effort: str) -> ChatOpenAI:
+        options = {"model": self.config.llm_model, "api_key": self.config.openai_api_key, "base_url": self.config.openai_base_url or None, "timeout": 90, "max_retries": 1}
+        if self.config.llm_use_responses_api:
+            options["use_responses_api"] = True
+        if effort:
+            options["reasoning"] = {"effort": effort}
+        return ChatOpenAI(**options)
 
     @property
     def local(self) -> bool:
         return self.mode == "LOCAL"
 
-    def structured(self, schema, system: str, user: dict, local: dict):
+    def structured(self, schema, system: str, user: dict, local: dict, toolkit: Toolkit | None = None, scoring: bool = False):
+        """Structured output from the cloud model. With a toolkit the agent sees its memory, may call its tools,
+        and then submits the answer through a final tool shaped like the schema."""
         if self.local:
             return schema.model_validate(local)
+        llm = self.scorer if scoring else self.llm
         # Callers pass only exam goals, learning text and scores; account identity is excluded.
-        chain = self.llm.with_structured_output(schema)
-        messages = [("system", system), ("human", json.dumps(user, ensure_ascii=False))]
+        if toolkit:
+            user = {**user, "your_memory": agent_core.recall(toolkit.db, toolkit.agent, toolkit.user_id, 8, include_cohort=True)}
+            system += (" You are one of four cooperating agents. 'your_memory' holds your own notes from earlier sessions. "
+                       "Call your tools when you need facts you were not given; then call submit_result exactly once with the final answer.")
+        messages = [SystemMessage(system), HumanMessage(json.dumps(user, ensure_ascii=False, default=str))]
+        if toolkit:
+            try:
+                return self._agent_loop(llm, schema, messages, toolkit)
+            except Exception:
+                pass  # Fall back to a plain structured call with the tool results gathered so far.
+        chain = llm.with_structured_output(schema)
         try:
             return chain.invoke(messages)
         except Exception:
             return chain.invoke(messages)  # One bounded retry before the caller holds the result.
+
+    def _agent_loop(self, llm, schema, messages: list, toolkit: Toolkit):
+        tools = {item.name: item for item in toolkit.tools()}
+        final = {"type": "function", "function": {"name": "submit_result", "description": "Submit the final structured answer.", "parameters": schema.model_json_schema()}}
+        for round_ in range(self.config.agent_tool_rounds + 1):
+            last = round_ == self.config.agent_tool_rounds
+            bound = llm.bind_tools([final] if last else [*tools.values(), final], tool_choice="submit_result" if last else "required")
+            reply = bound.invoke(messages)
+            messages.append(reply)
+            submitted = next((call for call in reply.tool_calls if call["name"] == "submit_result"), None)
+            if submitted:
+                return schema.model_validate(submitted["args"])
+            for call in reply.tool_calls:
+                result = tools[call["name"]].invoke(call["args"]) if call["name"] in tools else {"error": "unknown tool"}
+                messages.append(ToolMessage(content=json.dumps(result, ensure_ascii=False, default=str)[:6000], tool_call_id=call["id"]))
+        raise RuntimeError("Agent did not submit a result")
 
     def extract_onboarding(self, message: str, draft: dict) -> OnboardingExtraction:
         return self.structured(
@@ -105,7 +145,7 @@ class ProviderAdapter:
         )
 
     def chat(self, context: str, message: str, profile: dict, plan: dict | None, history: list[dict], persona: str = "witch",
-             memory: list[str] | None = None, notebook: dict | None = None, actions: list[str] | None = None) -> AgentChatReply:
+             memory: list[str] | None = None, notebook: dict | None = None, actions: list[str] | None = None, toolkit: Toolkit | None = None) -> AgentChatReply:
         """Instructional conversation with long-term memory; formal scores and plans use the verified workflows."""
         memory, notebook, actions = memory or [], notebook or {}, actions or []
         local = local_tutor.reply(context, message, profile, plan, history, persona, memory, notebook, actions)
@@ -127,7 +167,7 @@ class ProviderAdapter:
             "Do not claim an official IELTS/TOEFL score or calibrated confidence. If the learner writes in Chinese or another language, answer mainly in simple English "
             "and add a brief translation. Never ask for passwords or identity details.",
             {"message": message, "profile": profile, "active_plan": plan, "memory": memory[:30], "notebook": notebook, "actions": actions, "recent_messages": history[-12:]},
-            {"reply": local},
+            {"reply": local}, toolkit if skill != "speaking" else None,  # Spoken turns skip tools to keep the voice reply fast.
         )
 
     def word_info(self, word: str, context: str, language: str, dictionary: dict) -> dict:
@@ -141,7 +181,7 @@ class ProviderAdapter:
         return {"phonetic": info["phonetic"] or dictionary.get("phonetic", ""), "meanings": meanings, "translation": info["translation"],
                 "synonyms": info["synonyms"] or dictionary.get("synonyms", []), "collocations": info["collocations"], "dictionary": "cloud AI"}
 
-    def coach(self, points: list[str], profile: dict, memory: list[str], notebook: dict, persona: str) -> str:
+    def coach(self, points: list[str], profile: dict, memory: list[str], notebook: dict, persona: str, toolkit: Toolkit | None = None) -> str:
         name = "Kai" if persona == "boy" else "Luna"
         local = f"Here's your coaching plan for today from {name}:\n" + "\n".join(f"{i + 1}. {point}" for i, point in enumerate(points))
         if self.local:
@@ -149,7 +189,7 @@ class ProviderAdapter:
         return self.structured(CoachOutput, f"{PERSONA_STYLE.get(persona, PERSONA_STYLE['witch'])} Write today's personalised coaching message for this IELTS/TOEFL learner: "
                                "3-5 numbered, concrete steps that use their notebook statistics (most frequent mistake types, repeated grammar errors, words due) and what you remember about them. "
                                "Each step names a specific action in the app (Mistake book, Word book, Grammar book, a practice skill or the mock exam) and why. Plain text, under 220 words.",
-                               {"profile": profile, "memory": memory[:30], "notebook": notebook, "starting_points": points}, {"message": local}).message
+                               {"profile": profile, "memory": memory[:30], "notebook": notebook, "starting_points": points}, {"message": local}, toolkit).message
 
     def examiner_rephrase(self, stage: str, scripted: str, learner_text: str, allow_followup: bool, persona: str):
         """Let a cloud model phrase the next examiner turn naturally. LOCAL mode keeps the script."""
@@ -165,7 +205,7 @@ class ProviderAdapter:
             return (scripted, False)  # The model must not drop the scripted question.
         return (result.say, result.follow_up)
 
-    def portrait(self, profile: dict) -> PortraitOutput:
+    def portrait(self, profile: dict, toolkit: Toolkit | None = None) -> PortraitOutput:
         priorities = profile["priority_skills"]
         local = {
             "summary": f"Starting portrait for a {profile['proficiency']} {profile['exam']} learner aiming for {profile['target_score']}. It reflects stated goals until verified practice results arrive.",
@@ -180,7 +220,7 @@ class ProviderAdapter:
             PortraitOutput,
             "You are the Learning Coordinator. Create a concise learning portrait from stated goals only. "
             "Never claim a measured strength without verified performance. Give a self-reported heuristic confidence.",
-            {"profile": profile}, local,
+            {"profile": profile}, local, toolkit,
         )
 
     # ---------------------------------------------------------------- content
@@ -287,7 +327,7 @@ class ProviderAdapter:
         return {"title": out["title"], "task_type": "Full Speaking test (Parts 1-3)", "prompt": out["cue"], "content": item, "confidence": out["confidence"]}
 
     # ---------------------------------------------------------------- plans and assessment
-    def plan(self, profile: dict, progress: dict, adaptation: bool) -> PlanOutput:
+    def plan(self, profile: dict, progress: dict, adaptation: bool, toolkit: Toolkit | None = None) -> PlanOutput:
         priorities = priority_tool.invoke({"priority_skills": profile["priority_skills"], "weakness_skills": progress.get("weaknesses", [])})
         change_request = progress.get("change_request")
         if change_request:
@@ -307,14 +347,15 @@ class ProviderAdapter:
                  "priorities": priorities, "activities": activities,
                  "changes": (["Increase practice on recent weak skills"] if adaptation else []) + ([f"Consider learner request: {change_request}"] if change_request else []), "confidence": {"plan": .87}}
         return self.structured(PlanOutput, "You are the Learning Coordinator. Propose actionable IELTS or TOEFL weekly study activities (skill, title, minutes_per_week, reason) whose minutes sum to the "
-                               "learner's weekly hours. Return confidence as a self-reported heuristic, not a calibrated probability.", {"profile": profile, "progress": progress, "adaptation": adaptation}, local)
+                               "learner's weekly hours. Use the learner's earlier plan decisions and notebook patterns when they help. Return confidence as a self-reported heuristic, not a calibrated probability.",
+                               {"profile": profile, "progress": progress, "adaptation": adaptation}, local, toolkit, scoring=True)
 
     def prompt(self, exam: str, skill: str, avoid: set[str] | None = None) -> dict:
         """Pick an item from the curated bank, preferring ones the learner has not seen."""
         item = bank.pick(exam, skill, avoid)
         return practice_prompt(item, "ORIGINAL")
 
-    def feedback(self, exam: str, skill: str, text: str, scenario: str, prompt: str = "", task: str = "task2", metrics: dict | None = None) -> FeedbackOutput:
+    def feedback(self, exam: str, skill: str, text: str, scenario: str, prompt: str = "", task: str = "task2", metrics: dict | None = None, toolkit: Toolkit | None = None) -> FeedbackOutput:
         local = analyse_response(exam, skill, text, prompt, task, metrics)
         if self.local:
             if scenario == "low_confidence":
@@ -332,36 +373,39 @@ class ProviderAdapter:
                   "Give 3-6 sentence-specific comments (quote the sentence, name the issue, give a concrete fix), 3-4 improvements, up to 5 improved_sentences "
                   "({original, improved}), and a short model_answer paragraph showing a higher-band version of one part. "
                   "Never infer pronunciation from a transcript: set pronunciation_available false and explain that audio was not assessed. "
-                  "Provide self-reported confidence (0-1) for every criterion. These are unofficial estimates.")
+                  "Provide self-reported confidence (0-1) for every criterion. These are unofficial estimates. "
+                  "If the learner had earlier feedback on this skill, say in the summary which earlier problems are fixed and which remain.")
         output = self.structured(FeedbackOutput, system, {"exam": exam, "skill": skill, "task": task, "question": prompt[:3000], "response": text[:12000],
-                                                          "measured_features": local["analysis"], "delivery_metrics": metrics or {}}, local)
+                                                          "measured_features": local["analysis"], "delivery_metrics": metrics or {}}, local, toolkit, scoring=True)
         if not self.local:
             output.analysis = local["analysis"]
             if skill != "speaking":
                 output.pronunciation_note = None
         return output
 
-    def consistency(self, payload: dict) -> VerdictOutput:
+    def consistency(self, payload: dict, toolkit: Toolkit | None = None) -> VerdictOutput:
         scores = payload.get("criteria", {})
         summary = payload.get("summary", "").lower()
         issues = bool(scores) and ("excellent" in summary or "no weaknesses" in summary) and min(scores.values()) <= 3
         local = {"consistent": not issues, "reason": "Praise conflicts with a very low criterion score" if issues else "No obvious score and feedback contradiction", "confidence": .85}
-        return self.structured(VerdictOutput, "Check whether feedback statements contradict criterion scores. Be conservative and return a short reason.", {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local)
+        return self.structured(VerdictOutput, "You are the Operations & Quality Manager. Check whether feedback statements contradict criterion scores. Be conservative and return a short reason. "
+                               "Learn from earlier instructor decisions: if the instructor approved similar results you held, do not repeat that false alarm.",
+                               {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True)
 
-    def recommendations(self, catalog: list[dict], priorities: list[str]) -> RecommendationOutput:
+    def recommendations(self, catalog: list[dict], priorities: list[str], toolkit: Toolkit | None = None) -> RecommendationOutput:
         ranked = sorted(catalog, key=lambda item: item["skill"] not in priorities)[:4]
         local = {"items": [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": f"Targets your {'priority' if item['skill'] in priorities else 'supporting'} skill: {item['skill']}", "confidence": .84} for item in ranked],
                  "summary": "Ranked study material suggestions", "confidence": {str(item["id"]): .84 for item in ranked}}
-        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only catalog IDs provided, explain each match and return self-reported confidence per item.", {"catalog": catalog, "priorities": priorities}, local)
+        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only catalog IDs provided, explain each match and return self-reported confidence per item.", {"catalog": catalog, "priorities": priorities}, local, toolkit)
 
-    def report(self, progress: dict) -> ReportNarrative:
+    def report(self, progress: dict, toolkit: Toolkit | None = None) -> ReportNarrative:
         scores = progress.get("skill_scores", {})
         best = max(scores, key=scores.get) if scores else None
         local = {"summary": (f"Across {progress.get('sample_count', 0)} verified results, your strongest skill is {best} ({scores[best]}). " if best else "")
                  + (f"Focus next on {', '.join(progress.get('weaknesses', []))}." if progress.get("weaknesses") else "Collect more practice results for a clearer picture."),
                  "recommendations": [f"Practise {skill} twice this week and review every feedback comment" for skill in progress.get("weaknesses", [])] or ["Collect more practice results"],
                  "confidence": {"report": .81}}
-        return self.structured(ReportNarrative, "You are the Assessment and Analytics agent. Explain observed scores conservatively; readiness is an estimate and never an official score. Return self-reported confidence.", progress, local)
+        return self.structured(ReportNarrative, "You are the Assessment and Analytics agent. Explain observed scores conservatively; readiness is an estimate and never an official score. Return self-reported confidence.", progress, local, toolkit, scoring=True)
 
 
 def practice_prompt(item: dict, source: str) -> dict:
@@ -395,10 +439,16 @@ class AgentRuntime:
     def coordinator(self, state: FlowState) -> dict:
         t = time.perf_counter()
         self.event(state, "Learning Coordinator", "perception", {"exam": state["profile"]["exam"], "priorities": state["profile"]["priority_skills"]})
+        kit = Toolkit(self.db, "coordinator", state["user_id"], state["profile"]["exam"])
         try:
-            output = self.provider.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation").model_dump()
+            output = self.provider.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation", kit).model_dump()
         except Exception as exc:
             output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": type(exc).__name__}
+        kit.log(state["workflow"], self.provider.mode)
+        if output.get("priorities"):
+            request = state.get("progress", {}).get("change_request")
+            agent_core.remember(self.db, "coordinator", state["user_id"], f"Proposed {state['workflow']} plan '{output.get('title')}' with priorities {', '.join(output['priorities'][:4])}"
+                                + (f" after the learner asked: {request}" if request else "") + ".", data={"priorities": output["priorities"]})
         self.event(state, "Learning Coordinator", "handoff", {"decision": "submit proposed plan", "next_agent": "Quality Manager", "tool": "LLM adapter"}, t)
         return {"output": output, "source_mode": self.provider.mode}
 
@@ -413,11 +463,24 @@ class AgentRuntime:
     def tutor(self, state: FlowState) -> dict:
         t = time.perf_counter()
         self.event(state, "AI Tutor", "perception", {"skill": state["skill"], "response_length": len(state["text"])})
+        kit = Toolkit(self.db, "tutor", state["user_id"], state["profile"]["exam"])
+        previous = kit.call("get_previous_feedback", skill=state["skill"])
         try:
             result = self.provider.feedback(state["profile"]["exam"], state["skill"], state["text"], state.get("scenario", "normal"),
-                                            state.get("prompt", ""), state.get("task") or "task2", state.get("metrics")).model_dump()
+                                            state.get("prompt", ""), state.get("task") or "task2", state.get("metrics"), kit).model_dump()
         except Exception as exc:
             result = {"summary": "Feedback generation failed structured validation", "criteria": {}, "comments": [], "confidence": {}, "error_type": type(exc).__name__}
+        kit.log(state["workflow"], self.provider.mode)
+        if isinstance(previous, dict) and previous.get("criteria") and result.get("criteria"):
+            before = {item["issue"] for item in previous.get("issues", []) if item.get("issue")}
+            now = {item.get("issue") for item in result.get("comments", []) if item.get("issue")}
+            result["since_last"] = {"date": previous["date"], "fixed": sorted(before - now)[:6], "remaining": sorted(before & now)[:6],
+                                    "criteria_change": {k: round(v - previous["criteria"][k], 1) for k, v in result["criteria"].items()
+                                                        if isinstance(v, (int, float)) and isinstance(previous["criteria"].get(k), (int, float))}}
+        if result.get("comments"):
+            issues = [c.get("issue") for c in result["comments"][:4] if c.get("issue")]
+            agent_core.remember(self.db, "tutor", state["user_id"], f"Gave {state['skill']} ({state.get('task') or 'task'}) feedback; main issues: {'; '.join(issues) or 'none'}.",
+                                data={"skill": state["skill"], "issues": issues})
         self.event(state, "AI Tutor", "handoff", {"decision": "generate feedback", "next_agent": "Assessment & Analytics", "tool": "LLM adapter"}, t)
         return {"output": result, "source_mode": self.provider.mode}
 
@@ -428,7 +491,17 @@ class AgentRuntime:
         result["estimated_overall"] = criterion_average.invoke({"scores": scores})
         result["score_scale"] = "IELTS 0-9 bands" if state["profile"]["exam"] == "IELTS" else "TOEFL 2026 1-6 sections"
         result["official"] = False
-        self.event(state, "Assessment & Analytics", "handoff", {"decision": "calculate indicative criterion mean", "next_agent": "Quality Manager", "tool": "criterion_average"}, t)
+        kit = Toolkit(self.db, "assessment", state["user_id"], state["profile"]["exam"])
+        history = kit.call("get_score_history", skill=state["workflow"])
+        kit.log(state["workflow"], self.provider.mode)
+        previous = next((h["estimate"] for h in history if isinstance(h.get("estimate"), (int, float))), None) if isinstance(history, list) else None
+        if previous is not None and scores:
+            result["trend"] = {"previous": previous, "change": round(result["estimated_overall"] - previous, 1)}
+        if scores:
+            agent_core.remember(self.db, "assessment", state["user_id"], f"{state['workflow'].title()} estimate {result['estimated_overall']}"
+                                + (f" (previous {previous}, change {result['trend']['change']:+})" if previous is not None else " (first estimate)") + ".",
+                                data={"skill": state["workflow"], "estimate": result["estimated_overall"]})
+        self.event(state, "Assessment & Analytics", "handoff", {"decision": "calculate indicative criterion mean and trend", "next_agent": "Quality Manager", "tool": "criterion_average, get_score_history"}, t)
         return {"output": result}
 
     def quality(self, state: FlowState) -> dict:
@@ -483,8 +556,9 @@ class AgentRuntime:
             issues.append("Confidence below configured threshold")
         if payload.get("criteria") and ("excellent" in payload.get("summary", "").lower() or "no weaknesses" in payload.get("summary", "").lower()) and min(payload["criteria"].values()) <= 3:
             issues.append("Rule check found score/feedback contradiction")
+        kit = Toolkit(self.db, "quality", state["user_id"], (state.get("profile") or {}).get("exam", "IELTS"))
         try:
-            verdict = self.provider.consistency(payload)
+            verdict = self.provider.consistency(payload, kit)
             if not verdict.consistent:
                 issues.append(verdict.reason)
             if verdict.confidence < self.threshold():
@@ -496,6 +570,9 @@ class AgentRuntime:
                 issues.append("Rule fallback found score/feedback contradiction")
             if self.provider.mode == "REAL":
                 issues.append("LLM consistency verification unavailable")
+        kit.log(state["workflow"], self.provider.mode)
+        if issues:
+            agent_core.remember(self.db, "quality", state["user_id"], f"Held {state['workflow']} result #{package.id}: {'; '.join(issues)[:300]}.", data={"package_id": package.id})
         package.issues = issues
         self.db.add(QualityCheck(package_id=package.id, verdict="HOLD" if issues else "VERIFY", issues=issues, threshold=self.threshold(), method=method))
         self.event(state, "Quality Manager", "verification", {"package_id": package.id, "issues": issues, "method": method, "threshold": self.threshold(), "confidence": confidence}, t)

@@ -116,6 +116,13 @@ export function FeedbackPanel({ result }: { result: Result | null }) {
       <div className="font-read text-sm text-mist">Estimated {p.score_scale}<br />Unofficial practice score · quality checked</div>
     </div>}
     <p className="font-read leading-7 text-moon/90">{p.summary || p.rationale}</p>
+    {(p.since_last || p.trend) && <div className="tile space-y-2 font-read text-sm">
+      <h4 className="font-pixel text-base text-cyan">Compared with your last attempt{p.since_last?.date ? ` (${p.since_last.date})` : ''}</h4>
+      {p.trend && <p>Estimate {p.trend.previous} → {p.estimated_overall} <span className={p.trend.change >= 0 ? 'text-lime' : 'text-rose'}>({p.trend.change >= 0 ? '+' : ''}{p.trend.change})</span></p>}
+      {p.since_last?.criteria_change && Object.keys(p.since_last.criteria_change).length > 0 && <div className="flex flex-wrap gap-2">{Object.entries(p.since_last.criteria_change).map(([k, v]) => <span key={k} className={`pill ${Number(v) >= 0 ? 'text-lime' : 'text-rose'}`}>{nice(k)} {Number(v) >= 0 ? '+' : ''}{String(v)}</span>)}</div>}
+      {p.since_last?.fixed?.length > 0 && <p className="text-lime">Fixed: {p.since_last.fixed.join(' · ')}</p>}
+      {p.since_last?.remaining?.length > 0 && <p className="text-sun">Still there: {p.since_last.remaining.join(' · ')}</p>}
+    </div>}
     {p.criteria && <div className="grid gap-3 sm:grid-cols-2">{Object.entries(p.criteria).map(([name, score]) => <ScoreBar key={name} label={name} score={Number(score)} max={max} />)}</div>}
     {p.analysis && Object.keys(p.analysis).length > 0 && <div className="flex flex-wrap gap-2">{Object.entries(p.analysis).filter(([, v]) => typeof v === 'number').map(([k, v]) => <span key={k} className="pill text-cyan">{nice(k)}: {String(v)}</span>)}</div>}
     {p.comments?.length > 0 && <div className="space-y-3"><h4 className="font-pixel text-lg text-sun">Examiner notes</h4>{p.comments.map((item: Record<string, string>, i: number) => <div key={i} className="tile font-read text-sm">

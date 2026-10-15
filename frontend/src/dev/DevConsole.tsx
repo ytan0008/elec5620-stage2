@@ -100,6 +100,32 @@ export function AgentActivity() {
   </>
 }
 
+/* ---------------- agent memory ---------------- */
+type MemoryRow = { id: number; agent: string; agent_name: string; user_id: number | null; user: string; kind: string; text: string; created_at: string }
+const AGENT_KEYS: [string, string][] = [['', 'All agents'], ['coordinator', 'Learning Coordinator'], ['tutor', 'AI Tutor'], ['assessment', 'Assessment & Analytics'], ['quality', 'Quality Manager']]
+
+export function AgentMemoryPage() {
+  const [agent, setAgent] = useState('')
+  const query = `/instructor/agent-memory?limit=200${agent ? `&agent=${agent}` : ''}`
+  const { data, loading } = useLoad<MemoryRow[]>(query, [query])
+  const counts = useMemo(() => (data || []).reduce<Record<string, number>>((acc, row) => ({ ...acc, [row.agent_name]: (acc[row.agent_name] || 0) + 1 }), {}), [data])
+  return <>
+    <PageTitle eyebrow="Developer mode · agent state" title="Agent memory" subtitle="What each agent remembers: episodes it acted on and lessons learned from learners and your review decisions. Agents recall this before acting." />
+    <div className="panel panel-term mb-5 flex flex-wrap items-center gap-3 p-4">
+      <select aria-label="Memory agent filter" className="input !w-56" value={agent} onChange={e => setAgent(e.target.value)}>{AGENT_KEYS.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select>
+      <div className="flex flex-wrap gap-2">{Object.entries(counts).map(([name, count]) => <span key={name} className="pill" style={{ color: AGENT_COLOR[name] }}>{name}: {count}</span>)}</div>
+    </div>
+    {loading && !data ? <Spinner /> : !data?.length ? <Empty title="No agent memory yet" body="Memories appear when agents create plans, give feedback, score work or hold results." /> : <div className="panel panel-term stagger space-y-2 p-4 md:p-6">
+      {data.map(row => <div key={row.id} className="tile flex flex-wrap items-start gap-3 font-terminal text-lg">
+        <span className="w-48 shrink-0 truncate" style={{ color: AGENT_COLOR[row.agent_name] }}>{row.agent_name}</span>
+        <span className={`pill !text-[10px] ${row.kind === 'lesson' ? 'text-sun' : 'text-cyan'}`}>{row.kind}</span>
+        <span className="min-w-0 flex-1 font-read text-sm text-moon/90">{row.text}</span>
+        <span className="text-fog">{row.user} · {stamp(row.created_at)}</span>
+      </div>)}
+    </div>}
+  </>
+}
+
 /* ---------------- anomalies ---------------- */
 export function AnomaliesPage({ notify }: { notify: Notify }) {
   const { data, loading, reload, setData } = useLoad<Anomaly[]>('/instructor/anomalies')

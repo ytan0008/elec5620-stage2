@@ -578,3 +578,66 @@ def test_developer_console_reports_dictionary_and_exam_lock():
         from backend.models import NotebookEntry
         with SessionLocal() as db:
             assert db.get(NotebookEntry, saved["id"]).detail.get("translation")  # stored, revealed after the exam
+
+
+def test_each_agent_has_memory_tools_and_progress_comparison():
+    with TestClient(app) as client:
+        headers = auth(client, "memory.agents@example.com")
+        active_plan(client, headers)
+        task = client.post("/api/practice/writing", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. Companies should allow it because workers save time."
+        first = client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": essay})
+        assert first.status_code == 200, first.text
+        second = client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": essay.replace("peoples is", "people are")}).json()["result"]
+        assert second["state"] == "RELEASED"
+        # The Tutor compares with its previous feedback; Assessment reports the trend from its score-history tool.
+        assert {"fixed", "remaining", "criteria_change"} <= set(second["payload"]["since_last"])
+        assert "change" in second["payload"]["trend"]
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        assert client.get("/api/instructor/agent-memory", headers=headers).status_code == 403
+        memory = client.get("/api/instructor/agent-memory", headers=instructor).json()
+        assert {"coordinator", "tutor", "assessment"} <= {row["agent"] for row in memory}
+        tools = client.get("/api/events?limit=300", headers=instructor).json()
+        assert {"get_previous_feedback", "get_score_history"} <= {e["detail"].get("tool") for e in tools if e["phase"] == "tool"}
+
+
+def test_cloud_agent_loop_calls_tools_then_submits_structured_result():
+    from langchain_core.messages import AIMessage
+    from backend.agents import ProviderAdapter
+    from backend.agent_core import Toolkit, remember
+    from backend.db import SessionLocal
+    from backend.schemas import VerdictOutput
+
+    class FakeLLM:
+        def __init__(self):
+            self.seen = []
+
+        def bind_tools(self, tools, tool_choice=None):
+            names = [t["function"]["name"] if isinstance(t, dict) else t.name for t in tools]
+            outer = self
+
+            class Bound:
+                def invoke(self, messages):
+                    outer.seen.append((names, tool_choice, list(messages)))
+                    if len(outer.seen) == 1:
+                        return AIMessage(content="", tool_calls=[{"name": "get_quality_threshold", "args": {}, "id": "c1"}, {"name": "recall_memory", "args": {"query": "writing"}, "id": "c2"}])
+                    return AIMessage(content="", tool_calls=[{"name": "submit_result", "args": {"consistent": True, "reason": "Scores match comments", "confidence": 0.9}, "id": "c3"}])
+            return Bound()
+
+    db = SessionLocal()
+    try:
+        remember(db, "quality", None, "Instructor approved unchanged a held writing result (likely a false alarm).", "lesson")
+        adapter = ProviderAdapter()
+        adapter.mode, adapter.llm = "REAL", FakeLLM()
+        adapter.scorer = adapter.llm
+        kit = Toolkit(db, "quality", None)
+        verdict = adapter.consistency({"summary": "Good", "criteria": {"grammar": 6}, "comments": []}, kit)
+        assert isinstance(verdict, VerdictOutput) and verdict.consistent
+        names, choice, messages = adapter.llm.seen[0]
+        assert choice == "required" and "get_instructor_decisions" in names and "submit_result" in names
+        assert "false alarm" in messages[1].content  # The agent's own memory is in the prompt.
+        assert [c["tool"] for c in kit.calls] == ["get_quality_threshold", "recall_memory"]
+        assert any(m.type == "tool" for m in adapter.llm.seen[1][2])  # Tool results were returned to the model.
+    finally:
+        db.rollback()
+        db.close()

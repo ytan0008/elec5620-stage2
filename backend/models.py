@@ -317,3 +317,15 @@ class IssueReport(Base):
     resolved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentMemory(Base):
+    """Working memory of one AI agent: episodes it acted on and lessons it learned (user_id NULL = cohort-wide)."""
+    __tablename__ = "agent_memories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agent: Mapped[str] = mapped_column(String(40), index=True)  # coordinator | tutor | assessment | quality
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    kind: Mapped[str] = mapped_column(String(20))  # episode | lesson | note
+    text: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

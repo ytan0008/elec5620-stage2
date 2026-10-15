@@ -13,12 +13,14 @@ from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
-from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport
+from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport, AgentMemory
 from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
+from backend import agent_core
+from backend.agent_core import Toolkit
 from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
 from backend import notebook
 from backend import monitoring
@@ -323,12 +325,14 @@ def chat_turn(context: str, data: AgentChatTurn, user: User = Depends(learner), 
         events.append({"type": "memory", "text": text})
     memory_texts = [item.text for item in notebook.memories(db, user.id)]
     summary = notebook.stats(db, user.id)
+    kit = Toolkit(db, "tutor" if agent_for(context) == "AI Tutor" else "coordinator", user.id, profile.exam)
     try:
         safe_history = [{"role": item.get("role"), "text": safe_text(item.get("text", ""))} for item in history]
         result = runtime.provider.chat(context, safe_text(data.message), profile_data(profile), plan.content if plan else None, safe_history, data.persona,
-                                       memory_texts, {k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "counts")}, actions)
+                                       memory_texts, {k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "counts")}, actions, kit)
     except Exception:
         raise HTTPException(503, "Agent reply unavailable; please try again")
+    kit.log("chat", runtime.provider.mode)
     for text in result.remember[:3]:
         if 4 <= len(text) <= 300:
             notebook.remember(db, user.id, "note", text, source="tutor")
@@ -505,7 +509,9 @@ def tutor_coach(persona: str = "witch", user: User = Depends(learner), db: Sessi
         points.append(f"Your weakest verified skill right now is {progress['weaknesses'][0]} ({progress['skill_scores'].get(progress['weaknesses'][0])}). Do one timed {progress['weaknesses'][0]} task today.")
     runtime = AgentRuntime(db)
     try:
-        message = runtime.provider.coach(points, profile, memory_texts, {**{k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "due_mistakes")}, "skill_scores": progress["skill_scores"]}, persona)
+        kit = Toolkit(db, "tutor", user.id, profile.get("exam", "IELTS"))
+        message = runtime.provider.coach(points, profile, memory_texts, {**{k: summary[k] for k in ("mistakes_by_type", "grammar_issues", "due_words", "due_mistakes")}, "skill_scores": progress["skill_scores"]}, persona, kit)
+        kit.log("coaching", runtime.provider.mode)
     except Exception:
         message = "Here's your coaching plan for today:\n" + "\n".join(f"{i + 1}. {p}" for i, p in enumerate(points))
     record = chat_record(db, user.id, "tutor")
@@ -553,7 +559,9 @@ def confirm_onboarding(user: User = Depends(learner), db: Session = Depends(get_
 def create_portrait(db: Session, user: User, profile: Profile) -> ResultPackage:
     runtime = AgentRuntime(db)
     try:
-        portrait = runtime.provider.portrait(profile_data(profile)).model_dump()
+        kit = Toolkit(db, "coordinator", user.id, profile.exam)
+        portrait = runtime.provider.portrait(profile_data(profile), kit).model_dump()
+        kit.log("portrait", runtime.provider.mode)
     except Exception as exc:
         portrait = {"summary": "Portrait generation requires review", "confidence": {}, "error_type": type(exc).__name__}
     package = runtime.verify_output(user.id, "portrait", portrait)
@@ -634,6 +642,9 @@ def plan_decision(plan_id: int, accept: bool, user: User = Depends(learner), db:
         db.add(AgentEvent(user_id=user.id, workflow="adaptation" if plan.kind == "adaptation" else "plan", agent="Learning Coordinator", phase="handoff", detail={"decision": "activated", "next_agent": "AI Tutor + Assessment & Analytics", "plan_id": plan.id}, mode=settings().ai_mode))
     else:
         plan.status = "REJECTED"
+    priorities = ", ".join((plan.content or {}).get("priorities", [])[:4])
+    agent_core.remember(db, "coordinator", user.id, f"Learner {'accepted' if accept else 'rejected'} plan v{plan.version} (priorities {priorities}).",
+                        "episode" if accept else "lesson", {"plan_id": plan.id, "accepted": accept})
     db.add(AuditLog(user_id=user.id, action="plan_accepted" if accept else "plan_rejected", detail={"plan_id": plan.id}))
     db.commit()
     return {"id": plan.id, "status": plan.status}
@@ -647,6 +658,7 @@ def request_plan_changes(plan_id: int, data: ChangeRequestInput, user: User = De
     profile = profile_for(db, user)
     progress = latest_progress(db, user.id)
     progress["change_request"] = data.note
+    agent_core.remember(db, "coordinator", user.id, f"Learner asked to change plan v{previous.version}: {data.note[:300]}", "lesson", {"plan_id": plan_id})
     runtime = AgentRuntime(db)
     state = runtime.plan_graph().invoke({"user_id": user.id, "workflow": "plan", "profile": profile_data(profile), "progress": progress})
     package = db.get(ResultPackage, state["package_id"])
@@ -1091,6 +1103,7 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     if missing:
         raise HTTPException(409, "Complete all four sections: " + ", ".join(missing) + " still missing")
     runtime = AgentRuntime(db)
+    kit = Toolkit(db, "tutor", user.id, exam.exam)
     scores, details = {}, {}
     for skill in ("listening", "reading"):
         graded = objective_output(exam.sections[skill] | {"test": exam.sections[skill]}, answers[skill], skill, exam.exam)
@@ -1102,7 +1115,7 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
         if len(response.split()) < 3:
             task_scores.append((task["task"], 1.0 if exam.exam == "IELTS" else 1.0))
             continue
-        feedback = runtime.provider.feedback(exam.exam, "writing", response, "normal", task["prompt"], task["task"])
+        feedback = runtime.provider.feedback(exam.exam, "writing", response, "normal", task["prompt"], task["task"], toolkit=kit)
         band = round(sum(feedback.criteria.values()) / len(feedback.criteria) * 2) / 2
         task_scores.append((task["task"], band))
         writing_feedback[task["task"]] = {"criteria": feedback.criteria, "summary": feedback.summary, "comments": feedback.comments[:4], "band": band}
@@ -1111,7 +1124,8 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     scores["writing"] = round(sum(band * weights.get(task, 1) for task, band in task_scores) / total_weight * 2) / 2
     details["writing"] = writing_feedback
     spoken = answers["speaking"]
-    speaking = runtime.provider.feedback(exam.exam, "speaking", spoken["transcript"], "normal", "", "speaking", spoken.get("metrics"))
+    speaking = runtime.provider.feedback(exam.exam, "speaking", spoken["transcript"], "normal", "", "speaking", spoken.get("metrics"), kit)
+    kit.log("mock_exam", runtime.provider.mode)
     scores["speaking"] = round(sum(speaking.criteria.values()) / len(speaking.criteria) * 2) / 2
     details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments[:4], "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note}
     overall = overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / 4 * 2) / 2
@@ -1154,7 +1168,9 @@ def create_report(user: User = Depends(learner), db: Session = Depends(get_db)):
         raise HTTPException(409, "Complete practice before generating a report")
     runtime = AgentRuntime(db)
     try:
-        narrative = runtime.provider.report(data).model_dump()
+        kit = Toolkit(db, "assessment", user.id, profile_for(db, user).exam)
+        narrative = runtime.provider.report(data, kit).model_dump()
+        kit.log("report", runtime.provider.mode)
         data.update(narrative)
     except Exception as exc:
         data.update({"summary": "Report generation failed", "confidence": {}, "error_type": type(exc).__name__})
@@ -1189,7 +1205,9 @@ def recommend_materials(user: User = Depends(learner), db: Session = Depends(get
     catalog = db.scalars(select(Material).where(Material.exam == profile.exam)).all()
     runtime = AgentRuntime(db)
     try:
-        output = runtime.provider.recommendations([dto(item, "id", "title", "skill", "level", "description") for item in catalog], priorities).model_dump()
+        kit = Toolkit(db, "coordinator", user.id, profile.exam)
+        output = runtime.provider.recommendations([dto(item, "id", "title", "skill", "level", "description") for item in catalog], priorities, kit).model_dump()
+        kit.log("recommendations", runtime.provider.mode)
         valid_ids = {item.id for item in catalog}
         if any(item.get("id") not in valid_ids for item in output["items"]):
             output["confidence"] = {}
@@ -1214,6 +1232,19 @@ def material_interaction(material_id: int, relevant: bool | None = None, user: U
         item.relevant = relevant
     db.commit()
     return {"viewed": item.viewed, "relevant": item.relevant}
+
+
+@app.get("/api/instructor/agent-memory")
+def agent_memory(agent: str | None = None, user_id: int | None = None, limit: int = 100, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """What each agent remembers — developer (teacher) console only."""
+    query = select(AgentMemory).order_by(AgentMemory.id.desc()).limit(min(limit, 300))
+    if agent:
+        query = query.where(AgentMemory.agent == agent)
+    if user_id:
+        query = query.where(AgentMemory.user_id == user_id)
+    names = {u.id: u.name for u in db.scalars(select(User))}
+    return [{**dto(row, "id", "agent", "user_id", "kind", "text", "created_at"), "agent_name": agent_core.AGENT_NAMES.get(row.agent, row.agent),
+             "user": names.get(row.user_id, "All learners")} for row in db.scalars(query)]
 
 
 @app.get("/api/events")
@@ -1329,6 +1360,9 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
             package.payload = corrected
             package.confidence = corrected["confidence"]
     db.add(InstructorDecision(case_id=case.id, instructor_id=user.id, decision=data.decision, note=data.note, correction=data.correction))
+    outcome = {"approve": "approved unchanged (likely a false alarm)", "correct": "corrected", "request_information": "asked for more information on"}.get(data.decision, data.decision)
+    agent_core.remember(db, "quality", None, f"Instructor {outcome} a held {package.kind} result; it was held for: {(case.reason or '')[:200]}" + (f". Note: {data.note[:200]}" if data.note else "."),
+                        "lesson", {"package_id": package.id, "decision": data.decision})
     db.add(AuditLog(user_id=user.id, action="instructor_decision", detail={"case_id": case.id, "decision": data.decision}))
     db.add(AgentEvent(user_id=package.user_id, workflow=package.kind, agent="Human Instructor", phase="decision", detail={"decision": data.decision, "package_id": package.id, "next_agent": "Quality Manager"}, mode=package.source_mode))
     if data.decision == "request_information":
