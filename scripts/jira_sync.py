@@ -9,10 +9,12 @@ Settings come from .env (never commit real values):
     JIRA_EMAIL=you@example.com
     JIRA_API_TOKEN=ATATT...   (create at https://id.atlassian.com/manage-profile/security/api-tokens)
     JIRA_PROJECT_KEY=KAN
+    JIRA_ASSIGNEES=Yuxuan Tang=yx tang      (optional: backlog name=Jira display name; separate pairs with ;)
 
 Usage:
     python scripts/jira_sync.py           # dry run: checks access and prints the plan, changes nothing
     python scripts/jira_sync.py --apply   # creates the issues
+    python scripts/jira_sync.py --apply --update   # also refreshes issues created earlier
 
 Running it again is safe: every issue carries a label such as bk-ST-4, and
 issues whose label already exists in the project are skipped.
@@ -27,6 +29,8 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 BACKLOG = ROOT / "docs" / "jira-backlog.csv"
 TYPE_ORDER = {"Epic": 0, "Story": 1, "Task": 1, "Sub-task": 2}
+# Status names as they appear on English and Chinese Jira sites.
+STATUS_NAMES = {"to do": ("to do", "待办", "待辦"), "in progress": ("in progress", "正在进行", "進行中"), "done": ("done", "已完成", "完成")}
 
 
 def load_env() -> dict:
@@ -67,7 +71,21 @@ def adf(description: str, criteria: str, extra: list[str]) -> dict:
     return {"type": "doc", "version": 1, "content": content or [paragraph(" ")]}
 
 
-def main(apply: bool) -> None:
+def move_to(jira: "Jira", issue: str, status: str) -> None:
+    """Transition an issue to the backlog status, matching translated status names."""
+    names = STATUS_NAMES.get(status.lower(), (status.lower(),))
+    current = jira.call("GET", f"/rest/api/3/issue/{issue}", params={"fields": "status"}).json()["fields"]["status"]["name"].lower()
+    if current in names:
+        return
+    transitions = jira.call("GET", f"/rest/api/3/issue/{issue}/transitions").json().get("transitions", [])
+    target = next((t for t in transitions if t["to"]["name"].lower() in names), None)
+    if not target and status.lower() == "done":
+        target = next((t for t in transitions if t["to"].get("statusCategory", {}).get("key") == "done"), None)
+    if target:
+        jira.call("POST", f"/rest/api/3/issue/{issue}/transitions", json={"transition": {"id": target["id"]}})
+
+
+def main(apply: bool, update: bool = False) -> None:
     env = load_env()
     needed = ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY"]
     missing = [k for k in needed if not env.get(k) or env[k].lower() in ("xxx", "")]
@@ -88,20 +106,21 @@ def main(apply: bool) -> None:
     project = project.json()
     print(f"Project {project['key']} · {project['name']} · {project.get('style', 'classic')}-managed")
 
-    # Map our issue types to the project's own types.
-    types = {}
+    # Map our issue types to the project's own (possibly translated) types.
+    types, standard = {}, {}
     for item in project.get("issueTypes", []):
         name = item["name"].lower().replace("-", "")
         if item.get("subtask"):
             types["Sub-task"] = item
-        elif item.get("hierarchyLevel") == 1 or name == "epic":
+        elif item.get("hierarchyLevel") == 1 or name in ("epic", "长篇故事", "史诗"):
             types["Epic"] = item
-        elif name in ("story", "task"):
-            types[item["name"].title()] = item
-    types.setdefault("Story", types.get("Task"))
-    types.setdefault("Task", types.get("Story"))
+        elif item.get("hierarchyLevel", 0) == 0:
+            standard[name] = item
+    types["Story"] = next((standard[n] for n in ("story", "故事", "feature", "功能") if n in standard), None) or next(iter(standard.values()), None)
+    types["Task"] = next((standard[n] for n in ("task", "任务") if n in standard), None) or types["Story"]
     if not all(types.get(t) for t in TYPE_ORDER):
         sys.exit(f"The project is missing issue types: {[t for t in TYPE_ORDER if not types.get(t)]}")
+    print("Issue types: " + ", ".join(f"{ours} -> {item['name']}" for ours, item in types.items()))
 
     # Which optional fields each type accepts on its create screen.
     fields = {}
@@ -111,6 +130,9 @@ def main(apply: bool) -> None:
 
     def field_id(ours: str, *names: str):
         return next((fields[ours][n]["fieldId"] for n in names if n in fields[ours]), None)
+
+    def accepts(ours: str, fid: str) -> bool:
+        return any(f["fieldId"] == fid for f in fields[ours].values())
 
     # Existing issues from an earlier run, found by their bk-* label.
     existing, token = {}, None
@@ -125,44 +147,72 @@ def main(apply: bool) -> None:
         if not token or page.get("isLast", True):
             break
 
-    users = {}
+    users, aliases = {}, dict(pair.split("=", 1) for pair in env.get("JIRA_ASSIGNEES", "").split(";") if "=" in pair)
+    members = jira.call("GET", "/rest/api/3/user/assignable/search", params={"project": key, "maxResults": 200}).json()
+    members = [u for u in members if isinstance(u, dict) and u.get("accountType") != "app"]
 
     def account(name: str):
+        """Exact display name (case-insensitive), an alias from JIRA_ASSIGNEES, or a unique display name starting with it."""
         if name and name not in users:
-            found = jira.call("GET", "/rest/api/3/user/assignable/search", params={"project": key, "query": name}).json()
-            exact = [u for u in found if isinstance(u, dict) and u.get("displayName", "").lower() == name.lower()]
-            users[name] = exact[0]["accountId"] if len(exact) == 1 else None
+            wanted = aliases.get(name, name).strip().lower()
+            exact = [u for u in members if u.get("displayName", "").lower() == wanted]
+            prefix = [u for u in members if u.get("displayName", "").lower().startswith(wanted + " ")]
+            match = exact or prefix
+            users[name] = match[0]["accountId"] if len(match) == 1 else None
         return users.get(name)
 
-    rows = sorted(csv.DictReader(BACKLOG.open(encoding="utf-8")), key=lambda r: TYPE_ORDER[r["Issue Type"]])
+    rows = list(csv.DictReader(BACKLOG.open(encoding="utf-8")))
+    by_id = {row["Issue ID"]: row for row in rows}
+    # A Task cannot sit under a Story when both map to the same hierarchy level: it becomes a Sub-task of that Story,
+    # and its own Sub-tasks move up to the Story.
+    for row in rows:
+        parent = by_id.get(row["Parent ID"])
+        if row["Issue Type"] == "Task" and parent and parent["Issue Type"] == "Story" and types["Task"].get("hierarchyLevel", 0) == types["Story"].get("hierarchyLevel", 0):
+            row["Issue Type"] = "Sub-task"
+    for row in rows:
+        parent = by_id.get(row["Parent ID"])
+        if row["Issue Type"] == "Sub-task" and parent and parent["Issue Type"] == "Sub-task":
+            row["Parent ID"] = parent["Parent ID"]
+    rows.sort(key=lambda r: TYPE_ORDER[r["Issue Type"]])
     created = dict(existing)
     print(f"\n{len(rows)} backlog items · {len(existing)} already in Jira · {'APPLY' if apply else 'DRY RUN (add --apply to create)'}\n")
     for row in rows:
         ours, ident = row["Issue Type"], row["Issue ID"]
-        if ident in created:
+        if ident in created and not update:
             print(f"  skip   {ident:7} {created[ident]:10} {row['Summary']}")
             continue
         assignee = account(row["Assignee"])
         sprint_label = "sprint-" + row["Sprint"].split()[1] if row["Sprint"] else None
         labels = [f"bk-{ident}", "elec5620"] + ([sprint_label] if sprint_label else []) + [l for l in row["Labels"].split(",") if l]
+        points = field_id(ours, "story point estimate", "story points", "故事点估算", "故事点")
         extra = [f"Owner: {row['Assignee']}" + ("" if assignee else " (no matching Jira user; assign manually)"), f"Sprint: {row['Sprint']}"]
+        if row["Story Points"] and not points:
+            extra.append(f"Story points: {row['Story Points']}")
         data = {"project": {"key": key}, "issuetype": {"id": types[ours]["id"]}, "summary": row["Summary"][:250],
                 "description": adf(row["Description"], row["Acceptance Criteria"], extra), "labels": labels}
         if row["Parent ID"]:
             data["parent"] = {"key": created.get(row["Parent ID"], f"<{row['Parent ID']}>")}
         if assignee:
             data["assignee"] = {"accountId": assignee}
-        if "priority" in fields[ours] and row["Priority"]:
+        if accepts(ours, "priority") and row["Priority"]:
             data["priority"] = {"name": row["Priority"]}
-        points = field_id(ours, "story point estimate", "story points")
         if points and row["Story Points"]:
             data[points] = float(row["Story Points"])
         epic_name = field_id(ours, "epic name")
         if epic_name and ours == "Epic":
             data[epic_name] = row["Summary"][:250]
         if not apply:
-            print(f"  create {ident:7} {ours:8} parent={row['Parent ID'] or '-':6} {row['Status']:6} {row['Summary']}")
-            created[ident] = f"<{ident}>"
+            print(f"  {'update' if ident in created else 'create'} {ident:7} {ours:8} parent={row['Parent ID'] or '-':6} {row['Status']:11} {row['Summary']}")
+            created.setdefault(ident, f"<{ident}>")
+            continue
+        if ident in created:  # --update: refresh fields and status of an issue created earlier.
+            data.pop("project"), data.pop("issuetype")
+            response = jira.call("PUT", f"/rest/api/3/issue/{created[ident]}", json={"fields": data})
+            if response.status_code != 204:
+                print(f"  FAILED {ident}: {response.status_code} {response.text[:300]}")
+                continue
+            move_to(jira, created[ident], row["Status"].strip() or "To Do")
+            print(f"  update {ident:7} {created[ident]:10} {row['Summary']}")
             continue
         response = jira.call("POST", "/rest/api/3/issue", json={"fields": data})
         if response.status_code == 400:  # Retry without optional fields the project's screens may not allow.
@@ -174,14 +224,7 @@ def main(apply: bool) -> None:
             continue
         issue = response.json()["key"]
         created[ident] = issue
-        status = row["Status"].strip()
-        if status and status.lower() != "to do":
-            transitions = jira.call("GET", f"/rest/api/3/issue/{issue}/transitions").json().get("transitions", [])
-            category = "done" if status.lower() == "done" else "indeterminate"
-            target = next((t for t in transitions if t["to"]["name"].lower() == status.lower()), None) or \
-                next((t for t in transitions if t["to"].get("statusCategory", {}).get("key") == category), None)
-            if target:
-                jira.call("POST", f"/rest/api/3/issue/{issue}/transitions", json={"transition": {"id": target["id"]}})
+        move_to(jira, issue, row["Status"].strip() or "To Do")
         print(f"  ok     {ident:7} {issue:10} {row['Summary']}")
     if apply:
         print(f"\nDone. Open {env['JIRA_BASE_URL'].rstrip('/')}/jira/software/projects/{key}/list")
@@ -191,4 +234,4 @@ def main(apply: bool) -> None:
 
 
 if __name__ == "__main__":
-    main("--apply" in sys.argv)
+    main("--apply" in sys.argv, "--update" in sys.argv)
