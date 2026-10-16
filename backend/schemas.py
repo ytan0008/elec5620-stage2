@@ -62,7 +62,7 @@ class SubmitInput(BaseModel):
     task: str | None = None
     metrics: dict[str, float] | None = None
     # Quality-gate test hooks; honoured only by the local engine and never shown in the UI.
-    scenario: Literal["normal", "low_confidence", "contradiction", "invalid"] = "normal"
+    scenario: Literal["normal", "low_confidence", "contradiction", "invalid", "incomplete_once"] = "normal"
 
     @model_validator(mode="after")
     def has_response(self):
