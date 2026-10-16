@@ -357,7 +357,7 @@ This creates `ELEC5620-Stage2-Source.zip` from every file tracked by git. The zi
 
 ### Jira backlog
 
-`docs/jira-backlog.csv` holds the whole backlog: 6 epics (one per area and owner, following the Stage 1 use-case authors), stories with acceptance criteria, tasks and sub-tasks. `scripts/jira_sync.py` creates it in Jira Cloud through the REST API with the parent links, labels (`sprint-1` … `sprint-4`), priorities, story points, assignees and status.
+`docs/jira-backlog.csv` holds the whole backlog: 6 epics (one per area and owner, following the Stage 1 use-case authors), stories with acceptance criteria, tasks and sub-tasks. `scripts/jira_sync.py` creates it in Jira Cloud through the REST API in the CSV order (UC1–UC10 become KAN-1 to KAN-10), with parent links, story points, assignees (the Stage 1 use-case authors; other items stay unassigned), status, and Sprint 1–4 on a Scrum board (otherwise `sprint-N` labels).
 
 1. Create a Jira API token at <https://id.atlassian.com/manage-profile/security/api-tokens> (it starts with `ATATT`).
 2. In `.env`, set `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` and `JIRA_PROJECT_KEY`.

@@ -20,9 +20,11 @@ Running it again is safe: every issue carries a label such as bk-ST-4, and
 issues whose label already exists in the project are skipped.
 """
 import csv
+import re
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 import httpx
 
@@ -83,6 +85,47 @@ def move_to(jira: "Jira", issue: str, status: str) -> None:
         target = next((t for t in transitions if t["to"].get("statusCategory", {}).get("key") == "done"), None)
     if target:
         jira.call("POST", f"/rest/api/3/issue/{issue}/transitions", json={"transition": {"id": target["id"]}})
+
+
+def sprint_dates(name: str, year: str) -> tuple[str, str] | None:
+    """'Sprint 2 (12-18 Oct)' or 'Sprint 4 (26 Oct-1 Nov)' -> ISO start and end (Sydney time)."""
+    found = re.search(r"\((\d+)\s*([A-Za-z]{3})?\s*-\s*(\d+)\s*([A-Za-z]{3})\)", name)
+    if not found:
+        return None
+    first_day, first_month, last_day, last_month = found.groups()
+    parse = lambda day, month, clock: datetime.strptime(f"{day} {month} {year} {clock}", "%d %b %Y %H:%M").strftime("%Y-%m-%dT%H:%M:00.000+11:00")
+    return parse(first_day, first_month or last_month, "09:00"), parse(last_day, last_month, "18:00")
+
+
+def sync_sprints(jira: "Jira", key: str, rows: list[dict], created: dict, year: str) -> None:
+    """On a Scrum board: create one sprint per backlog sprint, add its issues and set past/current/future states."""
+    boards = jira.call("GET", "/rest/agile/1.0/board", params={"projectKeyOrId": key}).json().get("values", [])
+    # Team-managed boards report type "simple"; they support sprints when the Sprints feature is on.
+    board = next((b for b in boards if b.get("type") == "scrum"), None) or next((b for b in boards if b.get("type") == "simple"), None)
+    if not board:
+        print("  No Scrum board: sprints stay as sprint-N labels.")
+        return
+    existing = {s["name"]: s for s in jira.call("GET", f"/rest/agile/1.0/board/{board['id']}/sprint", params={"maxResults": 50}).json().get("values", [])}
+    today = datetime.now().strftime("%Y-%m-%d")
+    for name in dict.fromkeys(row["Sprint"] for row in rows if row["Sprint"]):
+        dates = sprint_dates(name, year)
+        sprint = existing.get(name)
+        if not sprint:
+            body = {"name": name[:30], "originBoardId": board["id"], **({"startDate": dates[0], "endDate": dates[1]} if dates else {})}
+            response = jira.call("POST", "/rest/agile/1.0/sprint", json=body)
+            if response.status_code not in (200, 201):
+                print(f"  Sprints unavailable on this board ({response.status_code}); sprint-N labels are used instead.")
+                return
+            sprint = response.json()
+        keys = [created[r["Issue ID"]] for r in rows if r["Sprint"] == name and r["Issue Type"] not in ("Epic", "Sub-task") and r["Issue ID"] in created]
+        for start in range(0, len(keys), 50):
+            jira.call("POST", f"/rest/agile/1.0/sprint/{sprint['id']}/issue", json={"issues": keys[start:start + 50]})
+        if dates and sprint.get("state") == "future" and dates[0][:10] <= today:
+            jira.call("POST", f"/rest/agile/1.0/sprint/{sprint['id']}", json={"state": "active", "startDate": dates[0], "endDate": dates[1]})
+            if dates[1][:10] < today:
+                jira.call("POST", f"/rest/agile/1.0/sprint/{sprint['id']}", json={"state": "closed"})
+        state = jira.call("GET", f"/rest/agile/1.0/sprint/{sprint['id']}").json().get("state")
+        print(f"  sprint {name:26} {len(keys):3} issues · {state}")
 
 
 def main(apply: bool, update: bool = False) -> None:
@@ -173,8 +216,9 @@ def main(apply: bool, update: bool = False) -> None:
         parent = by_id.get(row["Parent ID"])
         if row["Issue Type"] == "Sub-task" and parent and parent["Issue Type"] == "Sub-task":
             row["Parent ID"] = parent["Parent ID"]
-    rows.sort(key=lambda r: TYPE_ORDER[r["Issue Type"]])
-    created = dict(existing)
+    # Jira numbers issues in creation order, so the CSV order is kept (sub-tasks last, as they need their parent).
+    rows.sort(key=lambda r: r["Issue Type"] == "Sub-task")
+    created, deferred = dict(existing), []
     print(f"\n{len(rows)} backlog items · {len(existing)} already in Jira · {'APPLY' if apply else 'DRY RUN (add --apply to create)'}\n")
     for row in rows:
         ours, ident = row["Issue Type"], row["Issue ID"]
@@ -184,14 +228,18 @@ def main(apply: bool, update: bool = False) -> None:
         assignee = account(row["Assignee"])
         sprint_label = "sprint-" + row["Sprint"].split()[1] if row["Sprint"] else None
         labels = [f"bk-{ident}", "elec5620"] + ([sprint_label] if sprint_label else []) + [l for l in row["Labels"].split(",") if l]
-        points = field_id(ours, "story point estimate", "story points", "故事点估算", "故事点")
-        extra = [f"Owner: {row['Assignee']}" + ("" if assignee else " (no matching Jira user; assign manually)"), f"Sprint: {row['Sprint']}"]
+        points = next((f["fieldId"] for name, f in fields[ours].items() if "story point" in name or "故事点" in name), None)
+        extra = ([f"Owner: {row['Assignee']}" + ("" if assignee else " (assign once they join the Jira project)")] if row["Assignee"] else []) + [f"Sprint: {row['Sprint']}"]
         if row["Story Points"] and not points:
             extra.append(f"Story points: {row['Story Points']}")
+        if row["Priority"] and not accepts(ours, "priority"):
+            extra.append(f"Priority: {row['Priority']}")
         data = {"project": {"key": key}, "issuetype": {"id": types[ours]["id"]}, "summary": row["Summary"][:250],
                 "description": adf(row["Description"], row["Acceptance Criteria"], extra), "labels": labels}
-        if row["Parent ID"]:
-            data["parent"] = {"key": created.get(row["Parent ID"], f"<{row['Parent ID']}>")}
+        if row["Parent ID"] in created:
+            data["parent"] = {"key": created[row["Parent ID"]]}
+        elif row["Parent ID"]:
+            deferred.append(row)  # The parent (an epic) is created later; link it afterwards.
         if assignee:
             data["assignee"] = {"accountId": assignee}
         if accepts(ours, "priority") and row["Priority"]:
@@ -227,6 +275,11 @@ def main(apply: bool, update: bool = False) -> None:
         move_to(jira, issue, row["Status"].strip() or "To Do")
         print(f"  ok     {ident:7} {issue:10} {row['Summary']}")
     if apply:
+        for row in deferred:
+            if row["Issue ID"] in created and row["Parent ID"] in created:
+                response = jira.call("PUT", f"/rest/api/3/issue/{created[row['Issue ID']]}", json={"fields": {"parent": {"key": created[row["Parent ID"]]}}})
+                print(f"  link   {created[row['Issue ID']]:10} -> {created[row['Parent ID']]}" + ("" if response.status_code == 204 else f" FAILED {response.status_code}"))
+        sync_sprints(jira, key, rows, created, env.get("JIRA_SPRINT_YEAR", "2026"))
         print(f"\nDone. Open {env['JIRA_BASE_URL'].rstrip('/')}/jira/software/projects/{key}/list")
     unmatched = [name for name, acc in users.items() if not acc]
     if unmatched:
