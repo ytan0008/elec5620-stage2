@@ -366,6 +366,24 @@ This creates `ELEC5620-Stage2-Source.zip` from every file tracked by git. The zi
 
 Running it again skips issues that already exist (each carries a `bk-<ID>` label). Members without a matching Jira user are named in the description; assign them in Jira.
 
+### Linking work to Jira
+
+The Jira project is connected to this repository with the **GitHub for Jira** app. Any branch, commit or pull request that contains an issue key (for example `KAN-3`) appears in that issue's **Development** panel in Jira.
+
+| What | Convention | Example |
+|---|---|---|
+| Branch | `KAN-<n>-short-description` | `KAN-3-part3-followups` |
+| Commit | Start with the issue key | `KAN-3 Add Part 3 follow-up questions` |
+| Pull request title | Start with the issue key | `KAN-3 Speaking Part 3 follow-ups` |
+
+**Smart commits** also update Jira from a commit message, when your git email matches your Jira account email (`git config user.email`):
+
+```
+KAN-3 #comment Examiner now asks follow-ups #time 2h #done
+```
+
+`#comment` adds a comment, `#time` logs work and `#done` (or any status name such as `#in-progress`) moves the issue.
+
 ## 13. Troubleshooting
 
 | Problem | Fix |
