@@ -208,15 +208,33 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
 function MaterialsPage({ notify }: { notify: Notify }) {
   const { data } = useLoad<any[]>('/materials')
   const [skill, setSkill] = useState('all')
-  const [recommendations, setRecommendations] = useState<Result | null>(null)
+  const [recommendations, setRecommendations] = useState<(Result & { last_verified?: Record<string, any> | null }) | null>(null)
+  const [dismissed, setDismissed] = useState<number[]>([])
   const [selected, setSelected] = useState<any>(null)
-  const recommend = async () => { try { setRecommendations(await post('/materials/recommend')); notify('Recommendations quality checked') } catch (e) { notify((e as Error).message, 'error') } }
-  const view = async (item: any) => { setSelected(item); try { await post(`/materials/${item.id}/interaction`) } catch (e) { notify((e as Error).message, 'error') } }
-  const rate = async (relevant: boolean) => { if (!selected) return; try { await post(`/materials/${selected.id}/interaction?relevant=${relevant}`); notify('Thanks — relevance saved') } catch (e) { notify((e as Error).message, 'error') } }
+  const recommend = async () => { try { setRecommendations(await post('/materials/recommend')); setDismissed([]); notify('Recommendations quality checked') } catch (e) { notify((e as Error).message, 'error') } }
+  const view = async (item: any) => {
+    if (!item) { notify('That material could not be loaded. Try the next one.', 'error'); return }
+    setSelected(item)
+    if (typeof item.id !== 'number') return  // AI-generated exercises are not library items.
+    try { await post(`/materials/${item.id}/interaction`) } catch (e) { notify((e as Error).message, 'error') }
+  }
+  const rate = async (relevant: boolean) => {
+    if (!selected) return
+    try {
+      await post(`/materials/${selected.id}/interaction?relevant=${relevant}`)
+      if (relevant) notify('Thanks — relevance saved')
+      else { setDismissed(ids => [...ids, selected.id]); setSelected(null); notify("Removed. It won't be recommended again.") }
+    } catch (e) { notify((e as Error).message, 'error') }
+  }
+  // When a new list is held for checking, keep showing the last list that passed (UC10 6a).
+  const list = recommendations?.payload ?? recommendations?.last_verified
   return <>
     <PageTitle eyebrow="Spellbook library" title="Study materials" subtitle="Strategy lessons for each skill and question type." action={<button onClick={recommend} className="btn-primary">Recommend for me<Sparkles size={16} /></button>} />
     {recommendations && <div className="panel panel-cyan mb-6 p-5"><div className="flex justify-between"><h2 className="section-title">Quality-checked recommendations</h2><Status value={recommendations.state} /></div>
-      {recommendations.payload?.items ? <div className="mt-3 grid gap-3 md:grid-cols-2">{recommendations.payload.items.map((item: any) => <button key={item.id} onClick={() => view(data?.find(m => m.id === item.id))} className="tile text-left font-read text-sm"><b className="font-pixel text-base">{item.title}</b><br />{item.reason}</button>)}</div> : <p className="mt-3 font-read text-sun">Recommendations are held for review.</p>}</div>}
+      {!recommendations.payload && <p className="mt-3 font-read text-sun">{list ? 'Your new list is being double-checked. Here is your last checked list.' : 'Recommendations are held for review.'}</p>}
+      {list?.summary && <p className="mt-2 font-read text-sm text-mist">{list.summary}</p>}
+      {list?.items && <div className="mt-3 grid gap-3 md:grid-cols-2">{list.items.filter((item: any) => !dismissed.includes(item.id)).map((item: any) => <button key={item.id} onClick={() => view(item.content ? item : data?.find(m => m.id === item.id))} className="tile text-left font-read text-sm">
+        {item.label && <span className="pill mb-1 text-cyan">{item.label}</span>}<br /><b className="font-pixel text-base">{item.title}</b>{item.reason && <><br />{item.reason}</>}</button>)}</div>}</div>}
     <div className="mb-5 flex flex-wrap gap-1">{['all', ...skills].map(s => <button key={s} className={skill === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setSkill(s)}>{nice(s)}</button>)}</div>
     <div key={skill} className="stagger grid gap-5 md:grid-cols-2 lg:grid-cols-3">{data?.filter(item => skill === 'all' || item.skill === skill).map(item => <button key={item.id} onClick={() => view(item)} className="panel p-6 text-left transition-transform hover:-translate-y-1" style={{ ['--edge' as any]: SKILL_COLOR[item.skill] + 'aa' }}>
       <span className="font-pixel text-xs uppercase" style={{ color: SKILL_COLOR[item.skill] }}>{item.exam} · {item.skill} · {item.level}</span><h3 className="heading mt-3 text-xl">{item.title}</h3><p className="mt-2 font-read text-sm text-mist">{item.description}</p><span className="btn-ghost mt-4 !px-0">Open lesson <ArrowRight size={14} /></span>
@@ -224,7 +242,7 @@ function MaterialsPage({ notify }: { notify: Notify }) {
     {selected && createPortal(<div className="anim-fade fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-5" onClick={() => setSelected(null)}><div className="anim-pop panel panel-hot max-h-[85vh] w-full max-w-xl overflow-auto p-7" onClick={e => e.stopPropagation()} role="dialog" aria-label={selected.title}>
       <div className="flex justify-between"><span className="eyebrow">{selected.skill} lesson</span><button onClick={() => setSelected(null)} aria-label="Close lesson"><X /></button></div>
       <h2 className="heading mt-3 text-2xl">{selected.title}</h2><p className="reading mt-5 whitespace-pre-line">{selected.content}</p>
-      <div className="mt-7 border-t-4 border-plum pt-5"><p className="mb-3 font-pixel">Was this relevant to your goal?</p><div className="flex gap-2"><button className="btn-lime" onClick={() => rate(true)}>Yes</button><button className="btn-secondary" onClick={() => rate(false)}>Not yet</button></div></div>
+      {typeof selected.id === 'number' && <div className="mt-7 border-t-4 border-plum pt-5"><p className="mb-3 font-pixel">Was this relevant to your goal?</p><div className="flex gap-2"><button className="btn-lime" onClick={() => rate(true)}>Yes</button><button className="btn-secondary" onClick={() => rate(false)}>Not relevant</button></div></div>}
     </div></div>, document.body)}
   </>
 }

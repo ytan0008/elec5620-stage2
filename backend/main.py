@@ -1199,37 +1199,24 @@ def materials(exam: str | None = None, skill: str | None = None, level: str | No
 
 @app.post("/api/materials/recommend")
 def recommend_materials(user: User = Depends(learner), db: Session = Depends(get_db)):
+    """UC10. The Learning Coordinator builds the list; UC9 checks it before release."""
     profile = profile_for(db, user)
-    progress = latest_progress(db, user.id)
-    priorities = progress["weaknesses"] or profile.priority_skills
-    catalog = db.scalars(select(Material).where(Material.exam == profile.exam)).all()
-    runtime = AgentRuntime(db)
-    try:
-        kit = Toolkit(db, "coordinator", user.id, profile.exam)
-        output = runtime.provider.recommendations([dto(item, "id", "title", "skill", "level", "description") for item in catalog], priorities, kit).model_dump()
-        kit.log("recommendations", runtime.provider.mode)
-        valid_ids = {item.id for item in catalog}
-        if any(item.get("id") not in valid_ids for item in output["items"]):
-            output["confidence"] = {}
-            output["error_type"] = "Unknown catalog ID"
-    except Exception as exc:
-        output = {"items": [], "summary": "Recommendation generation failed", "confidence": {}, "error_type": type(exc).__name__}
-    package = runtime.verify_output(user.id, "recommendations", output)
+    coordinator = AgentRuntime(db).coordinator
+    package = coordinator.request_recommendations(user.id, {"exam": profile.exam, "proficiency": profile.proficiency, "priority_skills": profile.priority_skills},
+                                                  latest_progress(db, user.id))
     db.commit()
-    return package_view(package)
+    result = package_view(package)
+    if package.state != "RELEASED":
+        result["last_verified"] = coordinator.last_verified_list(user.id, before_id=package.id)  # 6a
+    return result
 
 
 @app.post("/api/materials/{material_id}/interaction")
 def material_interaction(material_id: int, relevant: bool | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
     if not db.get(Material, material_id):
         raise HTTPException(404, "Material not found")
-    item = db.scalar(select(MaterialInteraction).where(MaterialInteraction.user_id == user.id, MaterialInteraction.material_id == material_id))
-    if not item:
-        item = MaterialInteraction(user_id=user.id, material_id=material_id)
-        db.add(item)
-    item.viewed = True
-    if relevant is not None:
-        item.relevant = relevant
+    coordinator = AgentRuntime(db).coordinator
+    item = coordinator.dismiss(user.id, material_id) if relevant is False else coordinator.open_material(user.id, material_id, relevant)
     db.commit()
     return {"viewed": item.viewed, "relevant": item.relevant}
 

@@ -631,7 +631,7 @@ def test_cloud_agent_loop_calls_tools_then_submits_structured_result():
         adapter.mode, adapter.llm = "REAL", FakeLLM()
         adapter.scorer = adapter.llm
         kit = Toolkit(db, "quality", None)
-        verdict = adapter.consistency({"summary": "Good", "criteria": {"grammar": 6}, "comments": []}, kit)
+        verdict = adapter.check_consistency({"summary": "Good", "criteria": {"grammar": 6}, "comments": []}, kit)
         assert isinstance(verdict, VerdictOutput) and verdict.consistent
         names, choice, messages = adapter.llm.seen[0]
         assert choice == "required" and "get_instructor_decisions" in names and "submit_result" in names

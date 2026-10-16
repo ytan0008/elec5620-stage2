@@ -1,6 +1,11 @@
-"""Executable StateGraphs. All model access goes through ProviderAdapter.
+"""Agents and executable StateGraphs, following the Stage 1 class diagram.
 
-ProviderAdapter runs in one of two modes:
+Agent (abstract) is specialised by LearningCoordinatorAgent, TutorAgent,
+AssessmentAgent and OpsQualityManager. AgentRuntime is the central controller:
+it owns one of each agent and wires them into LangGraph workflows.
+
+All model access goes through the LLMService interface, realised by
+LLMProviderAdapter, which runs in one of two modes:
   REAL  - a configured OpenAI-compatible chat model produces structured output.
   LOCAL - the built-in engine: curated exam content, rule-based language
           analysis and a scripted examiner. No network access is needed.
@@ -8,8 +13,9 @@ ProviderAdapter runs in one of two modes:
 import json
 import random
 import time
+from abc import ABC
 from datetime import datetime, timedelta, timezone
-from typing import TypedDict
+from typing import Callable, TypedDict
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -17,7 +23,9 @@ from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from backend.config import settings
-from backend.models import AgentEvent, AuditLog, Escalation, QualityCheck, ResultPackage, SystemSetting
+from backend.models import AgentEvent, AuditLog, Escalation, MaterialInteraction, QualityCheck, ResultPackage, SystemSetting
+from backend.llm_service import AgentStatus, IssueType, LLMService, ResultStatus
+from backend.materials import MaterialLibrary, material_dto
 from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, RecommendationOutput, ReportNarrative, OnboardingExtraction, PortraitOutput,
                              QuestionOutput, AgentChatReply, ExaminerTurn, ListeningGen, ReadingGen, SpeakingGen, WordInfo, CoachOutput)
 from backend.onboarding import parse_demo_message
@@ -48,6 +56,8 @@ class FlowState(TypedDict, total=False):
     issues: list[str]
     route: str
     source_mode: str
+    regen_attempts: int
+    can_regenerate: bool
 
 
 @tool
@@ -75,7 +85,7 @@ RUBRICS = {
 }
 
 
-class ProviderAdapter:
+class LLMProviderAdapter(LLMService):
     def __init__(self):
         self.config = settings()
         self.mode = self.config.ai_mode
@@ -383,7 +393,7 @@ class ProviderAdapter:
                 output.pronunciation_note = None
         return output
 
-    def consistency(self, payload: dict, toolkit: Toolkit | None = None) -> VerdictOutput:
+    def check_consistency(self, payload: dict, toolkit: Toolkit | None = None) -> VerdictOutput:
         scores = payload.get("criteria", {})
         summary = payload.get("summary", "").lower()
         issues = bool(scores) and ("excellent" in summary or "no weaknesses" in summary) and min(scores.values()) <= 3
@@ -392,11 +402,21 @@ class ProviderAdapter:
                                "Learn from earlier instructor decisions: if the instructor approved similar results you held, do not repeat that false alarm.",
                                {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True)
 
-    def recommendations(self, catalog: list[dict], priorities: list[str], toolkit: Toolkit | None = None) -> RecommendationOutput:
-        ranked = sorted(catalog, key=lambda item: item["skill"] not in priorities)[:4]
-        local = {"items": [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": f"Targets your {'priority' if item['skill'] in priorities else 'supporting'} skill: {item['skill']}", "confidence": .84} for item in ranked],
+    def rank_and_explain(self, weaknesses: list[str], candidates: list[dict], toolkit: Toolkit | None = None) -> RecommendationOutput:
+        ranked = sorted(candidates, key=lambda item: item["skill"] not in weaknesses)[:5]
+        local = {"items": [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": f"Targets your {'priority' if item['skill'] in weaknesses else 'supporting'} skill: {item['skill']}", "confidence": .84} for item in ranked],
                  "summary": "Ranked study material suggestions", "confidence": {str(item["id"]): .84 for item in ranked}}
-        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only catalog IDs provided, explain each match and return self-reported confidence per item.", {"catalog": catalog, "priorities": priorities}, local, toolkit)
+        return self.structured(RecommendationOutput, "You are the Learning Coordinator. Rank only the candidate IDs provided, return at most 5, explain each match in one line "
+                               "and return self-reported confidence per item.", {"candidates": candidates, "weaknesses": weaknesses}, local, toolkit)
+
+    def generate_exercise(self, exam: str, skill: str, level: str) -> dict:
+        local = {"title": f"{skill.title()} quick exercise", "task_type": f"{exam} {skill} exercise", "confidence": {"exercise": .8},
+                 "prompt": {"writing": "Write three sentences that each give a clear opinion and one reason, using 'because', 'since' and 'as a result'. Then underline the reason in each.",
+                            "speaking": "Talk for one minute about a place you like. Say where it is, what you do there and why it matters to you. Record yourself and listen for pauses.",
+                            "reading": "Read any short news article. For each paragraph, write one line saying its main idea, then check the headline matches your lines.",
+                            "listening": "Listen to a two-minute talk. Write down every number and name you hear, then listen again and check your spelling."}[skill]}
+        return self.structured(QuestionOutput, f"Write one short ORIGINAL {exam} {skill} exercise for a {level} learner (10 minutes, plain instructions). Return a self-reported confidence.",
+                               {"exam": exam, "skill": skill, "level": level}, local).model_dump()
 
     def report(self, progress: dict, toolkit: Toolkit | None = None) -> ReportNarrative:
         scores = progress.get("skill_scores", {})
@@ -423,54 +443,178 @@ def practice_prompt(item: dict, source: str) -> dict:
             "task_type": "Full Speaking test", "duration_seconds": 900, "test": item, "content_id": item["id"]}
 
 
-class AgentRuntime:
-    def __init__(self, db: Session):
-        self.db = db
-        self.provider = ProviderAdapter()
 
-    def threshold(self) -> float:
-        row = self.db.get(SystemSetting, "quality_threshold")
-        return float(row.value) if row else settings().quality_threshold
 
-    def event(self, state: FlowState, agent: str, phase: str, detail: dict, started: float | None = None):
-        self.db.add(AgentEvent(user_id=state["user_id"], workflow=state["workflow"], agent=agent, phase=phase, detail=detail, mode=self.provider.mode, duration_ms=int((time.perf_counter()-started)*1000) if started else 0))
-        self.db.flush()
+ProviderAdapter = LLMProviderAdapter  # Earlier name, kept so existing imports still work.
 
-    def coordinator(self, state: FlowState) -> dict:
+
+# ---------------------------------------------------------------- agents (Stage 1 class diagram)
+class Agent(ABC):
+    """Abstract agent: perceives through its toolkit and memory, decides, then acts through the LLMService."""
+    name = ""
+    memory_key = ""
+
+    def __init__(self, runtime: "AgentRuntime"):
+        self.runtime = runtime
+        self.db = runtime.db
+        self.llm: LLMService = runtime.provider
+
+    def get_status(self) -> AgentStatus:
+        return AgentStatus.ACTIVE
+
+    def event(self, state: FlowState, phase: str, detail: dict, started: float | None = None):
+        self.runtime.event(state, self.name, phase, detail, started)
+
+    def toolkit(self, user_id: int, exam: str = "IELTS") -> Toolkit:
+        return Toolkit(self.db, self.memory_key, user_id, exam)
+
+
+class LearningCoordinatorAgent(Agent):
+    name, memory_key = "Learning Coordinator", "coordinator"
+    MAX_RECOMMENDATIONS = 5
+
+    def create_plan(self, state: FlowState) -> dict:
         t = time.perf_counter()
-        self.event(state, "Learning Coordinator", "perception", {"exam": state["profile"]["exam"], "priorities": state["profile"]["priority_skills"]})
-        kit = Toolkit(self.db, "coordinator", state["user_id"], state["profile"]["exam"])
+        self.event(state, "perception", {"exam": state["profile"]["exam"], "priorities": state["profile"]["priority_skills"]})
+        kit = self.toolkit(state["user_id"], state["profile"]["exam"])
         try:
-            output = self.provider.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation", kit).model_dump()
+            output = self.llm.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation", kit).model_dump()
         except Exception as exc:
             output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": type(exc).__name__}
-        kit.log(state["workflow"], self.provider.mode)
+        kit.log(state["workflow"], self.llm.mode)
         if output.get("priorities"):
             request = state.get("progress", {}).get("change_request")
-            agent_core.remember(self.db, "coordinator", state["user_id"], f"Proposed {state['workflow']} plan '{output.get('title')}' with priorities {', '.join(output['priorities'][:4])}"
+            agent_core.remember(self.db, self.memory_key, state["user_id"], f"Proposed {state['workflow']} plan '{output.get('title')}' with priorities {', '.join(output['priorities'][:4])}"
                                 + (f" after the learner asked: {request}" if request else "") + ".", data={"priorities": output["priorities"]})
-        self.event(state, "Learning Coordinator", "handoff", {"decision": "submit proposed plan", "next_agent": "Quality Manager", "tool": "LLM adapter"}, t)
-        return {"output": output, "source_mode": self.provider.mode}
+        self.event(state, "handoff", {"decision": "submit proposed plan", "next_agent": "Quality Manager", "tool": "LLM adapter"}, t)
+        return {"output": output, "source_mode": self.llm.mode}
 
     def request_insights(self, state: FlowState) -> dict:
-        self.event(state, "Learning Coordinator", "handoff", {"decision": "request performance analysis", "next_agent": "Assessment & Analytics"})
+        self.event(state, "handoff", {"decision": "request performance analysis", "next_agent": "Assessment & Analytics"})
         return {}
 
-    def assessment_insights(self, state: FlowState) -> dict:
-        self.event(state, "Assessment & Analytics", "handoff", {"decision": "return verified progress insights", "weaknesses": state.get("progress", {}).get("weaknesses", []), "next_agent": "Learning Coordinator"})
-        return {}
-
-    def tutor(self, state: FlowState) -> dict:
+    # UC10 Access Recommended Materials
+    def request_recommendations(self, user_id: int, profile: dict, progress: dict) -> ResultPackage:
         t = time.perf_counter()
-        self.event(state, "AI Tutor", "perception", {"skill": state["skill"], "response_length": len(state["text"])})
-        kit = Toolkit(self.db, "tutor", state["user_id"], state["profile"]["exam"])
-        previous = kit.call("get_previous_feedback", skill=state["skill"])
+        state: FlowState = {"user_id": user_id, "workflow": "recommendations"}
+        library = MaterialLibrary(self.db)
+        dismissed = library.dismissed_ids(user_id)
+        weaknesses = progress.get("weaknesses", [])
+        new_learner = not progress.get("sample_count")
+        self.event(state, "perception", {"weaknesses": weaknesses, "plan_priorities": profile["priority_skills"], "new_learner": new_learner, "dismissed": sorted(dismissed)})
+        if new_learner:
+            produce = lambda: self._starter_list(profile, library, dismissed)  # 2a
+        else:
+            targets = weaknesses or profile["priority_skills"]
+            produce = lambda: self._personalised_list(user_id, profile, targets, library, dismissed)
         try:
-            result = self.provider.feedback(state["profile"]["exam"], state["skill"], state["text"], state.get("scenario", "normal"),
-                                            state.get("prompt", ""), state.get("task") or "task2", state.get("metrics"), kit).model_dump()
+            output = produce()
+        except Exception as exc:
+            output = {"items": [], "summary": "Recommendation generation failed", "confidence": {}, "error_type": type(exc).__name__}
+        self.event(state, "handoff", {"decision": f"submit {output.get('basis', 'ranked')} recommendation list", "next_agent": "Quality Manager",
+                                      "items": len(output.get("items", []))}, t)
+        return self.runtime.quality_manager.verify(user_id, "recommendations", output, regenerate=produce)
+
+    def last_verified_list(self, user_id: int, before_id: int | None = None) -> dict | None:
+        """6a: while a new list is held, the learner keeps the last list that passed UC9."""
+        query = select(ResultPackage).where(ResultPackage.user_id == user_id, ResultPackage.kind == "recommendations", ResultPackage.state == ResultStatus.RELEASED)
+        if before_id:
+            query = query.where(ResultPackage.id < before_id)
+        package = self.db.scalar(query.order_by(ResultPackage.id.desc()))
+        return package.payload if package else None
+
+    def open_material(self, user_id: int, material_id: int, relevant: bool | None = None) -> MaterialInteraction:
+        """8: record the access and let the Coordinator see it."""
+        item = self._interaction(user_id, material_id)
+        item.viewed = True
+        if relevant is not None:
+            item.relevant = relevant
+        self.event({"user_id": user_id, "workflow": "recommendations"}, "perception", {"material_id": material_id, "opened": True, "relevant": relevant})
+        if relevant:
+            agent_core.remember(self.db, self.memory_key, user_id, f"Learner found material #{material_id} relevant.", data={"material_id": material_id})
+        return item
+
+    def dismiss(self, user_id: int, material_id: int) -> MaterialInteraction:
+        """8a: a "Not relevant" item is left out of future rankings."""
+        item = self.open_material(user_id, material_id, relevant=False)
+        agent_core.remember(self.db, self.memory_key, user_id, f"Learner marked material #{material_id} not relevant; leave it out of future recommendations.",
+                            data={"material_id": material_id})
+        return item
+
+    def _interaction(self, user_id: int, material_id: int) -> MaterialInteraction:
+        item = self.db.scalar(select(MaterialInteraction).where(MaterialInteraction.user_id == user_id, MaterialInteraction.material_id == material_id))
+        if not item:
+            item = MaterialInteraction(user_id=user_id, material_id=material_id)
+            self.db.add(item)
+        return item
+
+    def _starter_list(self, profile: dict, library: MaterialLibrary, dismissed: set[int]) -> dict:
+        starters = library.get_starter_materials(profile["proficiency"], profile["exam"], dismissed)[:self.MAX_RECOMMENDATIONS]
+        items = [{**material_dto(m), "reason": f"Starter {m.skill} material for {m.level} learners"} for m in starters]
+        return {"summary": f"General materials for {profile['proficiency']} {profile['exam']} learners. Complete a practice task to get a personalised list.",
+                "items": self._label(items, "General"), "targets": [], "basis": "starter", "confidence": {"rules": 1.0}}
+
+    def _personalised_list(self, user_id: int, profile: dict, targets: list[str], library: MaterialLibrary, dismissed: set[int]) -> dict:
+        exam, level = profile["exam"], profile["proficiency"]
+        candidates = [material_dto(m) for m in library.search(targets, exam, dismissed)]
+        generated = []
+        for skill in targets:
+            if not any(c["skill"] == skill for c in candidates):  # 3a: nothing in the library for this weakness
+                try:
+                    exercise = self.llm.generate_exercise(exam, skill, level)
+                except Exception:
+                    continue
+                generated.append({"id": f"ai-{skill}", "title": exercise["title"], "skill": skill, "level": level, "content": exercise["prompt"],
+                                  "reason": f"No library item matches your {skill} weakness, so a short exercise was written for you",
+                                  "confidence": min(exercise["confidence"].values(), default=0)})
+        basis, error = "llm", None
+        if candidates:
+            kit = self.toolkit(user_id, exam)
+            try:
+                ranked = self.llm.rank_and_explain(targets, candidates, kit).model_dump()
+                kit.log("recommendations", self.llm.mode)
+                valid = {c["id"] for c in candidates}
+                if any(item.get("id") not in valid for item in ranked["items"]):
+                    ranked["confidence"], error = {}, "Unknown catalog ID"
+            except Exception as exc:  # 4a: ranking service unavailable, so rank by weakness tags without reasons
+                ranked = {"summary": "Ranked by your weak skills only, because the AI ranking service is unavailable.",
+                          "items": self._rank_by_tags(candidates, targets), "confidence": {"rules": 1.0}}
+                basis, error = "tags", type(exc).__name__
+        else:
+            ranked = {"summary": "No library item matched your weak skills.", "items": [], "confidence": {}}
+        room = max(0, self.MAX_RECOMMENDATIONS - len(generated))
+        output = {"summary": ranked["summary"], "items": ranked["items"][:room] + self._label(generated, "AI-generated"), "targets": targets, "basis": basis,
+                  "confidence": {**ranked["confidence"], **{item["id"]: item["confidence"] for item in generated}}}
+        if error:
+            output["error_type"] = error
+        return output
+
+    @staticmethod
+    def _label(items: list[dict], tag: str) -> list[dict]:
+        return [{**item, "label": tag} for item in items]
+
+    def _rank_by_tags(self, candidates: list[dict], weaknesses: list[str]) -> list[dict]:
+        ranked = sorted(candidates, key=lambda item: weaknesses.index(item["skill"]) if item["skill"] in weaknesses else len(weaknesses))
+        return [{"id": item["id"], "title": item["title"], "skill": item["skill"], "reason": ""} for item in ranked[:self.MAX_RECOMMENDATIONS]]
+
+
+class TutorAgent(Agent):
+    name, memory_key = "AI Tutor", "tutor"
+
+    def give_feedback(self, state: FlowState) -> dict:
+        t = time.perf_counter()
+        self.event(state, "perception", {"skill": state["skill"], "response_length": len(state["text"])})
+        kit = self.toolkit(state["user_id"], state["profile"]["exam"])
+        previous = kit.call("get_previous_feedback", skill=state["skill"])
+        scenario = state.get("scenario", "normal")
+        if scenario == "incomplete_once":  # Demo of UC9 2a: the first result is incomplete, the regenerated one is not.
+            scenario = "normal" if state.get("regen_attempts") else "invalid"
+        try:
+            result = self.llm.feedback(state["profile"]["exam"], state["skill"], state["text"], scenario,
+                                       state.get("prompt", ""), state.get("task") or "task2", state.get("metrics"), kit).model_dump()
         except Exception as exc:
             result = {"summary": "Feedback generation failed structured validation", "criteria": {}, "comments": [], "confidence": {}, "error_type": type(exc).__name__}
-        kit.log(state["workflow"], self.provider.mode)
+        kit.log(state["workflow"], self.llm.mode)
         if isinstance(previous, dict) and previous.get("criteria") and result.get("criteria"):
             before = {item["issue"] for item in previous.get("issues", []) if item.get("issue")}
             now = {item.get("issue") for item in result.get("comments", []) if item.get("issue")}
@@ -479,182 +623,301 @@ class AgentRuntime:
                                                         if isinstance(v, (int, float)) and isinstance(previous["criteria"].get(k), (int, float))}}
         if result.get("comments"):
             issues = [c.get("issue") for c in result["comments"][:4] if c.get("issue")]
-            agent_core.remember(self.db, "tutor", state["user_id"], f"Gave {state['skill']} ({state.get('task') or 'task'}) feedback; main issues: {'; '.join(issues) or 'none'}.",
+            agent_core.remember(self.db, self.memory_key, state["user_id"], f"Gave {state['skill']} ({state.get('task') or 'task'}) feedback; main issues: {'; '.join(issues) or 'none'}.",
                                 data={"skill": state["skill"], "issues": issues})
-        self.event(state, "AI Tutor", "handoff", {"decision": "generate feedback", "next_agent": "Assessment & Analytics", "tool": "LLM adapter"}, t)
-        return {"output": result, "source_mode": self.provider.mode}
+        self.event(state, "handoff", {"decision": "generate feedback", "next_agent": "Assessment & Analytics", "tool": "LLM adapter"}, t)
+        return {"output": result, "source_mode": self.llm.mode}
 
-    def assessment(self, state: FlowState) -> dict:
+
+class AssessmentAgent(Agent):
+    name, memory_key = "Assessment & Analytics", "assessment"
+
+    def provide_insights(self, state: FlowState) -> dict:
+        self.event(state, "handoff", {"decision": "return verified progress insights", "weaknesses": state.get("progress", {}).get("weaknesses", []), "next_agent": "Learning Coordinator"})
+        return {}
+
+    def score(self, state: FlowState) -> dict:
         t = time.perf_counter()
         result = dict(state["output"])
         scores = result.get("criteria", {})
         result["estimated_overall"] = criterion_average.invoke({"scores": scores})
         result["score_scale"] = "IELTS 0-9 bands" if state["profile"]["exam"] == "IELTS" else "TOEFL 2026 1-6 sections"
         result["official"] = False
-        kit = Toolkit(self.db, "assessment", state["user_id"], state["profile"]["exam"])
+        kit = self.toolkit(state["user_id"], state["profile"]["exam"])
         history = kit.call("get_score_history", skill=state["workflow"])
-        kit.log(state["workflow"], self.provider.mode)
+        kit.log(state["workflow"], self.llm.mode)
         previous = next((h["estimate"] for h in history if isinstance(h.get("estimate"), (int, float))), None) if isinstance(history, list) else None
         if previous is not None and scores:
             result["trend"] = {"previous": previous, "change": round(result["estimated_overall"] - previous, 1)}
         if scores:
-            agent_core.remember(self.db, "assessment", state["user_id"], f"{state['workflow'].title()} estimate {result['estimated_overall']}"
+            agent_core.remember(self.db, self.memory_key, state["user_id"], f"{state['workflow'].title()} estimate {result['estimated_overall']}"
                                 + (f" (previous {previous}, change {result['trend']['change']:+})" if previous is not None else " (first estimate)") + ".",
                                 data={"skill": state["workflow"], "estimate": result["estimated_overall"]})
-        self.event(state, "Assessment & Analytics", "handoff", {"decision": "calculate indicative criterion mean and trend", "next_agent": "Quality Manager", "tool": "criterion_average, get_score_history"}, t)
+        self.event(state, "handoff", {"decision": "calculate indicative criterion mean and trend", "next_agent": "Quality Manager", "tool": "criterion_average, get_score_history"}, t)
         return {"output": result}
 
-    def quality(self, state: FlowState) -> dict:
+
+class OpsQualityManager(Agent):
+    """UC9 Check Agent Output Quality. Nothing reaches the learner unless it passes here or a human approves it."""
+    name, memory_key = "Quality Manager", "quality"
+    MAX_REGENERATIONS = 1
+
+    def threshold(self) -> float:
+        row = self.db.get(SystemSetting, "quality_threshold")
+        return float(row.value) if row else settings().quality_threshold
+
+    def submit_result(self, state: FlowState) -> dict:
+        """Graph node. Routes to release, hold, or (once, for an incomplete result) back to the producing agent."""
         t = time.perf_counter()
         payload = state["output"]
-        package = ResultPackage(user_id=state["user_id"], kind=state["workflow"], state="SUBMITTED", payload=payload, confidence=payload.get("confidence", {}), source_mode=state.get("source_mode", self.provider.mode), issues=[])
-        self.db.add(package)
+        package = self._package(state, payload)
+        self._set_state(state, package, ResultStatus.VALIDATING)
+        issues = self.validate(state, payload)
+        types = {IssueType.INCOMPLETE} if issues else set()
+        attempts = state.get("regen_attempts", 0)
+        if issues and state.get("can_regenerate", True) and attempts < self.MAX_REGENERATIONS:  # 2a: ask the agent once to regenerate
+            self._set_state(state, package, ResultStatus.REGENERATING)
+            self.event(state, "handoff", {"package_id": package.id, "issues": issues, "decision": "regenerate incomplete result", "attempt": attempts + 1}, t)
+            return {"package_id": package.id, "issues": issues, "route": "regenerate", "regen_attempts": attempts + 1}
+        self._set_state(state, package, ResultStatus.CHECKING)
+        if low := self.check_confidence(package.confidence):
+            issues += low
+            types.add(IssueType.LOW_CONFIDENCE)
+        if contradictions := self.rule_based_check(payload):
+            issues += contradictions
+            types.add(IssueType.CONTRADICTION)
+        verdict_issues, method, unchecked = self._llm_verdict(state, payload)
+        issues += verdict_issues
+        if verdict_issues:
+            types.add(IssueType.UNCHECKED if unchecked else IssueType.CONTRADICTION)
+        package.issues = issues
+        self.db.add(QualityCheck(package_id=package.id, verdict="HOLD" if issues else "VERIFY", issues=issues, threshold=self.threshold(), method=method))
+        self.event(state, "verification", {"package_id": package.id, "issues": issues, "issue_types": sorted(types), "method": method,
+                                           "threshold": self.threshold(), "confidence": package.confidence}, t)
+        if issues:
+            self.hold(state, package, issues)
+        else:
+            self.mark_verified(state, package)
+        self.db.add(AuditLog(user_id=state["user_id"], action="quality_checked", detail={"package_id": package.id, "issues": issues, "issue_types": sorted(types), "method": method}))
         self.db.flush()
-        self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "SUBMITTED"})
-        package.state = "VALIDATING"
-        self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "VALIDATING"})
+        return {"package_id": package.id, "issues": issues, "route": "hold" if issues else "release"}
+
+    def verify(self, user_id: int, workflow: str, output: dict, regenerate: Callable[[], dict] | None = None) -> ResultPackage:
+        """UC9 for results produced outside a graph (reports, mocks, recommendations)."""
+        state: FlowState = {"user_id": user_id, "workflow": workflow, "output": output, "source_mode": self.llm.mode, "can_regenerate": regenerate is not None}
+        state.update(self.submit_result(state))
+        if state["route"] == "regenerate":
+            try:
+                state["output"] = regenerate()
+            except Exception as exc:
+                state["output"] = {"items": [], "summary": "Regeneration failed", "confidence": {}, "error_type": type(exc).__name__}
+            state.update(self.submit_result(state))
+        if state["route"] == "release":
+            self.release(state)
+        else:
+            self.wait_for_instructor(state)
+        return self.db.get(ResultPackage, state["package_id"])
+
+    def validate(self, state: FlowState, payload: dict) -> list[str]:
+        """Structure and completeness checks (IssueType.INCOMPLETE)."""
         issues = []
-        confidence = package.confidence
+        workflow = state["workflow"]
+        confidence = payload.get("confidence") or {}
         if not payload or not confidence or any(not isinstance(v, (int, float)) or v < 0 or v > 1 for v in confidence.values()):
             issues.append("Missing or invalid structured output/confidence")
-        if state["workflow"] in ("writing", "speaking") and (not payload.get("summary") or not payload.get("criteria") or not payload.get("comments")):
-            issues.append("Required feedback fields missing")
-        if state["workflow"] in ("writing", "speaking"):
+        if workflow in ("writing", "speaking"):
+            if not payload.get("summary") or not payload.get("criteria") or not payload.get("comments"):
+                issues.append("Required feedback fields missing")
             criteria = payload.get("criteria", {})
             exam = state.get("profile", {}).get("exam")
-            expected = ({"task_response", "coherence", "lexical_resource", "grammar"} if state["workflow"] == "writing" else {"fluency", "lexical_resource", "grammar"}) if exam == "IELTS" else ({"task_fulfillment", "organisation", "language_use"} if state["workflow"] == "writing" else {"language_use", "topic_development"})
+            expected = ({"task_response", "coherence", "lexical_resource", "grammar"} if workflow == "writing" else {"fluency", "lexical_resource", "grammar"}) if exam == "IELTS" else ({"task_fulfillment", "organisation", "language_use"} if workflow == "writing" else {"language_use", "topic_development"})
             if set(criteria) != expected:
                 issues.append("Criteria do not match the selected exam rubric")
-            if state["workflow"] == "speaking" and (payload.get("pronunciation_available") is not False or not payload.get("pronunciation_note")):
+            if workflow == "speaking" and (payload.get("pronunciation_available") is not False or not payload.get("pronunciation_note")):
                 issues.append("Speaking feedback must disclose unavailable audio assessment")
             if set(criteria) != set(confidence):
                 issues.append("Every criterion requires its own confidence value")
             max_score = 9 if exam == "IELTS" else 6
             if any(not isinstance(v, (int, float)) or v < 0 or v > max_score for v in criteria.values()):
                 issues.append("Criterion score outside exam scale")
-            if criteria and isinstance(payload.get("estimated_overall"), (int, float)) and abs(payload["estimated_overall"] - criterion_average.invoke({"scores": criteria})) > 0.5:
-                issues.append("Overall estimate conflicts with criterion scores")
-        if state["workflow"] in ("plan", "adaptation") and (not payload.get("priorities") or not payload.get("activities") or not payload.get("rationale")):
+        if workflow in ("plan", "adaptation") and (not payload.get("priorities") or not payload.get("activities") or not payload.get("rationale")):
             issues.append("Plan is incomplete")
-        if state["workflow"] == "recommendations" and (not payload.get("items") or any(not item.get("reason") for item in payload.get("items", []))):
+        # Items ranked by tags only (UC10 4a) deliberately carry no reason.
+        if workflow == "recommendations" and (not payload.get("items") or any(not item.get("reason") and payload.get("basis") != "tags" for item in payload.get("items", []))):
             issues.append("Recommendation list is incomplete")
-        if state["workflow"] == "mock_exam" and (set(payload.get("section_scores", {})) != {"reading", "writing", "speaking", "listening"}):
+        if workflow == "mock_exam" and (set(payload.get("section_scores", {})) != {"reading", "writing", "speaking", "listening"}):
             issues.append("Mock exam requires four section scores")
-        if state["workflow"] == "mock_exam" and (any(not isinstance(v, (int, float)) or v < 0 or v > (9 if payload.get("score_scale", "").startswith("IELTS") else 6) for v in payload.get("section_scores", {}).values())):
+        if workflow == "mock_exam" and (any(not isinstance(v, (int, float)) or v < 0 or v > (9 if payload.get("score_scale", "").startswith("IELTS") else 6) for v in payload.get("section_scores", {}).values())):
             issues.append("Mock section score outside exam scale")
-        if state["workflow"] == "portrait" and (not payload.get("summary") or not payload.get("focus_areas") or not payload.get("next_steps")):
+        if workflow == "portrait" and (not payload.get("summary") or not payload.get("focus_areas") or not payload.get("next_steps")):
             issues.append("Learner portrait is incomplete")
-        if state["workflow"] == "question" and (not payload.get("title") or not payload.get("prompt") or not payload.get("task_type")):
+        if workflow == "question" and (not payload.get("title") or not payload.get("prompt") or not payload.get("task_type")):
             issues.append("Generated question is incomplete")
-        if state["workflow"] == "question" and isinstance(payload.get("content"), dict) and payload["content"].get("kind") in ("listening", "reading"):
+        if workflow == "question" and isinstance(payload.get("content"), dict) and payload["content"].get("kind") in ("listening", "reading"):
             issues.extend(validate_test(payload["content"]))
-        if state["workflow"] == "question" and "official ielts" in (str(payload.get("title", "")) + " " + str(payload.get("prompt", ""))).lower():
+        if workflow == "question" and "official ielts" in (str(payload.get("title", "")) + " " + str(payload.get("prompt", ""))).lower():
             issues.append("Generated question must not claim to be official IELTS content")
-        package.state = "CHECKING"
-        self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "CHECKING"})
+        return issues
+
+    def check_confidence(self, confidence: dict) -> list[str]:
         if any(v < self.threshold() for v in confidence.values() if isinstance(v, (int, float))):
-            issues.append("Confidence below configured threshold")
-        if payload.get("criteria") and ("excellent" in payload.get("summary", "").lower() or "no weaknesses" in payload.get("summary", "").lower()) and min(payload["criteria"].values()) <= 3:
+            return ["Confidence below configured threshold"]
+        return []
+
+    def rule_based_check(self, payload: dict) -> list[str]:
+        """Deterministic contradiction checks. They always run, so they are also the fallback when the LLM is down."""
+        issues = []
+        scores = [v for v in (payload.get("criteria") or {}).values() if isinstance(v, (int, float))]
+        summary = str(payload.get("summary", "")).lower()
+        if scores and ("excellent" in summary or "no weaknesses" in summary) and min(scores) <= 3:
             issues.append("Rule check found score/feedback contradiction")
-        kit = Toolkit(self.db, "quality", state["user_id"], (state.get("profile") or {}).get("exam", "IELTS"))
+        if scores and isinstance(payload.get("estimated_overall"), (int, float)) and abs(payload["estimated_overall"] - criterion_average.invoke({"scores": payload["criteria"]})) > 0.5:
+            issues.append("Overall estimate conflicts with criterion scores")
+        targets = payload.get("targets") or []
+        if targets and any(item.get("skill") not in targets for item in payload.get("items", [])):
+            issues.append("Recommendation does not match the learner's assessed weaknesses")
+        return issues
+
+    def _llm_verdict(self, state: FlowState, payload: dict) -> tuple[list[str], str, bool]:
+        """Ask the LLM for a structured consistency verdict. Returns (issues, method, unchecked)."""
+        if payload.get("basis") in ("tags", "starter"):
+            return [], "RULES", False  # No AI-written text to check; the rule checks above cover it.
+        kit = Toolkit(self.db, self.memory_key, state["user_id"], (state.get("profile") or {}).get("exam", "IELTS"))
+        issues = []
         try:
-            verdict = self.provider.consistency(payload, kit)
+            verdict = self.llm.check_consistency(payload, kit)
             if not verdict.consistent:
                 issues.append(verdict.reason)
             if verdict.confidence < self.threshold():
                 issues.append("Consistency verdict confidence below threshold")
-            method = "LLM" if self.provider.mode == "REAL" else "DEMO_RULES"
+            method = "LLM" if self.llm.mode == "REAL" else "DEMO_RULES"
+            unchecked = False
         except Exception:
-            method = "FALLBACK_RULES"
-            if payload.get("criteria") and ("excellent" in payload.get("summary", "").lower()) and min(payload["criteria"].values()) <= 3:
-                issues.append("Rule fallback found score/feedback contradiction")
-            if self.provider.mode == "REAL":
+            method, unchecked = "FALLBACK_RULES", True
+            if self.llm.mode == "REAL":
                 issues.append("LLM consistency verification unavailable")
-        kit.log(state["workflow"], self.provider.mode)
-        if issues:
-            agent_core.remember(self.db, "quality", state["user_id"], f"Held {state['workflow']} result #{package.id}: {'; '.join(issues)[:300]}.", data={"package_id": package.id})
-        package.issues = issues
-        self.db.add(QualityCheck(package_id=package.id, verdict="HOLD" if issues else "VERIFY", issues=issues, threshold=self.threshold(), method=method))
-        self.event(state, "Quality Manager", "verification", {"package_id": package.id, "issues": issues, "method": method, "threshold": self.threshold(), "confidence": confidence}, t)
-        if issues:
-            package.state = "HELD"
-            self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "HELD", "issues": issues})
-            self.db.add(Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues)))
-            self.event(state, "Quality Manager", "handoff", {"next_agent": "Human Instructor", "package_id": package.id})
-            if state["workflow"] in ("writing", "speaking"):
-                tags = {item.get("issue") for item in payload.get("comments", []) if item.get("issue")}
-                recent = self.db.scalars(select(ResultPackage).where(ResultPackage.kind == state["workflow"], ResultPackage.created_at >= datetime.now(timezone.utc)-timedelta(days=7))).all()
-                for tag in tags:
-                    learners = {item.user_id for item in recent if any(comment.get("issue") == tag for comment in item.payload.get("comments", []))}
-                    if len(learners) >= 5:
-                        prior = self.db.scalars(select(AuditLog).where(AuditLog.action == "curriculum_gap_detected", AuditLog.created_at >= datetime.now(timezone.utc)-timedelta(days=7))).all()
-                        if not any(row.detail.get("issue") == tag for row in prior):
-                            self.db.add(AuditLog(user_id=None, action="curriculum_gap_detected", detail={"issue": tag, "learners": len(learners)}))
-        else:
-            package.state = "VERIFIED"
-            self.event(state, "Quality Manager", "state", {"package_id": package.id, "state": "VERIFIED"})
-        self.db.add(AuditLog(user_id=state["user_id"], action="quality_checked", detail={"package_id": package.id, "issues": issues, "method": method}))
-        self.db.flush()
-        return {"package_id": package.id, "issues": issues, "route": "hold" if issues else "release"}
+        kit.log(state["workflow"], self.llm.mode)
+        return issues, method, unchecked
+
+    def hold(self, state: FlowState, package: ResultPackage, issues: list[str]):
+        agent_core.remember(self.db, self.memory_key, state["user_id"], f"Held {state['workflow']} result #{package.id}: {'; '.join(issues)[:300]}.", data={"package_id": package.id})
+        self._set_state(state, package, ResultStatus.HELD, issues=issues)
+        self.notify_escalation(state, package, issues)
+        self.record_issue(state, package.payload)
+
+    def notify_escalation(self, state: FlowState, package: ResultPackage, issues: list[str]):
+        """UC8 extends UC9 at "issue detected"."""
+        self.db.add(Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues)))
+        self.event(state, "handoff", {"next_agent": "Human Instructor", "package_id": package.id})
+
+    def record_issue(self, state: FlowState, payload: dict):
+        """7a: the same issue for 5+ learners in 7 days suggests a curriculum gap."""
+        if state["workflow"] not in ("writing", "speaking"):
+            return
+        tags = {item.get("issue") for item in payload.get("comments", []) if item.get("issue")}
+        recent = self.db.scalars(select(ResultPackage).where(ResultPackage.kind == state["workflow"], ResultPackage.created_at >= datetime.now(timezone.utc)-timedelta(days=7))).all()
+        for tag in tags:
+            learners = {item.user_id for item in recent if any(comment.get("issue") == tag for comment in item.payload.get("comments", []))}
+            if len(learners) >= 5:
+                prior = self.db.scalars(select(AuditLog).where(AuditLog.action == "curriculum_gap_detected", AuditLog.created_at >= datetime.now(timezone.utc)-timedelta(days=7))).all()
+                if not any(row.detail.get("issue") == tag for row in prior):
+                    self.db.add(AuditLog(user_id=None, action="curriculum_gap_detected", detail={"issue": tag, "learners": len(learners)}))
+
+    def mark_verified(self, state: FlowState, package: ResultPackage):
+        self._set_state(state, package, ResultStatus.VERIFIED)
 
     def release(self, state: FlowState) -> dict:
         package = self.db.get(ResultPackage, state["package_id"])
-        if package.state != "VERIFIED":
+        if package.state != ResultStatus.VERIFIED:
             raise RuntimeError("Unverified result cannot be released")
-        package.state = "RELEASED"
-        self.event(state, "Quality Manager", "release", {"package_id": package.id, "verified": True, "result": {"summary": package.payload.get("summary"), "title": package.payload.get("title"), "estimated_overall": package.payload.get("estimated_overall")}})
+        package.state = ResultStatus.RELEASED
+        self.event(state, "release", {"package_id": package.id, "verified": True, "result": {"summary": package.payload.get("summary"), "title": package.payload.get("title"), "estimated_overall": package.payload.get("estimated_overall")}})
         self.db.add(AuditLog(user_id=state["user_id"], action="result_released", detail={"package_id": package.id}))
         return {}
 
-    def hold(self, state: FlowState) -> dict:
-        self.event(state, "Human Instructor", "waiting", {"package_id": state["package_id"], "status": "durable database wait"})
+    def wait_for_instructor(self, state: FlowState) -> dict:
+        self.runtime.event(state, "Human Instructor", "waiting", {"package_id": state["package_id"], "status": "durable database wait"})
         return {}
+
+    def release_after_human(self, package: ResultPackage):
+        if package.state not in (ResultStatus.APPROVED, ResultStatus.CORRECTED):
+            raise RuntimeError("Human decision required before release")
+        package.state = ResultStatus.RELEASED
+        state: FlowState = {"user_id": package.user_id, "workflow": package.kind}
+        self.event(state, "release", {"package_id": package.id, "verification": "human approval", "next_agent": "Learner", "result": {"summary": package.payload.get("summary"), "title": package.payload.get("title"), "estimated_overall": package.payload.get("estimated_overall")}})
+        self.db.add(AuditLog(user_id=package.user_id, action="result_released", detail={"package_id": package.id, "by": "instructor"}))
+
+    def _package(self, state: FlowState, payload: dict) -> ResultPackage:
+        """A regenerated result keeps the same package (ResultPackage.regenAttempts in the class diagram)."""
+        if state.get("package_id") and state.get("route") == "regenerate":
+            package = self.db.get(ResultPackage, state["package_id"])
+            package.payload, package.confidence = payload, payload.get("confidence") or {}
+            return package
+        package = ResultPackage(user_id=state["user_id"], kind=state["workflow"], state=ResultStatus.SUBMITTED, payload=payload, confidence=payload.get("confidence") or {},
+                                source_mode=state.get("source_mode", self.llm.mode), issues=[])
+        self.db.add(package)
+        self.db.flush()
+        self.event(state, "state", {"package_id": package.id, "state": ResultStatus.SUBMITTED})
+        return package
+
+    def _set_state(self, state: FlowState, package: ResultPackage, status: ResultStatus, **detail):
+        package.state = status
+        self.event(state, "state", {"package_id": package.id, "state": status, **detail})
+
+
+# ---------------------------------------------------------------- central controller
+class AgentRuntime:
+    """Owns one of each agent and wires them into workflows (separate control from function, centralise control)."""
+
+    def __init__(self, db: Session, provider: LLMService | None = None):
+        self.db = db
+        self.provider: LLMService = provider or LLMProviderAdapter()
+        self.coordinator = LearningCoordinatorAgent(self)
+        self.tutor = TutorAgent(self)
+        self.assessment = AssessmentAgent(self)
+        self.quality_manager = OpsQualityManager(self)
+
+    def threshold(self) -> float:
+        return self.quality_manager.threshold()
+
+    def event(self, state: FlowState, agent: str, phase: str, detail: dict, started: float | None = None):
+        self.db.add(AgentEvent(user_id=state["user_id"], workflow=state["workflow"], agent=agent, phase=phase, detail=detail, mode=self.provider.mode, duration_ms=int((time.perf_counter()-started)*1000) if started else 0))
+        self.db.flush()
 
     def plan_graph(self):
         graph = StateGraph(FlowState)
-        graph.add_node("request_insights", self.request_insights)
-        graph.add_node("assessment_insights", self.assessment_insights)
-        graph.add_node("coordinator", self.coordinator)
-        graph.add_node("quality", self.quality)
-        graph.add_node("release", self.release)
-        graph.add_node("human_wait", self.hold)
+        graph.add_node("request_insights", self.coordinator.request_insights)
+        graph.add_node("assessment_insights", self.assessment.provide_insights)
+        graph.add_node("coordinator", self.coordinator.create_plan)
+        graph.add_node("quality", self.quality_manager.submit_result)
+        graph.add_node("release", self.quality_manager.release)
+        graph.add_node("human_wait", self.quality_manager.wait_for_instructor)
         graph.add_conditional_edges(START, lambda s: "request_insights" if s["workflow"] == "adaptation" else "coordinator", {"request_insights": "request_insights", "coordinator": "coordinator"})
         graph.add_edge("request_insights", "assessment_insights")
         graph.add_edge("assessment_insights", "coordinator")
         graph.add_edge("coordinator", "quality")
-        graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait"})
+        graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait", "regenerate": "coordinator"})
+        graph.add_edge("release", END)
+        graph.add_edge("human_wait", END)
+        return graph.compile()
+
+    def practice_graph(self):
+        graph = StateGraph(FlowState)
+        graph.add_node("tutor", self.tutor.give_feedback)
+        graph.add_node("assessment", self.assessment.score)
+        graph.add_node("quality", self.quality_manager.submit_result)
+        graph.add_node("release", self.quality_manager.release)
+        graph.add_node("human_wait", self.quality_manager.wait_for_instructor)
+        graph.add_edge(START, "tutor")
+        graph.add_edge("tutor", "assessment")
+        graph.add_edge("assessment", "quality")
+        graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait", "regenerate": "tutor"})
         graph.add_edge("release", END)
         graph.add_edge("human_wait", END)
         return graph.compile()
 
     def release_after_human(self, package: ResultPackage):
-        if package.state not in ("APPROVED", "CORRECTED"):
-            raise RuntimeError("Human decision required before release")
-        package.state = "RELEASED"
-        state: FlowState = {"user_id": package.user_id, "workflow": package.kind}
-        self.event(state, "Quality Manager", "release", {"package_id": package.id, "verification": "human approval", "next_agent": "Learner", "result": {"summary": package.payload.get("summary"), "title": package.payload.get("title"), "estimated_overall": package.payload.get("estimated_overall")}})
-        self.db.add(AuditLog(user_id=package.user_id, action="result_released", detail={"package_id": package.id, "by": "instructor"}))
+        self.quality_manager.release_after_human(package)
 
-    def practice_graph(self):
-        graph = StateGraph(FlowState)
-        graph.add_node("tutor", self.tutor)
-        graph.add_node("assessment", self.assessment)
-        graph.add_node("quality", self.quality)
-        graph.add_node("release", self.release)
-        graph.add_node("human_wait", self.hold)
-        graph.add_edge(START, "tutor")
-        graph.add_edge("tutor", "assessment")
-        graph.add_edge("assessment", "quality")
-        graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait"})
-        graph.add_edge("release", END)
-        graph.add_edge("human_wait", END)
-        return graph.compile()
-
-    def verify_output(self, user_id: int, workflow: str, output: dict) -> ResultPackage:
-        state: FlowState = {"user_id": user_id, "workflow": workflow, "output": output, "source_mode": self.provider.mode}
-        state.update(self.quality(state))
-        if state["route"] == "release":
-            self.release(state)
-        else:
-            self.hold(state)
-        return self.db.get(ResultPackage, state["package_id"])
+    def verify_output(self, user_id: int, workflow: str, output: dict, regenerate: Callable[[], dict] | None = None) -> ResultPackage:
+        return self.quality_manager.verify(user_id, workflow, output, regenerate)
