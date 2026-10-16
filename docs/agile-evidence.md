@@ -1,6 +1,6 @@
 # Four one-week sprint evidence templates
 
-The CSV backlog is an import aid, not a record of Jira work completed. Sprint dates are local Sydney dates leading to the 1 November 2026 deadline. The Stage 1 report names **Menglu Lin**; the Stage 2 brief names **Menglin Yu**. Confirm the correct Jira account before assignment.
+The CSV backlog is an import aid, not a record of Jira work completed. Sprint dates are local Sydney dates leading to the 1 November 2026 deadline. The correct name is **Menglu Lin** (as in the Stage 1 report). Assignees follow the Stage 1 use-case authors; match them to Jira accounts after import.
 
 ## Sprint review (copy once per sprint)
 

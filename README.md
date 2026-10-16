@@ -19,7 +19,7 @@ ELEC5620 Stage 2 implementation · Group 3 (Wednesday 09–11). The design follo
 9. [Project structure](#9-project-structure)
 10. [Configuration reference](#10-configuration-reference)
 11. [Testing](#11-testing)
-12. [Canvas submission package](#12-canvas-submission-package)
+12. [Canvas submission package](#12-canvas-submission-package) · [Jira backlog](#jira-backlog)
 13. [Troubleshooting](#13-troubleshooting)
 14. [Limitations and honesty notes](#14-limitations-and-honesty-notes)
 15. [Credits and licences](#15-credits-and-licences)
@@ -354,6 +354,17 @@ On macOS/Linux use `.venv/bin/python` and `npm` instead of `npm.cmd`. The end-to
 This creates `ELEC5620-Stage2-Source.zip` from every file tracked by git. The zip never contains `.env`, databases, recordings or dependencies. It is not committed to the repository; generate it when you submit.
 
 ---
+
+### Jira backlog
+
+`docs/jira-backlog.csv` holds the whole backlog: 6 epics (one per area and owner, following the Stage 1 use-case authors), stories with acceptance criteria, tasks and sub-tasks. `scripts/jira_sync.py` creates it in Jira Cloud through the REST API with the parent links, labels (`sprint-1` … `sprint-4`), priorities, story points, assignees and status.
+
+1. Create a Jira API token at <https://id.atlassian.com/manage-profile/security/api-tokens> (it starts with `ATATT`).
+2. In `.env`, set `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` and `JIRA_PROJECT_KEY`.
+3. Dry run (checks access, changes nothing): `python scripts/jira_sync.py`
+4. Create the issues: `python scripts/jira_sync.py --apply`
+
+Running it again skips issues that already exist (each carries a `bk-<ID>` label). Members without a matching Jira user are named in the description; assign them in Jira.
 
 ## 13. Troubleshooting
 
