@@ -361,6 +361,13 @@ function AppInner() {
   const markProfileComplete = () => setUser(previous => { if (!previous) return previous; const updated = { ...previous, profile_complete: true }; localStorage.setItem('certifyai_user', JSON.stringify(updated)); return updated })
   const logout = () => { ['certifyai_token', 'certifyai_user', 'last-listening', 'last-reading', 'last-writing'].forEach(key => localStorage.removeItem(key)); setUser(null); navigate('/') }
   const home = user ? (user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/console') : '/'
+  useEffect(() => {
+    const expired = () => { setUser(previous => { if (previous) { notify('Your session has expired. Please sign in again.', 'error'); navigate('/') } return null }) }
+    window.addEventListener('session-expired', expired)
+    // A stored user without a token cannot make requests: start at sign-in instead of an endless loading screen.
+    if (user && !localStorage.getItem('certifyai_token')) expired()
+    return () => window.removeEventListener('session-expired', expired)
+  }, [])
   return <div className="scanlines">
     <Scene />
     {user ? <PersonaProvider initial={user.avatar || 'witch'} onChange={avatar => store({ ...user, avatar })}>
