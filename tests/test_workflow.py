@@ -641,3 +641,14 @@ def test_cloud_agent_loop_calls_tools_then_submits_structured_result():
     finally:
         db.rollback()
         db.close()
+
+
+def test_sign_in_lasts_seven_days():
+    import jwt
+    from datetime import datetime, timezone
+    from backend.config import settings
+    with TestClient(app) as client:
+        token = auth(client, "session.days@example.com")["Authorization"].split()[1]
+        days = (datetime.fromtimestamp(jwt.decode(token, settings().jwt_secret, algorithms=["HS256"])["exp"], timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 86400
+        assert 6.9 < days <= 7
+        assert client.get("/api/me", headers={"Authorization": "Bearer not-a-token"}).status_code == 401
