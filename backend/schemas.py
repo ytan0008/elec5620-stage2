@@ -79,6 +79,10 @@ class MockCreateInput(BaseModel):
     length: Literal["full", "short"] = "short"
 
 
+class MockEndInput(BaseModel):
+    reason: Literal["time", "learner"] = "learner"
+
+
 class ReviewInput(BaseModel):
     decision: Literal["approve", "correct", "request_information"]
     note: str = Field(min_length=3, max_length=2000)

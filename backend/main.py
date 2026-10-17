@@ -14,7 +14,7 @@ from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
 from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport, AgentMemory
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, MockEndInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
@@ -1054,19 +1054,60 @@ def mock_view(exam: MockExam, db: Session):
         if skill in ("listening", "reading") and "sections" in section and exam.status == "IN_PROGRESS":
             section = strip_answers(section)
         sections[skill] = section
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at,
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"),
             "duration_seconds": sum(exam.sections[skill].get("duration_seconds", 0) for skill in SKILLS if skill in exam.sections),
             "sections": sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
 
+MOCK_GRACE = timedelta(minutes=15)  # Allowance after the timer for a speaking test that is still running.
+
+
+def mock_missing(db: Session, exam: MockExam) -> list[str]:
+    """Sections without a usable answer (UC5 step 4)."""
+    raw = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
+    answers = {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
+    # An empty answer sheet ("{}") does not count: listening, reading and writing need at least one real answer.
+    return [skill for skill in SKILLS if not raw.get(skill, "").strip() or (skill != "speaking" and not any(str(v).strip() for v in answers[skill].values()))
+            or (skill == "speaking" and not answers["speaking"].get("transcript"))]
+
+
+def record_incomplete(db: Session, exam: MockExam, reason: str) -> None:
+    """UC5 4a: an unfinished mock is recorded as incomplete and gets no final result. Saved answers are kept."""
+    missing = mock_missing(db, exam)
+    exam.status = "INCOMPLETE"
+    exam.sections = {**exam.sections, "ended": {"reason": reason, "at": datetime.now(timezone.utc).isoformat(), "missing": missing,
+                                                "completed": [skill for skill in SKILLS if skill not in missing]}}
+    db.add(AuditLog(user_id=exam.user_id, action="mock_incomplete", detail={"exam_id": exam.id, "reason": reason, "missing": missing}))
+    db.add(AgentEvent(user_id=exam.user_id, workflow="mock_exam", agent="Assessment & Analytics", phase="decision",
+                      detail={"decision": "recorded as incomplete; no final result", "exam_id": exam.id, "reason": reason, "missing": missing}, mode=settings().ai_mode))
+
+
+def expire_overdue(db: Session, exam: MockExam) -> bool:
+    """A mock left unfinished after its time (plus a short grace period) is closed as incomplete."""
+    if exam.status != "IN_PROGRESS" or "test" not in exam.sections.get("speaking", {}):
+        return False
+    created = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
+    duration = sum(exam.sections.get(skill, {}).get("duration_seconds", 0) for skill in SKILLS)
+    if datetime.now(timezone.utc) <= created + timedelta(seconds=duration) + MOCK_GRACE or not mock_missing(db, exam):
+        return False
+    record_incomplete(db, exam, "time expired")
+    return True
+
+
 @app.get("/api/mock-exams")
 def list_mocks(user: User = Depends(learner), db: Session = Depends(get_db)):
-    return [mock_view(exam, db) for exam in db.scalars(select(MockExam).where(MockExam.user_id == user.id).order_by(MockExam.id.desc()))]
+    exams = list(db.scalars(select(MockExam).where(MockExam.user_id == user.id).order_by(MockExam.id.desc())))
+    if any([expire_overdue(db, exam) for exam in exams]):
+        db.commit()
+    return [mock_view(exam, db) for exam in exams]
 
 
 @app.get("/api/mock-exams/{exam_id}")
 def get_mock(exam_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
-    return mock_view(owned(db, MockExam, exam_id, user), db)
+    exam = owned(db, MockExam, exam_id, user)
+    if expire_overdue(db, exam):
+        db.commit()
+    return mock_view(exam, db)
 
 
 @app.put("/api/mock-exams/{exam_id}/{skill}")
@@ -1096,12 +1137,94 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already submitted")
-    raw = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
-    answers = {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
-    missing = [skill for skill in SKILLS if not raw.get(skill, "").strip() or (skill == "writing" and not any(str(v).strip() for v in answers["writing"].values()))
-               or (skill == "speaking" and not answers["speaking"].get("transcript"))]
+    missing = mock_missing(db, exam)
     if missing:
         raise HTTPException(409, "Complete all four sections: " + ", ".join(missing) + " still missing")
+    grade_mock(db, exam, user)
+    db.commit()
+    return mock_view(exam, db)
+
+
+@app.post("/api/mock-exams/{exam_id}/end")
+def end_mock(exam_id: int, data: MockEndInput | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
+    """End a mock early or when time runs out: a finished exam is marked, an unfinished one is recorded as incomplete."""
+    exam = owned(db, MockExam, exam_id, user)
+    if exam.status != "IN_PROGRESS":
+        raise HTTPException(409, "Exam already finished")
+    if mock_missing(db, exam):
+        record_incomplete(db, exam, "time expired" if (data or MockEndInput()).reason == "time" else "ended by learner")
+    else:
+        grade_mock(db, exam, user)
+    db.commit()
+    return mock_view(exam, db)
+
+
+def issue_history(db: Session, user_id: int) -> dict[str, int]:
+    """How often each feedback issue appeared in the learner's earlier verified writing, speaking and mock results."""
+    counts: dict[str, int] = {}
+    for package in db.scalars(select(ResultPackage).where(ResultPackage.user_id == user_id, ResultPackage.state == "RELEASED",
+                                                          ResultPackage.kind.in_(["writing", "speaking", "mock_exam"]))):
+        payload = package.payload or {}
+        comments = payload.get("comments", []) if package.kind != "mock_exam" else \
+            [c for fb in (payload.get("details", {}).get("writing") or {}).values() for c in fb.get("comments", [])] + (payload.get("details", {}).get("speaking") or {}).get("comments", [])
+        for comment in comments:
+            if comment.get("issue"):
+                counts[comment["issue"]] = counts.get(comment["issue"], 0) + 1
+    return counts
+
+
+def split_skills(scores: dict[str, float], target: float | None) -> tuple[list[dict], list[dict]]:
+    """Strengths and weaknesses never overlap: below target is a weakness, at or above is a strength.
+    When every skill sits on one side, the clearest outlier (at least half a band away) is named relative to the others."""
+    ordered = sorted(scores, key=scores.get)
+    if target is None:
+        target = sum(scores.values()) / len(scores)
+    weak = [{"skill": s, "score": scores[s], "note": f"{round(target - scores[s], 1)} below target"} for s in ordered if scores[s] < target]
+    strong = [{"skill": s, "score": scores[s], "note": "at or above target"} for s in reversed(ordered) if scores[s] >= target]
+    spread = scores[ordered[-1]] - scores[ordered[0]] if ordered else 0
+    if not weak and spread >= .5:
+        weak = [{"skill": ordered[0], "score": scores[ordered[0]], "note": "lowest of your skills (still at target)"}]
+        strong = [item for item in strong if item["skill"] != ordered[0]]
+    if not strong and spread >= .5:
+        strong = [{"skill": ordered[-1], "score": scores[ordered[-1]], "note": "highest of your skills (still below target)"}]
+        weak = [item for item in weak if item["skill"] != ordered[-1]]
+    return strong, weak
+
+
+def mock_insights(db: Session, user_id: int, scores: dict[str, float], overall: float, target: float | None, current_issues: list[str]) -> dict:
+    """Compare with earlier assessments, name strengths and weaknesses, and estimate readiness from the trend (UC5 steps 6-7)."""
+    previous = db.scalar(select(ResultPackage).where(ResultPackage.user_id == user_id, ResultPackage.kind == "mock_exam", ResultPackage.state == "RELEASED")
+                         .order_by(ResultPackage.id.desc()))
+    if previous:
+        prev_exam = db.scalar(select(MockExam.id).where(MockExam.package_id == previous.id))
+        before = previous.payload.get("section_scores", {})
+        against = f"Mock #{prev_exam} ({previous.created_at.date().isoformat()})" if prev_exam else f"your previous mock ({previous.created_at.date().isoformat()})"
+        overall_change = round(overall - previous.payload.get("estimated_overall", overall), 1)
+    else:
+        before = latest_progress(db, user_id)["skill_scores"]
+        against = "your practice average" if before else None
+        overall_change = None
+    comparison = {"against": against, "overall_change": overall_change,
+                  "skills": {skill: {"before": before[skill], "now": scores[skill], "change": round(scores[skill] - before[skill], 1)} for skill in scores if skill in before}} if against else None
+    strengths, weaknesses = split_skills(scores, target)
+    history = issue_history(db, user_id)
+    persistent = sorted({issue for issue in current_issues if history.get(issue)}, key=lambda issue: -history[issue])[:5]
+    gap = round(target - overall, 1) if target is not None else None
+    level = "Not enough data" if gap is None else "On track" if gap <= 0 else "Close to target" if gap <= .5 else "Needs further practice"
+    if overall_change is None:
+        trend = "This is your first mock, so there is no trend yet: take another mock in two to three weeks to see your progress."
+    else:
+        trend = (f"Up {overall_change} since {against}." if overall_change > 0 else f"Down {abs(overall_change)} since {against}." if overall_change < 0 else f"No change since {against}.")
+    explanation = (f"Estimated {overall} against your target {target}" + (f" ({gap} to go). " if gap and gap > 0 else ". ") if target is not None else "") + trend
+    if weaknesses:
+        explanation += f" Focus next on {', '.join(item['skill'] for item in weaknesses[:2])}."
+    return {"comparison": comparison, "strengths": strengths, "weaknesses": weaknesses, "persistent_issues": persistent,
+            "readiness_detail": {"level": level, "gap": gap, "target": target, "trend": trend, "explanation": explanation}}
+
+
+def grade_mock(db: Session, exam: MockExam, user: User) -> None:
+    raw = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
+    answers = {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
     runtime = AgentRuntime(db)
     kit = Toolkit(db, "tutor", user.id, exam.exam)
     scores, details = {}, {}
@@ -1109,7 +1232,7 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
         graded = objective_output(exam.sections[skill] | {"test": exam.sections[skill]}, answers[skill], skill, exam.exam)
         scores[skill] = graded["estimated_overall"]
         details[skill] = {k: graded[k] for k in ("raw_score", "total", "review", "summary")} | ({"transcript": graded["transcript"]} if skill == "listening" else {})
-    task_scores, writing_feedback = [], {}
+    task_scores, writing_feedback, confidence = [], {}, {"listening": .95, "reading": .95}
     for task in exam.sections["writing"]["tasks"]:
         response = str(answers["writing"].get(task["task"], "")).strip()
         if len(response.split()) < 3:
@@ -1119,6 +1242,8 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
         band = round(sum(feedback.criteria.values()) / len(feedback.criteria) * 2) / 2
         task_scores.append((task["task"], band))
         writing_feedback[task["task"]] = {"criteria": feedback.criteria, "summary": feedback.summary, "comments": feedback.comments[:4], "band": band}
+        # The section is only as certain as its least certain criterion.
+        confidence["writing"] = min([confidence.get("writing", 1.0), *feedback.confidence.values()])
     weights = {"task2": 2, "task1": 1}
     total_weight = sum(weights.get(task, 1) for task, _ in task_scores)
     scores["writing"] = round(sum(band * weights.get(task, 1) for task, band in task_scores) / total_weight * 2) / 2
@@ -1127,13 +1252,17 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     speaking = runtime.provider.feedback(exam.exam, "speaking", spoken["transcript"], "normal", "", "speaking", spoken.get("metrics"), kit)
     kit.log("mock_exam", runtime.provider.mode)
     scores["speaking"] = round(sum(speaking.criteria.values()) / len(speaking.criteria) * 2) / 2
+    confidence.setdefault("writing", .9)  # Every task was blank or a few words: scored as the minimum, with no judgement involved.
+    confidence["speaking"] = min(speaking.confidence.values()) if speaking.confidence else .5
     details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments[:4], "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note}
     overall = overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / 4 * 2) / 2
     target = db.scalar(select(Profile.target_score).where(Profile.user_id == user.id))
+    current_issues = [c.get("issue") for fb in writing_feedback.values() for c in fb["comments"]] + [c.get("issue") for c in details["speaking"]["comments"]]
+    insights = mock_insights(db, user.id, scores, overall, target, [issue for issue in current_issues if issue])
     output = {"summary": f"{'Full-length' if exam.sections.get('length') == 'full' else 'Short-format'} mock estimate. Listening and Reading are marked against answer keys; Writing and Speaking are assessed against the rubric. Pronunciation is not scored from a transcript.",
-              "section_scores": scores, "estimated_overall": overall, "readiness": "On track" if target is not None and overall >= target else "Needs further practice",
+              "section_scores": scores, "estimated_overall": overall, "readiness": insights["readiness_detail"]["level"], **insights,
               "score_scale": "IELTS 0-9 bands" if exam.exam == "IELTS" else "TOEFL 2026 1-6 sections", "official": False,
-              "details": details, "confidence": {skill: .82 for skill in scores}}
+              "details": details, "confidence": confidence}
     package = runtime.verify_output(user.id, "mock_exam", output)
     exam.package_id = package.id
     exam.status = "SUBMITTED"
@@ -1144,8 +1273,6 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
             notebook.record_feedback(db, user.id, fb, "writing", f"Mock #{exam.id} · {task}")
         notebook.record_feedback(db, user.id, details["speaking"], "speaking", f"Mock #{exam.id}")
         notebook.remember(db, user.id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {overall}; sections {scores}", key="progress:mock", source="assessment")
-    db.commit()
-    return mock_view(exam, db)
 
 
 @app.get("/api/analytics")
