@@ -711,3 +711,38 @@ def test_strengths_and_weaknesses_never_overlap():
     assert [s["skill"] for s in strong] == ["reading"] and [w["skill"] for w in weak] == ["writing"]
     strong, weak = split_skills({"writing": 7.0, "reading": 7.0}, 7.0)
     assert [s["skill"] for s in strong] == ["reading", "writing"] and not weak
+
+
+def test_performance_report_trends_readiness_and_partial_report(monkeypatch):
+    import backend.agents as agents_module
+    with TestClient(app) as client:
+        headers = auth(client, "uc6.report@example.com")
+        active_plan(client, headers)
+        task = client.post("/api/practice/writing", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. Companies should allow it because workers save time."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": essay}).status_code == 200
+        first = client.get("/api/analytics", headers=headers).json()
+        assert not set(first["strengths"]) & set(first["weaknesses"])  # one skill is never both
+        assert first["weaknesses"] == ["writing"] and first["strengths"] == []  # far below the target of 7
+        assert first["trend_note"].startswith("Not enough results to show a trend")
+        assert first["readiness"] == "Insufficient data"
+        better = essay + " Moreover, flexible schedules can improve wellbeing, although managers need clear routines to keep teams connected."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": better}).status_code == 200
+        progress = client.get("/api/analytics", headers=headers).json()
+        trend = progress["trends"]["writing"]
+        assert trend["results"] == 2 and trend["direction"] in ("improving", "steady", "declining")
+        assert trend["change"] == round(trend["latest"] - trend["first"], 2)
+        assert progress["readiness"] in ("On track", "Close to target", "Needs further practice") and progress["readiness_note"]
+        assert any("writing" in tip.lower() for tip in progress["recommendations"])
+        report = client.post("/api/reports", headers=headers).json()["result"]
+        assert report["state"] == "RELEASED"
+        assert report["payload"]["readiness"] == progress["readiness"]  # the saved report agrees with the page
+        assert report["payload"]["trends"]["writing"]["direction"] == trend["direction"]
+
+        def broken(*args, **kwargs):
+            raise TimeoutError("model unavailable")
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "report", broken)
+        partial = client.post("/api/reports", headers=headers).json()["result"]
+        assert partial["state"] == "RELEASED"  # the verified analysis is still delivered (UC6 6a)
+        assert partial["payload"]["recommendations_unavailable"] is True and partial["payload"]["recommendations"] == []
+        assert "writing" in partial["payload"]["summary"]

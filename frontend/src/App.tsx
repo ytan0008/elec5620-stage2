@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
-import { Activity, AlertTriangle, ArrowRight, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowRight, Minus, TrendingDown, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
 import { Empty, Metric, Notify, PageTitle, SKILL_COLOR, Spinner, Status, nice, skills, stamp, useLoad } from './ui'
@@ -190,17 +190,30 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
   const max = data.exam === 'IELTS' ? 9 : 6
   return <>
     <PageTitle eyebrow="Performance intelligence" title="Your progress" subtitle="Estimates from verified practice and mock exams only." action={<button className="btn-primary" disabled={busy || !data.sample_count} onClick={generate}>Generate report</button>} />
-    <div className="grid gap-4 md:grid-cols-3"><Metric label="Verified results" value={String(data.sample_count)} icon={<ShieldCheck />} /><Metric label="Target score" value={String(data.target_score)} icon={<Target />} color="#ff4fd8" /><Metric label="Readiness" value={data.readiness.replace('Estimated ', '')} icon={<TrendingUp />} color="#b8ff5c" /></div>
+    <div className="grid gap-4 md:grid-cols-3"><Metric label="Verified results" value={String(data.sample_count)} icon={<ShieldCheck />} /><Metric label="Target score" value={String(data.target_score)} icon={<Target />} color="#ff4fd8" /><Metric label="Readiness" value={data.readiness} icon={<TrendingUp />} color="#b8ff5c" /></div>
+    {data.readiness_note && <p className="mt-3 font-read text-sm text-mist">{data.readiness_note}</p>}
     {data.sample_count ? <div className="mt-6 grid gap-6 lg:grid-cols-2">
       <div className="panel p-6"><h2 className="section-title">Skill estimates</h2><div className="mt-5 h-64"><ResponsiveContainer width="100%" height="100%"><BarChart data={Object.entries(data.skill_scores).map(([skill, score]) => ({ skill, score }))}><CartesianGrid stroke="#3a2b7e" strokeDasharray="4 4" /><XAxis dataKey="skill" {...chartAxis} /><YAxis domain={[0, max]} {...chartAxis} /><Tooltip cursor={{ fill: 'rgba(107,82,214,.2)' }} /><Bar dataKey="score" fill="#ff4fd8" isAnimationActive={false} /></BarChart></ResponsiveContainer></div></div>
       <div className="panel p-6"><h2 className="section-title">Verified score history</h2><div className="mt-5 h-64"><ResponsiveContainer width="100%" height="100%"><LineChart data={data.history.map((h: any, i: number) => ({ ...h, index: i + 1 }))}><CartesianGrid stroke="#3a2b7e" strokeDasharray="4 4" /><XAxis dataKey="index" {...chartAxis} /><YAxis domain={[0, max]} {...chartAxis} /><Tooltip /><Line type="linear" dataKey="score" stroke="#3ef0ff" strokeWidth={3} dot={{ r: 4, fill: '#ffd34d', strokeWidth: 0 }} isAnimationActive={false} /></LineChart></ResponsiveContainer></div></div>
     </div> : <div className="mt-6"><Empty title="Insights need practice data" body="Complete a practice session before trends and weaknesses are estimated." action={<Link to="/practice/listening" className="btn-primary">Start listening practice</Link>} /></div>}
     <div className="mt-6 grid gap-6 lg:grid-cols-2">
-      <div className="panel p-6"><h2 className="section-title">Areas to improve</h2><div className="mt-4 flex flex-wrap gap-2">{data.weaknesses?.length ? data.weaknesses.map((s: string) => <span key={s} className="pill text-sun">{nice(s)}</span>) : <span className="font-read text-mist">Not enough evidence yet.</span>}</div>
+      <div className="panel p-6"><h2 className="section-title">Strengths and weaknesses</h2>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div><p className="font-pixel text-lime">Strengths</p>{data.strength_notes?.length ? data.strength_notes.map((s: any) => <p key={s.skill} className="mt-1 font-read text-sm"><b>{nice(s.skill)}</b> {s.score} · <span className="text-mist">{s.note}</span></p>) : <p className="mt-1 font-read text-sm text-mist">{data.sample_count ? 'No skill is at your target yet.' : 'Not enough evidence yet.'}</p>}</div>
+          <div><p className="font-pixel text-sun">Areas to improve</p>{data.weakness_notes?.length ? data.weakness_notes.map((s: any) => <p key={s.skill} className="mt-1 font-read text-sm"><b>{nice(s.skill)}</b> {s.score} · <span className="text-mist">{s.note}</span></p>) : <p className="mt-1 font-read text-sm text-mist">{data.sample_count ? 'Every practised skill is at or above your target.' : 'Not enough evidence yet.'}</p>}</div>
+        </div>
+        {data.trends && Object.keys(data.trends).length > 0 && <div className="mt-5"><p className="font-pixel text-cyan">Trends</p>
+          {Object.entries(data.trends).map(([skill, t]: [string, any]) => <p key={skill} className="mt-1 flex items-center gap-2 font-read text-sm">
+            {t.direction === 'improving' ? <TrendingUp size={15} className="text-lime" /> : t.direction === 'declining' ? <TrendingDown size={15} className="text-rose" /> : <Minus size={15} className="text-fog" />}
+            <b>{nice(skill)}</b> {t.direction === 'not enough data' ? <span className="text-mist">one result so far ({t.latest})</span> : <span>{t.direction} · {t.first} → {t.latest} ({t.change > 0 ? '+' : ''}{t.change} vs earlier average, {t.results} results)</span>}</p>)}
+          {data.trend_note && <p className="mt-2 font-read text-xs text-sun">{data.trend_note}</p>}</div>}
         {data.repeated_errors?.length > 0 && <div className="mt-4 space-y-1">{data.repeated_errors.map((r: any) => <p key={r.issue} className="font-read text-sm text-mist">▸ {r.issue} ×{r.count}</p>)}</div>}
         <div className="mt-5 space-y-2">{data.recommendations?.map((r: string) => <p key={r} className="tile font-read text-sm">{r}</p>)}</div></div>
       <div className="panel p-6"><h2 className="section-title">Saved reports</h2><div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <button key={r.id} onClick={() => setOpen(r.result)} className="tile flex w-full items-center justify-between font-pixel"><span>Report #{r.id}</span><Status value={r.result.state} /></button>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
-        {open?.payload && <div className="mt-4 tile font-read text-sm"><p>{open.payload.summary}</p>{open.payload.recommendations?.map((r: string) => <p key={r} className="mt-1 text-mist">▸ {r}</p>)}</div>}</div>
+        {open?.payload && <div className="mt-4 tile space-y-1 font-read text-sm"><p>{open.payload.summary}</p>
+          {open.payload.readiness && <p className="text-cyan">Readiness: {open.payload.readiness}{open.payload.readiness_note ? ` · ${open.payload.readiness_note}` : ''}</p>}
+          {open.payload.recommendations?.map((r: string) => <p key={r} className="text-mist">▸ {r}</p>)}
+          {open.payload.recommendations_unavailable && <p className="text-sun">Recommendations were temporarily unavailable for this report. Generate a new report later to get them.</p>}</div>}</div>
     </div>
   </>
 }

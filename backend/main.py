@@ -104,8 +104,51 @@ def latest_progress(db: Session, user_id: int):
                 if issue:
                     error_counts[issue] = error_counts.get(issue, 0) + 1
     averages = {skill: round(sum(values) / len(values), 2) for skill, values in scores.items()}
-    weaknesses = [skill for skill, _ in sorted(averages.items(), key=lambda item: item[1])[:2]]
-    return {"skill_scores": averages, "history": history, "weaknesses": weaknesses, "strengths": [skill for skill, _ in sorted(averages.items(), key=lambda item: -item[1])[:2]], "repeated_errors": [{"issue": issue, "count": count} for issue,count in error_counts.items() if count >= 2], "sample_count": len(packages), "readiness": "Insufficient data" if len(packages) < 2 else "Developing"}
+    target = db.scalar(select(Profile.target_score).where(Profile.user_id == user_id))
+    # Strengths are at or above the target, weaknesses below it, so a skill is never both (UC6 step 4).
+    strong, weak = split_skills(averages, target) if averages else ([], [])
+    trends, trend_note = skill_trends(history)
+    readiness, readiness_note = progress_readiness(averages, target, len(packages))
+    return {"skill_scores": averages, "history": history, "weaknesses": [w["skill"] for w in weak], "strengths": [s["skill"] for s in strong],
+            "weakness_notes": weak, "strength_notes": strong, "trends": trends, "trend_note": trend_note,
+            "repeated_errors": [{"issue": issue, "count": count} for issue, count in error_counts.items() if count >= 2], "sample_count": len(packages),
+            "readiness": readiness, "readiness_note": readiness_note}
+
+
+TREND_STEP = .25  # Smaller changes than a quarter band are treated as steady.
+
+
+def skill_trends(history: list[dict]) -> tuple[dict, str]:
+    """Per-skill trend: the latest verified result against the average of the earlier ones (UC6 step 5)."""
+    by_skill: dict[str, list[float]] = {}
+    for item in history:
+        by_skill.setdefault(item["skill"], []).append(item["score"])
+    trends = {}
+    for skill, values in by_skill.items():
+        if len(values) < 2:
+            trends[skill] = {"results": 1, "latest": values[-1], "direction": "not enough data"}
+            continue
+        change = round(values[-1] - sum(values[:-1]) / len(values[:-1]), 2)
+        trends[skill] = {"results": len(values), "first": values[0], "latest": values[-1], "change": change,
+                         "direction": "improving" if change >= TREND_STEP else "declining" if change <= -TREND_STEP else "steady"}
+    thin = sorted(skill for skill, t in trends.items() if t["direction"] == "not enough data")
+    if not trends or len(thin) == len(trends):
+        note = "Not enough results to show a trend yet: complete at least two verified results in a skill."
+    elif thin:
+        note = f"Not enough data for a trend in {', '.join(thin)} yet: one more verified result in each is needed."
+    else:
+        note = ""
+    return trends, note
+
+
+def progress_readiness(averages: dict[str, float], target: float | None, samples: int) -> tuple[str, str]:
+    """One readiness rule for the Performance page and saved reports."""
+    if samples < 2 or not averages or target is None:
+        return "Insufficient data", "Complete at least two verified results before readiness is estimated."
+    mean = round(sum(averages.values()) / len(averages), 2)
+    gap = round(target - mean, 2)
+    level = "On track" if gap <= 0 else "Close to target" if gap <= .5 else "Needs further practice"
+    return level, f"Your average verified estimate is {mean} against a target of {target}" + (f" ({gap} to go)." if gap > 0 else ".")
 
 
 @app.get("/api/health")
@@ -1281,11 +1324,17 @@ def analytics(user: User = Depends(learner), db: Session = Depends(get_db)):
     progress = latest_progress(db, user.id)
     progress["target_score"] = profile.target_score
     progress["exam"] = profile.exam
-    if progress["sample_count"] >= 2 and progress["skill_scores"]:
-        mean = sum(progress["skill_scores"].values()) / len(progress["skill_scores"])
-        progress["readiness"] = "Estimated on track" if mean >= profile.target_score else "Estimated needs practice"
-    progress["recommendations"] = [f"Practise {skill} twice this week" for skill in progress["weaknesses"]] if progress["sample_count"] else ["Complete a practice session to unlock personalised insights"]
+    progress["recommendations"] = progress_recommendations(progress) if progress["sample_count"] else ["Complete a practice session to unlock personalised insights"]
     return progress
+
+
+def progress_recommendations(progress: dict) -> list[str]:
+    """Recommendations from the main skill gaps, declining trends and repeated problems (UC6 step 6)."""
+    tips = [f"{item['skill'].title()} is {item['note']}: do two timed {item['skill']} tasks this week and review every comment." for item in progress["weakness_notes"][:2]]
+    tips += [f"{skill.title()} is declining ({t['change']:+}): revisit your last {skill} feedback before practising again." for skill, t in progress["trends"].items()
+             if t["direction"] == "declining" and skill not in progress["weaknesses"][:2]]
+    tips += [f"'{item['issue']}' came up {item['count']} times in your feedback: make it your focus in the next task." for item in progress["repeated_errors"][:2]]
+    return tips or ["Keep practising all four skills to maintain your level."]
 
 
 @app.post("/api/reports")
@@ -1293,6 +1342,7 @@ def create_report(user: User = Depends(learner), db: Session = Depends(get_db)):
     data = latest_progress(db, user.id)
     if data["sample_count"] == 0:
         raise HTTPException(409, "Complete practice before generating a report")
+    data["target_score"] = profile_for(db, user).target_score
     runtime = AgentRuntime(db)
     try:
         kit = Toolkit(db, "assessment", user.id, profile_for(db, user).exam)
@@ -1300,7 +1350,13 @@ def create_report(user: User = Depends(learner), db: Session = Depends(get_db)):
         kit.log("report", runtime.provider.mode)
         data.update(narrative)
     except Exception as exc:
-        data.update({"summary": "Report generation failed", "confidence": {}, "error_type": type(exc).__name__})
+        # UC6 6a: keep the report built from verified analysis, leave out the recommendations and record the failure for a retry.
+        scores = ", ".join(f"{skill} {score}" for skill, score in data["skill_scores"].items())
+        data.update({"summary": f"Verified estimates: {scores}. {data['readiness_note']} {data['trend_note']}".strip(), "recommendations": [], "recommendations_unavailable": True,
+                     "confidence": {"report": .8}})
+        db.add(AuditLog(user_id=user.id, action="report_recommendations_failed", detail={"error_type": type(exc).__name__}))
+        db.add(AgentEvent(user_id=user.id, workflow="report", agent="Assessment & Analytics", phase="decision", mode=runtime.provider.mode,
+                          detail={"decision": "report saved without recommendations; retry later", "error_type": type(exc).__name__}))
     package = runtime.verify_output(user.id, "report", data)
     report = PerformanceReport(user_id=user.id, package_id=package.id)
     db.add(report)
