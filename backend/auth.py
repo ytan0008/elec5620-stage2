@@ -17,7 +17,7 @@ def hash_password(password: str) -> str:
 
 
 def token_for(user: User) -> str:
-    return jwt.encode({"sub": str(user.id), "role": user.role, "version": user.token_version, "exp": datetime.now(timezone.utc) + timedelta(days=settings().session_days)}, settings().jwt_secret, algorithm="HS256")
+    return jwt.encode({"sub": str(user.id), "role": user.role, "version": user.token_version, "exp": datetime.now(timezone.utc) + timedelta(hours=24)}, settings().jwt_secret, algorithm="HS256")
 
 
 def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> User:

@@ -5,8 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./elec5620.db"
     jwt_secret: str = "local-secret-change-before-deploying"
-    # How long a sign-in stays valid before the learner must sign in again.
-    session_days: int = 7
     # Forces the built-in local engine even when a key is present (used by the automated tests).
     demo_mode: bool = False
     openai_api_key: str = ""

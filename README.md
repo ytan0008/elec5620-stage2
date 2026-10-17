@@ -319,7 +319,6 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 | `QUALITY_THRESHOLD` | `0.70` | Initial confidence threshold (also adjustable in the console). |
 | `INSTRUCTOR_EMAIL` / `INSTRUCTOR_PASSWORD` | `instructor@example.com` / `ChangeMe123!` | Teacher account created at startup. |
 | `JWT_SECRET` | placeholder | **Change before any public deployment.** |
-| `SESSION_DAYS` | `7` | Days a sign-in stays valid. When it expires the app returns to the sign-in page. |
 | `DATABASE_URL` | `sqlite:///./elec5620.db` | Database (Docker uses its own volume). |
 | `CORS_ORIGINS` | localhost:5173 | Allowed browser origins in development. |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Used in password-reset links. |
