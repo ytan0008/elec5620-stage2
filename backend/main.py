@@ -24,7 +24,7 @@ from backend.agent_core import Toolkit
 from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
 from backend import notebook
 from backend import monitoring
-from backend.speech import server_speech_available, synthesise, transcribe
+from backend.speech import server_speech_available, stt_available, synthesise, transcribe, warm_up
 from backend import content as bank
 from backend import examiner
 from backend.seed import seed
@@ -33,6 +33,7 @@ from backend.seed import seed
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     seed()
+    warm_up()
     yield
 
 
@@ -112,7 +113,7 @@ def latest_progress(db: Session, user_id: int):
 def health():
     config = settings()
     return {"status": "ok", "mode": config.ai_mode, "model": config.llm_model if config.ai_mode == "REAL" else "built-in engine",
-            "server_tts": server_speech_available(), "server_stt": server_speech_available()}
+            "server_tts": server_speech_available(), "server_stt": stt_available()}
 
 
 def user_view(user: User, profile_complete: bool | None = None) -> dict:
@@ -810,13 +811,13 @@ async def upload_audio(practice_id: int, file: UploadFile = File(...), user: Use
     path.write_bytes(data)
     db.add(AuditLog(user_id=user.id, action="audio_uploaded", detail={"practice_id": practice.id, "bytes": len(data)}))
     db.commit()
-    if server_speech_available():
+    if stt_available():
         try:
             return {"stored": True, "transcription_available": True, "transcript": transcribe(path), "message": "Recording saved and transcribed. Review the transcript before submitting."}
         except Exception as exc:
             db.add(AuditLog(user_id=user.id, action="transcription_failed", detail={"practice_id": practice.id, "error_type": type(exc).__name__}))
             db.commit()
-            return {"stored": True, "transcription_available": False, "message": "Recording saved, but cloud transcription failed. Live browser recognition or typing still works."}
+            return {"stored": True, "transcription_available": False, "message": "Recording saved, but it could not be transcribed. Record again or type your answer."}
     return {"stored": True, "transcription_available": False, "message": "Recording saved for replay. Your words are captured by live speech recognition in the browser."}
 
 
@@ -1010,7 +1011,7 @@ def text_to_speech(data: TTSInput, user: User = Depends(current_user)):
 
 @app.post("/api/stt")
 async def speech_to_text(file: UploadFile = File(...), user: User = Depends(current_user)):
-    if not server_speech_available():
+    if not stt_available():
         raise HTTPException(404, "Server transcription is not configured")
     data = await read_audio(file)
     folder = Path("uploads") / "stt"

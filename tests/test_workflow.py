@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 os.environ["DATABASE_URL"] = "sqlite:///./test_suite.db"
 os.environ["DEMO_MODE"] = "true"
+os.environ["LOCAL_STT"] = "false"  # keep the suite fast; tests/test_speech.py covers recognition
 from fastapi.testclient import TestClient
 from backend.main import app
 from backend.db import Base, engine
