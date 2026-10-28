@@ -1052,3 +1052,16 @@ def test_last_autosave_of_a_closing_section_is_kept():
             row.sections = {**row.sections, "timing": {**row.sections["timing"], "closed_at": {**row.sections["timing"]["closed_at"], "writing": gone}}}
             db.commit()
         assert client.put(f"/api/mock-exams/{mock['id']}/writing", headers=headers, json={"answer": "{}"}).status_code == 409
+
+
+def test_plan_update_notice_survives_any_marking_path():
+    with TestClient(app) as client:
+        headers = auth(client, "uc7.notice@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        take_written(client, headers, mock["id"])
+        speak_mock(client, headers, mock["id"])  # speaking last: marked when it finishes
+        view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
+        assert view["status"] == "SUBMITTED" and view["adaptation"]["outcome"] == "PROPOSED" and view["adaptation"]["plan_id"]
+        assert client.get("/api/mock-exams", headers=headers).json()[0]["adaptation"]["plan_id"] == view["adaptation"]["plan_id"]

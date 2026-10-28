@@ -1049,7 +1049,7 @@ def mock_view(exam: MockExam, db: Session):
     timing = None
     if mock_timing.is_timed(exam.sections):
         timing = mock_timing.view(exam.sections, exam.sections["timing"], datetime.now(timezone.utc), bool(parse_json(answers.get("speaking", "")).get("transcript")))
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "timing": timing, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"), "report_id": exam.sections.get("report_id"),
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "timing": timing, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"), "report_id": exam.sections.get("report_id"), "adaptation": exam.sections.get("adaptation"),
             "duration_seconds": sum(exam.sections[skill].get("duration_seconds", 0) for skill in SKILLS if skill in exam.sections),
             "sections": sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
@@ -1297,10 +1297,11 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
     db.commit()
     if package.state == "RELEASED":
         report_after_mock(db, exam)
-    view = mock_view(exam, db)
     if package.state == "RELEASED":
-        view["adaptation"] = adapt_after_major_assessment(db, user)
-    return view
+        # UC7: keep the outcome with the mock so every view shows it, however the mock was marked.
+        exam.sections = {**exam.sections, "adaptation": adapt_after_major_assessment(db, user)}
+        db.commit()
+    return mock_view(exam, db)
 
 
 def report_after_mock(db: Session, exam: MockExam) -> int | None:
