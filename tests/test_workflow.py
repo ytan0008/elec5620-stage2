@@ -868,3 +868,33 @@ def test_blank_answers_do_not_block_a_mock_only_the_speaking_test_does():
             row.created_at = row.created_at - timedelta(hours=4)
             db.commit()
         assert client.get(f"/api/mock-exams/{overdue['id']}", headers=headers).json()["status"] == "SUBMITTED"
+
+
+def test_verified_mock_generates_its_performance_report(monkeypatch):
+    import backend.agents as agents_module
+    with TestClient(app) as client:
+        headers = auth(client, "mock.report@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        done = complete_mock(client, headers)
+        assert done["result"]["state"] == "RELEASED" and done["report_id"]
+        report = next(r for r in client.get("/api/reports", headers=headers).json() if r["id"] == done["report_id"])
+        assert report["result"]["state"] == "RELEASED"
+        payload = report["result"]["payload"]
+        assert payload["trigger"] == {"kind": "mock_exam", "mock_id": done["id"]}
+        assert {"listening", "reading", "writing", "speaking"} <= set(payload["skill_scores"])  # the mock is in the report
+        # A held mock gets its report only when the teacher releases the result.
+        real_feedback = agents_module.LLMProviderAdapter.feedback
+        def no_speaking(self, exam, skill, *args, **kwargs):
+            if skill == "speaking":
+                raise TimeoutError("scoring service down")
+            return real_feedback(self, exam, skill, *args, **kwargs)
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "feedback", no_speaking)
+        held = complete_mock(client, headers)
+        assert held["result"]["state"] != "RELEASED" and held["report_id"] is None
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        case = next(c for c in client.get("/api/instructor/cases", headers=instructor).json() if c["package"]["id"] == held["result"]["id"])
+        approved = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=instructor, json={"decision": "approve", "note": "Speaking re-checked by hand."})
+        assert approved.status_code == 200, approved.text
+        after = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
+        assert after["result"]["state"] == "RELEASED" and after["report_id"]

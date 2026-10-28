@@ -28,6 +28,10 @@ function Results({ exam }: { exam: Mock }) {
     {exam.adaptation?.plan_id && <div className="panel panel-cyan flex flex-wrap items-center justify-between gap-3 p-5" role="status"><p className="font-read">Your mock results changed what we suggest you study. A plan update is ready for your review.</p><Link to="/plans" className="btn-primary">Review plan update</Link></div>}
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{Object.entries(p.section_scores || {}).map(([skill, score]) => <ScoreBar key={skill} label={skill} score={Number(score)} max={max} />)}</div>
     <Insights p={p} />
+    <div className="panel panel-flat flex flex-wrap items-center justify-between gap-3 p-5">
+      <p className="font-read text-sm text-mist">{exam.report_id ? 'Your full performance report has been updated with this mock: all four skills, trends over time and what to focus on next.' : 'See how this mock fits into your progress across all your verified results.'}</p>
+      <Link to={exam.report_id ? `/analytics?report=${exam.report_id}` : '/analytics'} className="btn-primary">View full report <ChevronRight size={16} /></Link>
+    </div>
     {details.listening && <div className="panel p-6">
       <div className="flex flex-wrap gap-2">{SECTIONS.map(s => <button key={s} className={open === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setOpen(s)}>{nice(s)}</button>)}</div>
       <div className="mt-5 space-y-4 font-read">

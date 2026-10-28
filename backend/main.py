@@ -1055,7 +1055,7 @@ def mock_view(exam: MockExam, db: Session):
         if skill in ("listening", "reading") and "sections" in section and exam.status == "IN_PROGRESS":
             section = strip_answers(section)
         sections[skill] = section
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"),
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"), "report_id": exam.sections.get("report_id"),
             "duration_seconds": sum(exam.sections[skill].get("duration_seconds", 0) for skill in SKILLS if skill in exam.sections),
             "sections": sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
@@ -1232,10 +1232,29 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
         notebook.record_feedback(db, user.id, details["speaking"], "speaking", f"Mock #{exam.id}")
         notebook.remember(db, user.id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {overall}; sections {scores}", key="progress:mock", source="assessment")
     db.commit()
+    if package.state == "RELEASED":
+        report_after_mock(db, exam)
     view = mock_view(exam, db)
     if package.state == "RELEASED":
         view["adaptation"] = adapt_after_major_assessment(db, user)
     return view
+
+
+def report_after_mock(db: Session, exam: MockExam) -> int | None:
+    """UC5 success condition: once the mock result is verified, the Assessment & Analytics agent generates the
+    comprehensive performance report (UC6) that includes it. A failure here never affects the saved mock result."""
+    try:
+        target = db.scalar(select(Profile.target_score).where(Profile.user_id == exam.user_id))
+        report = build_report(db, AgentRuntime(db), exam.user_id, exam.exam, target, {"kind": "mock_exam", "mock_id": exam.id})
+        if report:
+            exam.sections = {**exam.sections, "report_id": report.id}
+        db.commit()
+        return report.id if report else None
+    except Exception as exc:
+        db.rollback()
+        db.add(AuditLog(user_id=exam.user_id, action="mock_report_failed", detail={"exam_id": exam.id, "error_type": type(exc).__name__}))
+        db.commit()
+        return None
 
 
 def adapt_after_major_assessment(db: Session, user: User) -> dict | None:
@@ -1271,29 +1290,42 @@ def analytics(user: User = Depends(learner), db: Session = Depends(get_db)):
     return progress
 
 
+def build_report(db: Session, runtime: AgentRuntime, user_id: int, exam: str, target: float | None, trigger: dict | None = None) -> PerformanceReport | None:
+    """UC6: the Assessment & Analytics agent analyses verified results and writes the report; the Quality Manager checks it.
+    Returns None when there is no verified result yet (2a)."""
+    data = runtime.assessment.analyse_progress(user_id)
+    if data["sample_count"] == 0:
+        return None
+    data["target_score"] = target
+    if trigger:
+        data["trigger"] = trigger
+    data = runtime.assessment.write_report(user_id, exam, data)
+    package = runtime.verify_output(user_id, "report", data)
+    report = PerformanceReport(user_id=user_id, package_id=package.id)
+    db.add(report)
+    db.flush()
+    return report
+
+
 @app.post("/api/reports")
 def create_report(user: User = Depends(learner), db: Session = Depends(get_db)):
     runtime = AgentRuntime(db)
     profile = profile_for(db, user)
     try:
-        data = runtime.assessment.analyse_progress(user.id)
+        report = build_report(db, runtime, user.id, profile.exam, profile.target_score)
     except Exception:
         db.rollback()
         raise HTTPException(503, "The report cannot be completed right now (analysis failed). Your results are safe; please try again later.")  # 3a
-    if data["sample_count"] == 0:
+    if report is None:
         raise HTTPException(409, "Complete practice before generating a report")  # 2a
-    data["target_score"] = profile.target_score
-    data = runtime.assessment.write_report(user.id, profile.exam, data)
-    package = runtime.verify_output(user.id, "report", data)
-    report = PerformanceReport(user_id=user.id, package_id=package.id)
-    db.add(report)
     db.commit()
-    return {"id": report.id, "result": package_view(package)}
+    return {"id": report.id, "result": package_view(db.get(ResultPackage, report.package_id))}
 
 
 @app.get("/api/reports")
 def reports(user: User = Depends(learner), db: Session = Depends(get_db)):
-    return [{"id": report.id, "result": package_view(db.get(ResultPackage, report.package_id))} for report in db.scalars(select(PerformanceReport).where(PerformanceReport.user_id == user.id).order_by(PerformanceReport.id.desc()))]
+    return [{"id": report.id, "created_at": report.created_at, "result": package_view(db.get(ResultPackage, report.package_id))}
+            for report in db.scalars(select(PerformanceReport).where(PerformanceReport.user_id == user.id).order_by(PerformanceReport.id.desc()))]
 
 
 @app.get("/api/materials")
@@ -1478,6 +1510,10 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
             plan.content = package.payload
             plan.status = "PROPOSED"
     db.commit()
+    if package.kind == "mock_exam" and package.state == "RELEASED":
+        mock = db.scalar(select(MockExam).where(MockExam.package_id == package.id))
+        if mock:
+            report_after_mock(db, mock)  # the report follows the teacher-approved mock result
     return {"status": case.status, "package": package_view(package, True)}
 
 

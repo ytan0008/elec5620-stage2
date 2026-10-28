@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Activity, AlertTriangle, ArrowRight, Minus, TrendingDown, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
@@ -217,6 +217,14 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
   const reports = useLoad<{ id: number; result: Result }[]>('/reports')
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState<Result | null>(null)
+  const [params] = useSearchParams()
+  const reportPanel = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    // "View full report" from a mock result opens the report generated for it.
+    const id = Number(params.get('report'))
+    const found = id && reports.data?.find(r => r.id === id)
+    if (found) { setOpen(found.result); window.setTimeout(() => reportPanel.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 150) }
+  }, [reports.data])
   const generate = async () => { setBusy(true); try { await post('/reports'); reports.reload(); notify('Verified report saved') } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
   // UC6 2b/8a: the data could not be loaded; nothing is lost and the learner can try again.
   if (error && !data) return <div className="panel panel-sun mx-auto mt-10 max-w-xl space-y-4 p-7 text-center anim-pop" role="alert">
@@ -246,9 +254,16 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
         {data.repeated_errors?.length > 0 && <div className="mt-4 space-y-1">{data.repeated_errors.map((r: any) => <p key={r.issue} className="font-read text-sm text-mist">▸ {r.issue} ×{r.count}</p>)}</div>}
         <div className="mt-5 space-y-2">{data.recommendations?.map((r: string) => <p key={r} className="tile font-read text-sm">{r}</p>)}</div>
         {data.sample_count > 0 && <Link to="/materials?recommend=1" className="btn-cyan mt-4 inline-flex">Recommended for me <Sparkles size={15} /></Link>}</div>
-      <div className="panel p-6"><h2 className="section-title">Saved reports</h2><div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <button key={r.id} onClick={() => setOpen(r.result)} className="tile flex w-full items-center justify-between font-pixel"><span>Report #{r.id}</span><Status value={r.result.state} /></button>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
-        {open?.payload && <div className="mt-4 tile space-y-1 font-read text-sm"><p>{open.payload.summary}</p>
+      <div ref={reportPanel} className="panel p-6"><h2 className="section-title">Saved reports</h2><div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <button key={r.id} onClick={() => setOpen(r.result)} className="tile flex w-full items-center justify-between font-pixel"><span>Report #{r.id}</span><Status value={r.result.state} /></button>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
+        {open && !open.payload && <p className="mt-4 tile font-read text-sm text-sun">This report is being double-checked before it is shown.</p>}
+        {open?.payload && <div className="mt-4 tile space-y-1 font-read text-sm">
+          {open.payload.trigger?.kind === 'mock_exam' && <p className="font-pixel text-xs text-cyan">Generated after mock #{open.payload.trigger.mock_id}</p>}
+          <p>{open.payload.summary}</p>
           {open.payload.readiness && <p className="text-cyan">Readiness: {open.payload.readiness}{open.payload.readiness_note ? ` · ${open.payload.readiness_note}` : ''}</p>}
+          {open.payload.skill_scores && <p>Skills: {Object.entries(open.payload.skill_scores).map(([k, v]) => `${nice(k)} ${v}`).join(' · ')}</p>}
+          {open.payload.strengths?.length > 0 && <p className="text-lime">Strengths: {open.payload.strengths.map(nice).join(', ')}</p>}
+          {open.payload.weaknesses?.length > 0 && <p className="text-sun">To improve: {open.payload.weaknesses.map(nice).join(', ')}</p>}
+          {open.payload.trends && Object.keys(open.payload.trends).length > 0 && <p className="text-mist">Trends: {Object.entries(open.payload.trends).map(([k, t]: [string, any]) => `${nice(k)} ${t.direction}`).join(' · ')}</p>}
           {open.payload.recommendations?.map((r: string) => <p key={r} className="text-mist">▸ {r}</p>)}
           {open.payload.recommendations_unavailable && <p className="text-sun">Recommendations were temporarily unavailable for this report. Generate a new report later to get them.</p>}</div>}</div>
     </div>
