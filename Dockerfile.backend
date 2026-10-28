@@ -2,6 +2,12 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Offline speech recognition model (Whisper base.en, ~140 MB), baked into the image so answers are recognised without internet.
+# Falls back to a mirror; if both fail, the model is downloaded on first use instead.
+ENV HF_HUB_DISABLE_TELEMETRY=1 HF_HUB_DISABLE_SYMLINKS_WARNING=1
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='/app/models')" \
+ || HF_ENDPOINT=https://hf-mirror.com python -c "from faster_whisper import WhisperModel; WhisperModel('base.en', device='cpu', compute_type='int8', download_root='/app/models')" \
+ || echo "Speech model not downloaded now; it will be fetched on first use"
 COPY backend ./backend
 COPY migrations ./migrations
 COPY alembic.ini .

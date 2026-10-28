@@ -3,12 +3,14 @@ import { Keyboard, Mic, MicOff, Play, RotateCcw, Square, Volume2 } from 'lucide-
 import { Result, SpeakingView, health, post, request } from '../api'
 import { PixelAvatar, personaName } from '../pixel/Avatar'
 import { moodFor, usePersona } from '../persona'
-import { Listener, listen, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
+import { Listener, listen, monitorLevel, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
 import { Countdown, FeedbackPanel, Notify, clock } from '../ui'
 import { useExamLock } from '../examLock'
 
 type Props = { notify: Notify; mockId?: number; questionId?: string | null; onSaved?: () => void; onResult?: (result: Result) => void }
-const SILENCE: Record<string, number> = { p2_talk: 6500, repeat: 2200, interview: 4000 }
+const SILENCE: Record<string, number> = { p2_talk: 7000, repeat: 2500, interview: 4500 }
+const DEFAULT_SILENCE = 4000 // Part 1 and Part 3
+const MIN_ANSWER_MS = 1500 // never send before this much of the answer has been heard
 const CAP: Record<string, number> = { p2_talk: 120, repeat: 15, interview: 45 }
 
 export default function SpeakingStudio({ notify, mockId, questionId, onSaved, onResult }: Props) {
@@ -24,7 +26,13 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const [metrics, setMetrics] = useState<Record<string, number> | null>(null)
   const [handsFree, setHandsFree] = useState(prefs.handsFree)
   const [serverStt, setServerStt] = useState(false)
+  // 'server' records the answer and recognises it on our server (offline Whisper or cloud); 'browser' uses the browser's online service.
+  const [mode, setMode] = useState<'server' | 'browser' | 'none'>(recognitionSupported() ? 'browser' : 'none')
+  const [level, setLevel] = useState(0)
   const [error, setError] = useState('')
+  const modeRef = useRef(mode)
+  const stopLevel = useRef<(() => void) | null>(null)
+  const finishing = useRef(false)
   const sessionRef = useRef<SpeakingView | null>(null)
   const listener = useRef<Listener | null>(null)
   const textRef = useRef({ final: '', interim: '' })
@@ -32,13 +40,13 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const silenceTimer = useRef(0)
   const tickTimer = useRef(0)
   const recorder = useRef<{ stop: () => Promise<Blob> } | null>(null)
-  const sttRecorder = useRef<{ stop: () => Promise<Blob> } | null>(null)
+  const sttRecorder = useRef<{ stop: () => Promise<Blob>; stream: MediaStream } | null>(null)
   const alive = useRef(true)
-  const supported = recognitionSupported()
   useExamLock(`speaking-${mockId ?? 'practice'}`, session?.status === 'ACTIVE')
 
-  useEffect(() => { health().then(h => setServerStt(h.server_stt)).catch(() => {}) }, [])
-  useEffect(() => () => { alive.current = false; listener.current?.abort(); stopSpeaking(); window.clearTimeout(silenceTimer.current); window.clearInterval(tickTimer.current); void recorder.current?.stop() }, [])
+  const chooseMode = (next: 'server' | 'browser' | 'none') => { modeRef.current = next; setMode(next) }
+  useEffect(() => { health().then(h => { setServerStt(h.server_stt); if (h.server_stt) chooseMode('server') }).catch(() => {}) }, [])
+  useEffect(() => () => { alive.current = false; listener.current?.abort(); stopSpeaking(); stopLevel.current?.(); window.clearTimeout(silenceTimer.current); window.clearInterval(tickTimer.current); void recorder.current?.stop(); void sttRecorder.current?.stop() }, [])
 
   const stage = session?.ui.stage || 'intro'
   const lastExaminer = [...(session?.log || [])].reverse().find(item => item.role === 'examiner')
@@ -52,7 +60,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const afterSpeech = (view: SpeakingView) => {
     if (view.ui.stage === 'p2_prep') { setPrep(true); return }
     if (view.ui.stage === 'done' || view.status !== 'ACTIVE') { void finish(); return }
-    if (prefs.handsFree && supported) startListening()
+    if (prefs.handsFree && modeRef.current !== 'none') startListening()
   }
 
   const begin = async () => {
@@ -66,6 +74,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   }
 
   const startListening = () => {
+    if (modeRef.current === 'server') { void startServerAnswer(); return }
     if (listener.current || !sessionRef.current) return
     stopSpeaking()
     textRef.current = { final: '', interim: '' }
@@ -73,7 +82,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     started.current = Date.now()
     const current = sessionRef.current.ui.stage
     const cap = CAP[current] || 75
-    const silence = SILENCE[current] || 2600
+    const silence = SILENCE[current] || DEFAULT_SILENCE
     tickTimer.current = window.setInterval(() => {
       const secs = Math.round((Date.now() - started.current) / 1000)
       setElapsed(secs)
@@ -85,10 +94,64 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
         textRef.current = { final, interim }
         setCaption(`${final} ${interim}`.trim())
         window.clearTimeout(silenceTimer.current)
-        silenceTimer.current = window.setTimeout(() => { if (`${textRef.current.final}${textRef.current.interim}`.trim()) void finishAnswer() }, silence)
+        silenceTimer.current = window.setTimeout(() => { if (`${textRef.current.final}${textRef.current.interim}`.trim() && Date.now() - started.current > MIN_ANSWER_MS) void finishAnswer() }, silence)
       },
-      onError: message => { setError(message); stopListening() },
+      onError: message => {
+        stopListening()
+        // The browser's recognition runs on an online service; when it cannot be reached, switch to recognition on our server.
+        if (/network|service-not-allowed|not available/i.test(message) && serverStt) {
+          chooseMode('server'); setError('')
+          notify("Your browser's speech service is unreachable, so answers are now recognised offline on the server.")
+          void startServerAnswer()
+          return
+        }
+        setError(message)
+      },
     })
+  }
+
+  /* Server recognition: record until the learner pauses (or presses "I've finished"), then transcribe the whole answer. */
+  const startServerAnswer = async () => {
+    if (sttRecorder.current || !sessionRef.current) return
+    stopSpeaking()
+    const current = sessionRef.current.ui.stage
+    const cap = CAP[current] || 75
+    const silence = SILENCE[current] || DEFAULT_SILENCE
+    let rec: { stop: () => Promise<Blob>; stream: MediaStream }
+    try { rec = await recordMicrophone() } catch (e) { setError(`Microphone unavailable: ${(e as Error).message}. Allow microphone access or type your answer.`); return }
+    sttRecorder.current = rec
+    finishing.current = false
+    started.current = Date.now()
+    setCaption(''); setElapsed(0); setError(''); setListening(true)
+    let heard = false, lastVoice = Date.now(), floor = 0.01
+    stopLevel.current = monitorLevel(rec.stream, value => {
+      setLevel(value)
+      if (value > Math.max(0.02, floor * 2.5)) { heard = true; lastVoice = Date.now() }
+      else if (!heard) floor = floor * .9 + value * .1 // learn the room's background noise before the learner starts
+      if (heard && Date.now() - lastVoice > silence && Date.now() - started.current > MIN_ANSWER_MS) void finishServerAnswer()
+    })
+    tickTimer.current = window.setInterval(() => {
+      const secs = Math.round((Date.now() - started.current) / 1000)
+      setElapsed(secs)
+      if (secs >= cap) void finishServerAnswer()
+    }, 500)
+  }
+  const finishServerAnswer = async () => {
+    if (!sttRecorder.current || finishing.current) return
+    finishing.current = true
+    const rec = sttRecorder.current
+    const seconds = (Date.now() - started.current) / 1000
+    stopLevel.current?.(); stopLevel.current = null
+    window.clearInterval(tickTimer.current)
+    const blob = await rec.stop()
+    sttRecorder.current = null
+    setListening(false); setLevel(0); setThinking(true)
+    try {
+      const text = (await transcribeOnServer(blob)).trim()
+      setThinking(false)
+      if (!text) { notify("I didn't catch that — please answer again.", 'error'); if (prefs.handsFree) void startServerAnswer(); return }
+      await sendTurn(text, seconds)
+    } catch (e) { setThinking(false); setError(`${(e as Error).message}. Try again or type your answer.`) }
   }
   const stopListening = () => {
     listener.current?.stop(); listener.current = null
@@ -105,7 +168,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
       apply(next)
       setThinking(false)
       void say(next.reply || '', next)
-    } catch (e) { setThinking(false); notify((e as Error).message, 'error'); if (prefs.handsFree && supported) startListening() }
+    } catch (e) { setThinking(false); notify((e as Error).message, 'error'); if (prefs.handsFree && modeRef.current !== 'none') startListening() }
   }
   const finishAnswer = async () => {
     if (!listener.current) return
@@ -117,16 +180,6 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     await sendTurn(text, seconds)
   }
   const sendTyped = async () => { const text = typed.trim(); if (!text) return; setTyped(''); await sendTurn(text, Math.max(5, text.split(/\s+/).length / 2.2)) }
-  const serverRecord = async () => {
-    if (sttRecorder.current) {
-      const blob = await sttRecorder.current.stop(); sttRecorder.current = null; setListening(false)
-      const seconds = (Date.now() - started.current) / 1000
-      setThinking(true)
-      try { const text = await transcribeOnServer(blob); setThinking(false); await sendTurn(text, seconds) } catch (e) { setThinking(false); notify((e as Error).message, 'error') }
-      return
-    }
-    try { sttRecorder.current = await recordMicrophone(); started.current = Date.now(); setListening(true) } catch (e) { notify(`Microphone unavailable: ${(e as Error).message}`, 'error') }
-  }
   const startLongTurn = async () => {
     const view = sessionRef.current
     if (!view) return
@@ -140,6 +193,8 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     const view = sessionRef.current
     if (!view) return
     stopListening()
+    stopLevel.current?.(); stopLevel.current = null
+    if (sttRecorder.current) { void sttRecorder.current.stop(); sttRecorder.current = null }
     setThinking(true)
     try {
       const blob = await recorder.current?.stop()
@@ -168,7 +223,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
       <span className="eyebrow">Live speaking examiner</span>
       <h2 className="heading text-3xl">Talk with {personaName(persona)}</h2>
       <p className="font-read text-mist">{personaName(persona)} runs a complete speaking test out loud: {mockId ? 'the speaking section of your mock exam' : 'IELTS Part 1 interview, Part 2 cue card (1 minute to prepare, 2 minutes to talk) and Part 3 discussion — or the TOEFL 2026 Listen & Repeat and Interview tasks'}. Answer with your microphone; your session is recorded for replay.</p>
-      {!supported && <p className="tile font-read text-sm text-sun">This browser has no built-in speech recognition. {serverStt ? 'Use the record button (cloud transcription) or type your answers.' : 'Use Chrome or Edge for voice, or type your answers.'}</p>}
+      {mode === 'none' && <p className="tile font-read text-sm text-sun">Speech recognition is not available here, so please type your answers. (Ask your teacher to enable server speech recognition.)</p>}
       {error && <p role="alert" className="font-read text-rose">{error}</p>}
       <button className="btn-primary" onClick={begin}><Play size={17} /> Start speaking test</button>
     </div>
@@ -178,13 +233,14 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     <aside className="panel panel-hot flex flex-col items-center gap-4 p-6 lg:sticky lg:top-24 lg:self-start">
       <PixelAvatar persona={persona} mood={mood} size={190} />
       <div className="text-center"><p className="font-arcade text-[11px] text-magenta">{session.ui.part}</p>{session.ui.progress && <p className="mt-2 font-pixel text-mist">{session.ui.progress}</p>}</div>
-      {listening && <div className="text-center"><p className="font-pixel text-cyan">Listening…</p><p className="num text-4xl text-cyan">{capFor ? clock(Math.max(0, capFor - elapsed)) : clock(elapsed)}</p></div>}
+      {listening && <div className="w-full text-center"><p className="font-pixel text-cyan">Listening…</p><p className="num text-4xl text-cyan">{capFor ? clock(Math.max(0, capFor - elapsed)) : clock(elapsed)}</p>
+        {mode === 'server' && <><div className="mx-auto mt-2 h-2 w-40 bg-abyss" aria-label="Microphone level"><div className="h-2 bg-lime transition-[width] duration-100" style={{ width: `${Math.min(100, Math.round(level * 900))}%` }} /></div>
+          <p className="mt-2 font-read text-xs text-mist">Speak naturally. Your answer is sent after a pause of {Math.round((SILENCE[stage] || DEFAULT_SILENCE) / 1000)} seconds, or press “I've finished”.</p></>}</div>}
       {stage === 'p2_talk' && !listening && <p className="font-read text-xs text-mist">Speak for up to two minutes.</p>}
       {session.status === 'ACTIVE' && !prep && <div className="flex w-full flex-col gap-2">
-        {supported ? (listening
-          ? <button className="btn-danger" onClick={finishAnswer}><Square size={16} /> I've finished</button>
-          : <button className="btn-cyan" disabled={aiSpeaking || thinking} onClick={startListening}><Mic size={17} /> Answer</button>)
-          : serverStt && <button className={sttRecorder.current ? 'btn-danger' : 'btn-cyan'} disabled={aiSpeaking || thinking} onClick={serverRecord}>{sttRecorder.current ? <><Square size={16} /> Stop & send</> : <><Mic size={17} /> Record answer</>}</button>}
+        {mode !== 'none' && (listening
+          ? <button className="btn-danger" onClick={() => void (mode === 'server' ? finishServerAnswer() : finishAnswer())}><Square size={16} /> I've finished</button>
+          : <button className="btn-cyan" disabled={aiSpeaking || thinking} onClick={startListening}><Mic size={17} /> Answer</button>)}
         {!mockId && lastExaminer && !hideText(lastExaminer) && <button className="btn-secondary" disabled={aiSpeaking || listening} onClick={() => speak(lastExaminer.text, persona, { force: true })}><Volume2 size={16} /> Repeat question</button>}
         <button className="btn-ghost justify-center" onClick={toggleHandsFree}>{handsFree ? <Mic size={14} /> : <MicOff size={14} />} Hands-free {handsFree ? 'on' : 'off'}</button>
       </div>}
