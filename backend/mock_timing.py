@@ -58,7 +58,8 @@ def _close_current(timing: dict, at: datetime) -> dict:
     current = timing["current"]
     closed = [*timing["closed"], current]
     following = [skill for skill in WRITTEN if skill not in closed]
-    return {**timing, "closed": closed, "current": following[0] if following else None, "current_started": at.isoformat() if following else None}
+    return {**timing, "closed": closed, "closed_at": {**timing.get("closed_at", {}), current: at.isoformat()},
+            "current": following[0] if following else None, "current_started": at.isoformat() if following else None}
 
 
 def start_written(timing: dict, now: datetime) -> dict:
@@ -92,9 +93,10 @@ def can_edit(sections: dict, skill: str, now: datetime) -> bool:
     timing = sections["timing"]
     if timing.get("current") == skill:
         return now <= section_deadline(sections, timing) + SAVE_GRACE
-    # The autosave of a section that has just closed may arrive a moment late.
-    if skill in timing.get("closed", []) and timing["closed"][-1] == skill and timing.get("current_started"):
-        return now <= _at(timing["current_started"]) + SAVE_GRACE
+    # The autosave of the section that has just closed may arrive a moment late (also for Writing, the last one).
+    closed_at = (timing.get("closed_at") or {}).get(skill)
+    if closed_at and timing["closed"] and timing["closed"][-1] == skill:
+        return now <= _at(closed_at) + SAVE_GRACE
     return False
 
 

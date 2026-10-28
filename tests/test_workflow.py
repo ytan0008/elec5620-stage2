@@ -1021,3 +1021,34 @@ def test_toefl_mock_keeps_one_sitting():
         mock = client.post("/api/mock-exams", headers=headers).json()
         assert mock["timing"] is None  # TOEFL 2026 speaking is part of the same sitting
         assert client.put(f"/api/mock-exams/{mock['id']}/reading", headers=headers, json={"answer": "{\"1\": \"B\"}"}).status_code == 200
+
+
+def test_last_autosave_of_a_closing_section_is_kept():
+    import json
+    from datetime import datetime, timedelta, timezone
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "last.autosave@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        client.post(f"/api/mock-exams/{mock['id']}/written/start", headers=headers)
+        client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers)
+        client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers)  # Writing is running
+        with SessionLocal() as db:  # Writing ran out of time 5 seconds ago
+            row = db.get(MockExam, mock["id"])
+            started = datetime.now(timezone.utc) - timedelta(seconds=row.sections["writing"]["duration_seconds"] + 5)
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current_started": started.isoformat()}}
+            db.commit()
+        essay = {"task2": "My final sentence typed just before the time ran out."}
+        late = client.put(f"/api/mock-exams/{mock['id']}/writing", headers=headers, json={"answer": json.dumps(essay)})
+        assert late.status_code == 200, late.text  # within the grace period: nothing typed is lost
+        view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
+        assert view["timing"]["written_done"] and json.loads(view["answers"]["writing"]) == essay
+        with SessionLocal() as db:  # well after the grace period the section stays closed
+            row = db.get(MockExam, mock["id"])
+            gone = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "closed_at": {**row.sections["timing"]["closed_at"], "writing": gone}}}
+            db.commit()
+        assert client.put(f"/api/mock-exams/{mock['id']}/writing", headers=headers, json={"answer": "{}"}).status_code == 409
