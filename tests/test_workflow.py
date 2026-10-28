@@ -652,3 +652,108 @@ def test_cloud_agent_loop_calls_tools_then_submits_structured_result():
     finally:
         db.rollback()
         db.close()
+
+
+def complete_mock(client, headers):
+    import json
+    mock = client.post("/api/mock-exams", headers=headers).json()
+    tasks = {task["task"]: "I think remote work offers meaningful flexibility while teams need clear routines to collaborate effectively." for task in mock["sections"]["writing"]["tasks"]}
+    for skill, answer in {"reading": {"1": "TRUE"}, "listening": {"1": "Kowalski"}, "writing": tasks}.items():
+        assert client.put(f"/api/mock-exams/{mock['id']}/{skill}", headers=headers, json={"answer": json.dumps(answer)}).status_code == 200
+    speak_mock(client, headers, mock["id"])
+    done = client.post(f"/api/mock-exams/{mock['id']}/submit", headers=headers)
+    assert done.status_code == 200, done.text
+    return done.json()
+
+
+def test_unfinished_mock_is_recorded_incomplete():
+    import json
+    from datetime import timedelta
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "incomplete.mock@example.com")
+        active_plan(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        assert client.put(f"/api/mock-exams/{mock['id']}/reading", headers=headers, json={"answer": json.dumps({"1": "TRUE"})}).status_code == 200
+        assert client.put(f"/api/mock-exams/{mock['id']}/listening", headers=headers, json={"answer": json.dumps({})}).status_code == 200  # empty sheet
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 423  # locked while running
+        ended = client.post(f"/api/mock-exams/{mock['id']}/end", headers=headers, json={"reason": "learner"}).json()
+        assert ended["status"] == "INCOMPLETE" and ended["result"] is None
+        assert ended["ended"]["reason"] == "ended by learner" and ended["ended"]["completed"] == ["reading"]
+        assert set(ended["ended"]["missing"]) == {"listening", "writing", "speaking"}
+        assert client.post(f"/api/mock-exams/{mock['id']}/submit", headers=headers).status_code == 409
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 200  # lock released
+        # A mock abandoned past its time is closed as incomplete when the learner returns.
+        overdue = client.post("/api/mock-exams", headers=headers).json()
+        with SessionLocal() as db:
+            row = db.get(MockExam, overdue["id"])
+            row.created_at = row.created_at - timedelta(hours=4)
+            db.commit()
+        reopened = client.get(f"/api/mock-exams/{overdue['id']}", headers=headers).json()
+        assert reopened["status"] == "INCOMPLETE" and reopened["ended"]["reason"] == "time expired"
+
+
+def test_mock_result_compares_with_previous_and_explains_readiness():
+    with TestClient(app) as client:
+        headers = auth(client, "mock.insights@example.com")
+        active_plan(client, headers)
+        first = complete_mock(client, headers)["result"]["payload"]
+        assert first["readiness_detail"]["trend"].startswith("This is your first mock")
+        assert first["readiness"] in ("On track", "Close to target", "Needs further practice")
+        assert first["confidence"]["listening"] == .95 and 0 < first["confidence"]["writing"] <= 1
+        second = complete_mock(client, headers)
+        payload = second["result"]["payload"]
+        assert payload["comparison"]["against"].startswith(f"Mock #{second['id'] - 1}")
+        assert set(payload["comparison"]["skills"]) == {"listening", "reading", "writing", "speaking"}
+        assert payload["comparison"]["overall_change"] == round(payload["estimated_overall"] - first["estimated_overall"], 1)
+        strong = {item["skill"] for item in payload["strengths"]}
+        weak = {item["skill"] for item in payload["weaknesses"]}
+        assert not strong & weak and weak  # target 7 is above these scores, so there are weaknesses
+        assert payload["persistent_issues"]  # the same writing issues appeared in the first mock
+        assert str(payload["readiness_detail"]["target"]) in payload["readiness_detail"]["explanation"]
+
+
+def test_strengths_and_weaknesses_never_overlap():
+    from backend.main import split_skills
+    strong, weak = split_skills({"writing": 6.0}, 7.0)
+    assert not strong and [w["skill"] for w in weak] == ["writing"]
+    strong, weak = split_skills({"writing": 7.5, "reading": 8.0}, 7.0)
+    assert [s["skill"] for s in strong] == ["reading"] and [w["skill"] for w in weak] == ["writing"]
+    strong, weak = split_skills({"writing": 7.0, "reading": 7.0}, 7.0)
+    assert [s["skill"] for s in strong] == ["reading", "writing"] and not weak
+
+
+def test_performance_report_trends_readiness_and_partial_report(monkeypatch):
+    import backend.agents as agents_module
+    with TestClient(app) as client:
+        headers = auth(client, "uc6.report@example.com")
+        active_plan(client, headers)
+        task = client.post("/api/practice/writing", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. Companies should allow it because workers save time."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": essay}).status_code == 200
+        first = client.get("/api/analytics", headers=headers).json()
+        assert not set(first["strengths"]) & set(first["weaknesses"])  # one skill is never both
+        assert first["weaknesses"] == ["writing"] and first["strengths"] == []  # far below the target of 7
+        assert first["trend_note"].startswith("Not enough results to show a trend")
+        assert first["readiness"] == "Insufficient data"
+        better = essay + " Moreover, flexible schedules can improve wellbeing, although managers need clear routines to keep teams connected."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": better}).status_code == 200
+        progress = client.get("/api/analytics", headers=headers).json()
+        trend = progress["trends"]["writing"]
+        assert trend["results"] == 2 and trend["direction"] in ("improving", "steady", "declining")
+        assert trend["change"] == round(trend["latest"] - trend["first"], 2)
+        assert progress["readiness"] in ("On track", "Close to target", "Needs further practice") and progress["readiness_note"]
+        assert any("writing" in tip.lower() for tip in progress["recommendations"])
+        report = client.post("/api/reports", headers=headers).json()["result"]
+        assert report["state"] == "RELEASED"
+        assert report["payload"]["readiness"] == progress["readiness"]  # the saved report agrees with the page
+        assert report["payload"]["trends"]["writing"]["direction"] == trend["direction"]
+
+        def broken(*args, **kwargs):
+            raise TimeoutError("model unavailable")
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "report", broken)
+        partial = client.post("/api/reports", headers=headers).json()["result"]
+        assert partial["state"] == "RELEASED"  # the verified analysis is still delivered (UC6 6a)
+        assert partial["payload"]["recommendations_unavailable"] is True and partial["payload"]["recommendations"] == []
+        assert "writing" in partial["payload"]["summary"]
