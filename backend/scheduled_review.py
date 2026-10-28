@@ -1,32 +1,31 @@
-"""Run daily via Task Scheduler or cron to propose weekly adaptations."""
+"""Run daily via Task Scheduler or cron: the UC7 weekly review, plus retries of failed agent notifications."""
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import select, func
-from backend.agents import AgentRuntime
+from sqlalchemy import select
+from backend import adaptation
 from backend.db import SessionLocal
 from backend.main import latest_progress, profile_data
-from backend.models import Plan, Profile, ResultPackage, AuditLog
+from backend.models import Plan, Profile
 
 
 def run():
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    proposed = 0
+    proposed = kept = 0
     with SessionLocal() as db:
         for active in db.scalars(select(Plan).where(Plan.status == "ACTIVE")).all():
-            existing = db.scalar(select(Plan.id).where(Plan.user_id == active.user_id, Plan.kind == "adaptation", Plan.created_at >= cutoff))
-            if existing or active.created_at.replace(tzinfo=timezone.utc) > cutoff:
+            if active.created_at.replace(tzinfo=timezone.utc) > cutoff or adaptation.reviewed_recently(db, active.user_id):
                 continue
             profile = db.scalar(select(Profile).where(Profile.user_id == active.user_id))
             if not profile:
                 continue
-            runtime = AgentRuntime(db)
-            state = runtime.plan_graph().invoke({"user_id": active.user_id, "workflow": "adaptation", "profile": profile_data(profile), "progress": latest_progress(db, active.user_id)})
-            package = db.get(ResultPackage, state["package_id"])
-            version = (db.scalar(select(func.max(Plan.version)).where(Plan.user_id == active.user_id)) or 0) + 1
-            db.add(Plan(user_id=active.user_id, version=version, kind="adaptation", status="PROPOSED" if package.state == "RELEASED" else "HELD", content=package.payload, package_id=package.id))
-            db.add(AuditLog(user_id=active.user_id, action="scheduled_adaptation_proposed", detail={"package_id": package.id}))
+            result = adaptation.propose(db, active.user_id, profile_data(profile), latest_progress(db, active.user_id), "weekly_review")
             db.commit()
-            proposed += 1
-    print(f"Created {proposed} weekly adaptation proposals")
+            if result["plan"]:
+                proposed += 1
+            else:
+                kept += 1  # not enough evidence, or the model failed twice: the learner keeps the existing plan and is told why
+        retried = adaptation.retry_pending_notifications(db)
+        db.commit()
+    print(f"Created {proposed} weekly adaptation proposals; kept {kept} existing plans; delivered {retried} pending agent notifications")
 
 
 if __name__ == "__main__":

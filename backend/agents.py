@@ -31,6 +31,7 @@ from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, Recommen
 from backend.onboarding import parse_demo_message
 from backend import content as bank
 from backend import local_tutor
+from backend import adaptation
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
@@ -58,6 +59,7 @@ class FlowState(TypedDict, total=False):
     source_mode: str
     regen_attempts: int
     can_regenerate: bool
+    generation_failed: bool
 
 
 @tool
@@ -357,7 +359,9 @@ class LLMProviderAdapter(LLMService):
                  "priorities": priorities, "activities": activities,
                  "changes": (["Increase practice on recent weak skills"] if adaptation else []) + ([f"Consider learner request: {change_request}"] if change_request else []), "confidence": {"plan": .87}}
         return self.structured(PlanOutput, "You are the Learning Coordinator. Propose actionable IELTS or TOEFL weekly study activities (skill, title, minutes_per_week, reason) whose minutes sum to the "
-                               "learner's weekly hours. Use the learner's earlier plan decisions and notebook patterns when they help. Return confidence as a self-reported heuristic, not a calibrated probability.",
+                               "learner's weekly hours. Use the learner's earlier plan decisions and notebook patterns when they help. Return confidence as a self-reported heuristic, not a calibrated probability. "
+                               "When adaptation is true, compare progress.current_plan with progress.skill_scores and progress.target_score, and return change_details: one {skill, reason} for each skill whose "
+                               "priority or weekly minutes you changed, with a reason that cites the learner's verified scores.",
                                {"profile": profile, "progress": progress, "adaptation": adaptation}, local, toolkit, scoring=True)
 
     def prompt(self, exam: str, skill: str, avoid: set[str] | None = None) -> dict:
@@ -477,13 +481,30 @@ class LearningCoordinatorAgent(Agent):
         t = time.perf_counter()
         self.event(state, "perception", {"exam": state["profile"]["exam"], "priorities": state["profile"]["priority_skills"]})
         kit = self.toolkit(state["user_id"], state["profile"]["exam"])
-        try:
-            output = self.llm.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation", kit).model_dump()
-        except Exception as exc:
-            output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": type(exc).__name__}
+        adapting = state["workflow"] == "adaptation"
+        output = None
+        for attempt in range(2 if adapting else 1):  # UC7 4a: when the model does not respond, retry once
+            try:
+                output = self.llm.plan(state["profile"], state.get("progress", {}), adapting, kit).model_dump()
+                break
+            except Exception as exc:
+                error = type(exc).__name__
+                self.event(state, "decision", {"decision": "plan generation failed", "attempt": attempt + 1, "error": error})
         kit.log(state["workflow"], self.llm.mode)
+        if output is None:
+            if adapting and not state.get("package_id"):  # 4a: nothing to check or release; the existing plan stays active
+                self.event(state, "handoff", {"decision": "keep existing plan", "reason": "adaptation could not be generated", "next_agent": "Learner"}, t)
+                return {"generation_failed": True}
+            output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": error}
         if output.get("priorities"):
-            request = state.get("progress", {}).get("change_request")
+            profile, progress = state["profile"], state.get("progress", {})
+            if adapting:  # UC7 step 3 and 4: which priorities should change, and why
+                derived = adaptation.describe_changes(progress.get("current_plan", {}), output, progress, progress.get("target_score"))
+                output["change_details"] = adaptation.merge_reasons(derived, output.get("change_details", []))
+                output["changes"] = adaptation.change_summaries(output["change_details"])
+                output["trigger"] = progress.get("trigger")
+            output["resources"] = adaptation.select_resources(self.db, state["user_id"], profile["exam"], output["priorities"], profile.get("proficiency"))  # step 5 / 5a
+            request = progress.get("change_request")
             agent_core.remember(self.db, self.memory_key, state["user_id"], f"Proposed {state['workflow']} plan '{output.get('title')}' with priorities {', '.join(output['priorities'][:4])}"
                                 + (f" after the learner asked: {request}" if request else "") + ".", data={"priorities": output["priorities"]})
         self.event(state, "handoff", {"decision": "submit proposed plan", "next_agent": "Quality Manager", "tool": "LLM adapter"}, t)
@@ -742,6 +763,8 @@ class OpsQualityManager(Agent):
                 issues.append("Criterion score outside exam scale")
         if workflow in ("plan", "adaptation") and (not payload.get("priorities") or not payload.get("activities") or not payload.get("rationale")):
             issues.append("Plan is incomplete")
+        if workflow == "adaptation" and any(not str(item.get("reason", "")).strip() for item in payload.get("change_details", []) if isinstance(item, dict)):
+            issues.append("Plan is incomplete: a major change has no rationale")
         # Items ranked by tags only (UC10 4a) deliberately carry no reason.
         if workflow == "recommendations" and (not payload.get("items") or any(not item.get("reason") and payload.get("basis") != "tags" for item in payload.get("items", []))):
             issues.append("Recommendation list is incomplete")
@@ -895,7 +918,7 @@ class AgentRuntime:
         graph.add_conditional_edges(START, lambda s: "request_insights" if s["workflow"] == "adaptation" else "coordinator", {"request_insights": "request_insights", "coordinator": "coordinator"})
         graph.add_edge("request_insights", "assessment_insights")
         graph.add_edge("assessment_insights", "coordinator")
-        graph.add_edge("coordinator", "quality")
+        graph.add_conditional_edges("coordinator", lambda s: "failed" if s.get("generation_failed") else "quality", {"failed": END, "quality": "quality"})
         graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait", "regenerate": "coordinator"})
         graph.add_edge("release", END)
         graph.add_edge("human_wait", END)

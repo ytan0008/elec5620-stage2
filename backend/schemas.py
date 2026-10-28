@@ -111,6 +111,7 @@ class PlanOutput(BaseModel):
     priorities: list[Skill] = Field(min_length=1)
     activities: list[dict] = Field(min_length=1)
     changes: list[str] = []
+    change_details: list[dict] = []
     confidence: dict[str, float]
 
 

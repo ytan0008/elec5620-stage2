@@ -25,6 +25,7 @@ function Results({ exam }: { exam: Mock }) {
       <div className="grid h-32 w-32 place-items-center bg-abyss" style={{ boxShadow: '0 0 0 4px #ff4fd8' }}><span className="num text-8xl text-magenta">{p.estimated_overall}</span></div>
       <div className="min-w-0 flex-1"><span className="eyebrow">Overall estimate · {p.score_scale}</span><p className="mt-3 font-pixel text-2xl">{p.readiness}</p><p className="mt-2 font-read text-sm text-mist">{p.summary}</p></div>
     </div>
+    {exam.adaptation?.plan_id && <div className="panel panel-cyan flex flex-wrap items-center justify-between gap-3 p-5" role="status"><p className="font-read">Your mock results changed what we suggest you study. A plan update is ready for your review.</p><Link to="/plans" className="btn-primary">Review plan update</Link></div>}
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{Object.entries(p.section_scores || {}).map(([skill, score]) => <ScoreBar key={skill} label={skill} score={Number(score)} max={max} />)}</div>
     {details.listening && <div className="panel p-6">
       <div className="flex flex-wrap gap-2">{SECTIONS.map(s => <button key={s} className={open === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setOpen(s)}>{nice(s)}</button>)}</div>

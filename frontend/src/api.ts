@@ -2,6 +2,8 @@ export type Persona = 'witch' | 'boy'
 export type User = { id: number; email: string; name: string; role: 'learner' | 'instructor'; avatar?: Persona; profile_complete?: boolean }
 export type Profile = { exam: 'IELTS' | 'TOEFL'; proficiency: string; target_score: number; exam_date: string; weekly_hours: number; priority_skills: string[] }
 export type Result = { id: number; kind: string; state: string; source_mode: string; issues: string[]; payload?: Record<string, any>; confidence?: Record<string, number>; message?: string; created_at: string }
+export type AdaptationOutcome = { outcome: string; plan_id: number | null; message: string | null }
+export type AdaptationNotice = { outcome: string; message: string; trigger: string | null; created_at: string | null }
 export type Plan = { id: number; version: number; kind: string; status: string; content?: Record<string, any>; created_at: string }
 export type Health = { status: string; mode: 'LOCAL' | 'REAL'; model: string; server_tts: boolean; server_stt: boolean }
 
@@ -16,7 +18,7 @@ export type WritingTask = { id: string; task: string; title: string; prompt: str
 export type SpeakingTest = Record<string, any>
 export type PracticePrompt = { title: string; text: string; mode: string; task_type?: string; duration_seconds: number; test?: any; task?: string; min_words?: number; chart?: Chart | null; content_id?: string }
 export type Practice = { id: number; skill: string; prompt: PracticePrompt }
-export type Mock = { id: number; exam: string; status: string; length: string; legacy: boolean; created_at: string; duration_seconds: number; sections: Record<string, any>; answers: Record<string, string>; result: Result | null }
+export type Mock = { id: number; exam: string; status: string; length: string; legacy: boolean; created_at: string; duration_seconds: number; sections: Record<string, any>; answers: Record<string, string>; result: Result | null; adaptation?: AdaptationOutcome | null }
 export type Event = { id: number; workflow: string; agent: string; phase: string; detail: Record<string, any>; mode: string; duration_ms: number; created_at: string }
 export type SpeakingView = { id: number; exam: string; status: string; practice_id: number | null; mock_id: number | null; persona: Persona; log: { role: string; text: string; stage?: string; part?: string; seconds?: number; repeat_accuracy?: number; repeat_target?: string; follow_up?: boolean }[]; ui: { part: string; stage: string; progress?: string; cue_card?: { topic: string; cue: string; bullets: string[]; closing: string }; timer?: { kind: string; seconds: number } }; test_title?: string; reply?: string; done?: boolean; result?: Result; metrics?: Record<string, number>; saved_to_mock?: boolean }
 

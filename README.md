@@ -181,7 +181,7 @@ After pulling changes that add database tables, run `alembic upgrade head` again
 | Area | What you get |
 |---|---|
 | **Onboarding** | Conversational setup assistant (voice or text) that captures exam, level, target, date, weekly hours and priority skills. Produces a quality-checked learning portrait. |
-| **Learning plan** | Weekly activities with a reason for each priority. You can accept, reject or request changes (for example "more speaking"). Plans adapt weekly to verified results. |
+| **Learning plan** | Weekly activities with a reason for each priority. You can accept, reject or request changes (for example "more speaking"). Plans adapt to verified results after your request, every week, or after a mock exam: each major change comes with a reason and study resources, and your current plan stays active until you accept (or when there is not enough data) |
 | **Listening** | IELTS Parts 1–4 and TOEFL 2026 tasks with multi-speaker scripts read aloud in distinct voices. Exam mode plays once; practice mode allows pause, replay and 0.8–1.3× speed. Form/note completion, multiple choice and matching. Marked against hidden keys, converted to a band, with a transcript that highlights where each answer is. |
 | **Reading** | Academic passages with TRUE/FALSE/NOT GIVEN, YES/NO/NOT GIVEN, matching headings, multiple choice and completion. TOEFL Complete-the-Words, daily-life and academic passages. Timer and evidence highlighting after marking. |
 | **Writing** | Task 1 with rendered bar/line/pie charts, Task 2 essays, TOEFL email and academic discussion. Timer, word count, autosaved drafts, criterion scores, sentence-level corrections, "level-up" rewrites, a model answer (REAL mode), revision history and a comparison with your previous attempt. |
@@ -330,7 +330,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 ## 11. Testing
 
 ```powershell
-# Backend: 20 tests (workflows, quality gate, agents' memory and tools, notebooks, console, exam lock)
+# Backend: 38 tests (workflows, quality gate, plan adaptation (UC7), agents' memory and tools, notebooks, console, exam lock)
 .\.venv\Scripts\python -m pytest tests -q
 
 # Frontend type-check and production build
