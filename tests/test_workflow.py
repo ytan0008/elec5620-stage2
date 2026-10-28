@@ -828,3 +828,43 @@ def test_performance_page_reports_unavailable_data(monkeypatch):
         assert page.status_code == 503 and "temporarily unavailable" in page.json()["detail"]  # 2b
         report = client.post("/api/reports", headers=headers)
         assert report.status_code == 503 and "try again" in report.json()["detail"]  # 3a after one retry
+
+
+def test_blank_answers_do_not_block_a_mock_only_the_speaking_test_does():
+    import json
+    from datetime import timedelta
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "blank.answers@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        # Listening, reading and writing answered but no speaking test: cannot be marked yet.
+        no_speaking = client.post("/api/mock-exams", headers=headers).json()
+        for skill, answer in {"listening": {"1": "Kowalski"}, "reading": {"1": "TRUE"}}.items():
+            client.put(f"/api/mock-exams/{no_speaking['id']}/{skill}", headers=headers, json={"answer": json.dumps(answer)})
+        refused = client.post(f"/api/mock-exams/{no_speaking['id']}/submit", headers=headers)
+        assert refused.status_code == 409 and "speaking" in refused.json()["detail"]
+        # Every listening, reading and writing answer left blank: still marked, blanks count as wrong.
+        blank = client.post("/api/mock-exams", headers=headers).json()
+        for skill in ("listening", "reading", "writing"):
+            client.put(f"/api/mock-exams/{blank['id']}/{skill}", headers=headers, json={"answer": "{}"})
+        speak_mock(client, headers, blank["id"])
+        marked = client.post(f"/api/mock-exams/{blank['id']}/submit", headers=headers)
+        assert marked.status_code == 200, marked.text
+        payload = marked.json()["result"]["payload"]
+        assert payload["details"]["listening"]["raw_score"] == 0 and payload["details"]["reading"]["raw_score"] == 0
+        assert payload["section_scores"]["writing"] == 1.0  # a blank task gets the lowest band
+        # "End exam" after the speaking test also marks it, blanks included.
+        ended = client.post("/api/mock-exams", headers=headers).json()
+        speak_mock(client, headers, ended["id"])
+        finished = client.post(f"/api/mock-exams/{ended['id']}/end", headers=headers, json={"reason": "learner"}).json()
+        assert finished["status"] == "SUBMITTED" and finished["result"]["state"] in ("RELEASED", "HELD", "HUMAN_REVIEW")
+        # Time runs out after the speaking test: marked automatically when the learner returns.
+        overdue = client.post("/api/mock-exams", headers=headers).json()
+        speak_mock(client, headers, overdue["id"])
+        with SessionLocal() as db:
+            row = db.get(MockExam, overdue["id"])
+            row.created_at = row.created_at - timedelta(hours=4)
+            db.commit()
+        assert client.get(f"/api/mock-exams/{overdue['id']}", headers=headers).json()["status"] == "SUBMITTED"

@@ -70,12 +70,12 @@ function Insights({ p }: { p: Record<string, any> }) {
   </div>
 }
 
-/* UC5 4a: an unfinished mock is kept, but it has no final result. */
+/* UC5 4a: a mock left before the speaking test is kept, but it has no final result. */
 function IncompleteNotice({ exam }: { exam: Mock }) {
   const ended = exam.ended
   return <div className="panel panel-sun space-y-3 p-6 anim-pop">
     <h2 className="section-title flex items-center gap-2"><AlertTriangle className="text-sun" /> Recorded as incomplete</h2>
-    <p className="font-read leading-7">This mock {ended?.reason === 'time expired' ? 'ran out of time' : 'was ended'} before all four sections were finished, so there is <b>no final result</b>. Your saved answers are kept.</p>
+    <p className="font-read leading-7">This mock {ended?.reason === 'time expired' ? 'ran out of time' : 'was ended'} before the speaking test was taken, so it cannot be marked and there is <b>no final result</b>. Your saved answers are kept.</p>
     {ended && <div className="grid gap-2 font-read text-sm sm:grid-cols-2">
       <p className="tile">Finished: {ended.completed.length ? ended.completed.map(nice).join(', ') : 'none'}</p>
       <p className="tile text-sun">Not finished: {ended.missing.map(nice).join(', ')}</p>
@@ -93,6 +93,7 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
   const [part, setPart] = useState(0)
   const [busy, setBusy] = useState(false)
   const [confirmEnd, setConfirmEnd] = useState(false)
+  const [confirmSubmit, setConfirmSubmit] = useState(false)
   const [now, setNow] = useState(Date.now())
   const saveTimer = useRef(0)
   const timedOut = useRef<number | null>(null)
@@ -154,7 +155,14 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
     writing: tasks.map(t => words(answers.writing?.[t.task] || '')).join(' + ') + ' words',
     speaking: exam.answers.speaking ? 'saved' : 'not started',
   } : {}, [exam, answers]) as Record<string, string>
-  const unfinished = exam ? SECTIONS.filter(s => s === 'speaking' ? !exam.answers.speaking : s === 'writing' ? !tasks.some(t => (answers.writing?.[t.task] || '').trim()) : !Object.values(answers[s] || {}).some(v => String(v).trim())) : []
+  // Blank answers do not stop marking (they count as wrong, as in the real test); only the speaking test must be taken.
+  const speakingDone = Boolean(exam?.answers.speaking)
+  const blanks = [
+    ...(listening ? [[questionCount(listening.sections) - answeredCount(listening.sections, answers.listening || {}), 'listening']] : []),
+    ...(reading ? [[questionCount(reading.sections) - answeredCount(reading.sections, answers.reading || {}), 'reading']] : []),
+  ].filter(([n]) => Number(n) > 0).map(([n, s]) => `${nice(String(s))}: ${n} unanswered`)
+    .concat(tasks.filter(t => !(answers.writing?.[t.task] || '').trim()).map(t => `${t.task === 'task1' ? 'Writing Task 1' : t.task === 'task2' ? 'Writing Task 2' : nice(t.task)} blank`))
+  const trySubmit = () => { if (!speakingDone || blanks.length) setConfirmSubmit(true); else void submit() }
   useEffect(() => {
     // When the clock reaches zero the exam ends: marked if every section is done, otherwise recorded as incomplete.
     if (exam && exam.status === 'IN_PROGRESS' && !exam.legacy && remaining === 0 && timedOut.current !== exam.id && !busy) { timedOut.current = exam.id; void end('time') }
@@ -178,12 +186,22 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
       <div className="flex flex-wrap items-center gap-3">
         {!submitted && <span className={`flex items-center gap-2 px-3 py-1 ${remaining < 600 ? 'bg-rose text-night' : 'bg-abyss'}`} style={{ boxShadow: '0 0 0 3px #3ef0ff' }}><Clock3 size={18} /><span className="num text-4xl">{clock(remaining)}</span></span>}
         {!submitted && <button className="btn-secondary" disabled={busy} onClick={() => setConfirmEnd(true)}><Flag size={16} /> End exam</button>}
-        {!submitted ? <button className="btn-primary" disabled={busy} onClick={submit}><Send size={16} /> {busy ? 'Marking…' : 'Submit all sections'}</button> : <button className="btn-secondary" onClick={() => setExam(null)}>Back to exam hall</button>}
+        {!submitted ? <button className="btn-primary" disabled={busy} onClick={trySubmit}><Send size={16} /> {busy ? 'Marking…' : 'Submit all sections'}</button> : <button className="btn-secondary" onClick={() => setExam(null)}>Back to exam hall</button>}
       </div>
     </div>
     {confirmEnd && !submitted && <div role="alertdialog" aria-label="End the exam" className="panel panel-sun anim-pop flex flex-wrap items-center justify-between gap-4 p-5">
-      <p className="font-read">{unfinished.length ? <>Not finished yet: <b>{unfinished.map(nice).join(', ')}</b>. If you end now the mock is <b>recorded as incomplete</b> and you get no final result.</> : 'All sections are done. Ending now marks your mock.'}</p>
+      <p className="font-read">{!speakingDone ? <>You haven't taken the <b>speaking test</b> yet. If you end now the mock is <b>recorded as incomplete</b> and you get no final result.</>
+        : <>Ending now marks your mock.{blanks.length > 0 && <> Still blank: <b>{blanks.join(' · ')}</b>, which count as wrong.</>}</>}</p>
       <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmEnd(false)}>Keep working</button><button className="btn-sun" onClick={() => void end('learner')}>End exam</button></div>
+    </div>}
+    {confirmSubmit && !submitted && <div role="alertdialog" aria-label="Check before submitting" className="panel panel-sun anim-pop flex flex-wrap items-center justify-between gap-4 p-5">
+      {!speakingDone ? <>
+        <p className="font-read">Take the <b>speaking test</b> before submitting: it is the one section that cannot be marked without you. Blank answers elsewhere are fine.</p>
+        <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmSubmit(false)}>Close</button><button className="btn-cyan" onClick={() => { setConfirmSubmit(false); setSection('speaking') }}>Go to speaking</button></div>
+      </> : <>
+        <p className="font-read">Still blank: <b>{blanks.join(' · ')}</b>. Blank answers are marked as wrong, as in the real test. Submit anyway?</p>
+        <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmSubmit(false)}>Go back and check</button><button className="btn-primary" onClick={() => { setConfirmSubmit(false); void submit() }}>Submit</button></div>
+      </>}
     </div>}
     {submitted ? (exam.result ? <Results exam={exam} /> : exam.status === 'INCOMPLETE' ? <IncompleteNotice exam={exam} /> : <Spinner />) : <>
       <nav className="flex flex-wrap gap-1" aria-label="Exam sections">{SECTIONS.map((s, i) => <button key={s} onClick={() => setSection(s)} className={section === s ? 'btn-primary' : 'btn-secondary'}>

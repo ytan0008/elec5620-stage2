@@ -1063,51 +1063,64 @@ def mock_view(exam: MockExam, db: Session):
 MOCK_GRACE = timedelta(minutes=15)  # Allowance after the timer for a speaking test that is still running.
 
 
-def mock_missing(db: Session, exam: MockExam) -> list[str]:
-    """Sections without a usable answer (UC5 step 4)."""
+def mock_answers(db: Session, exam: MockExam) -> dict[str, dict]:
     raw = {item.skill: item.answer for item in db.scalars(select(ExamResponse).where(ExamResponse.exam_id == exam.id))}
-    answers = {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
-    # An empty answer sheet ("{}") does not count: listening, reading and writing need at least one real answer.
-    return [skill for skill in SKILLS if not raw.get(skill, "").strip() or (skill != "speaking" and not any(str(v).strip() for v in answers[skill].values()))
-            or (skill == "speaking" and not answers["speaking"].get("transcript"))]
+    return {skill: parse_json(raw.get(skill, "")) for skill in SKILLS}
+
+
+def mock_attempted(db: Session, exam: MockExam) -> list[str]:
+    """Sections with at least one answer (an empty answer sheet does not count)."""
+    answers = mock_answers(db, exam)
+    return [skill for skill in SKILLS if (answers["speaking"].get("transcript") if skill == "speaking" else any(str(v).strip() for v in answers[skill].values()))]
+
+
+def mock_missing(db: Session, exam: MockExam) -> list[str]:
+    """What still prevents marking (UC5 step 4). As in the real test, blank listening, reading or writing answers do not:
+    they are marked wrong (or get the lowest band). Only the speaking test, a live interview, must have been taken."""
+    return [] if mock_answers(db, exam)["speaking"].get("transcript") else ["speaking"]
 
 
 def record_incomplete(db: Session, exam: MockExam, reason: str) -> None:
-    """UC5 4a: an unfinished mock is recorded as incomplete and gets no final result. Saved answers are kept."""
-    missing = mock_missing(db, exam)
+    """UC5 4a: a mock left before the speaking test is recorded as incomplete and gets no final result. Saved answers are kept."""
+    attempted = mock_attempted(db, exam)
+    missing = [skill for skill in SKILLS if skill not in attempted]
     exam.status = "INCOMPLETE"
     exam.sections = {**exam.sections, "ended": {"reason": reason, "at": datetime.now(timezone.utc).isoformat(), "missing": missing,
-                                                "completed": [skill for skill in SKILLS if skill not in missing]}}
+                                                "completed": attempted}}
     db.add(AuditLog(user_id=exam.user_id, action="mock_incomplete", detail={"exam_id": exam.id, "reason": reason, "missing": missing}))
     db.add(AgentEvent(user_id=exam.user_id, workflow="mock_exam", agent="Assessment & Analytics", phase="decision",
                       detail={"decision": "recorded as incomplete; no final result", "exam_id": exam.id, "reason": reason, "missing": missing}, mode=settings().ai_mode))
 
 
-def expire_overdue(db: Session, exam: MockExam) -> bool:
-    """A mock left unfinished after its time (plus a short grace period) is closed as incomplete."""
+def expire_overdue(db: Session, exam: MockExam, user: User) -> bool:
+    """When a mock's time (plus a short grace period) is over, it ends as on test day: it is marked with what was answered,
+    or recorded as incomplete if the speaking test was never taken."""
     if exam.status != "IN_PROGRESS" or "test" not in exam.sections.get("speaking", {}):
         return False
     created = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
     duration = sum(exam.sections.get(skill, {}).get("duration_seconds", 0) for skill in SKILLS)
-    if datetime.now(timezone.utc) <= created + timedelta(seconds=duration) + MOCK_GRACE or not mock_missing(db, exam):
+    if datetime.now(timezone.utc) <= created + timedelta(seconds=duration) + MOCK_GRACE:
         return False
-    record_incomplete(db, exam, "time expired")
+    if mock_missing(db, exam):
+        record_incomplete(db, exam, "time expired")
+        db.commit()
+    else:
+        grade_mock(db, exam, user)
     return True
 
 
 @app.get("/api/mock-exams")
 def list_mocks(user: User = Depends(learner), db: Session = Depends(get_db)):
     exams = list(db.scalars(select(MockExam).where(MockExam.user_id == user.id).order_by(MockExam.id.desc())))
-    if any([expire_overdue(db, exam) for exam in exams]):
-        db.commit()
+    for exam in exams:
+        expire_overdue(db, exam, user)
     return [mock_view(exam, db) for exam in exams]
 
 
 @app.get("/api/mock-exams/{exam_id}")
 def get_mock(exam_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     exam = owned(db, MockExam, exam_id, user)
-    if expire_overdue(db, exam):
-        db.commit()
+    expire_overdue(db, exam, user)
     return mock_view(exam, db)
 
 
@@ -1138,20 +1151,20 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already submitted")
-    missing = mock_missing(db, exam)
-    if missing:
-        raise HTTPException(409, "Complete all four sections: " + ", ".join(missing) + " still missing")
+    if mock_missing(db, exam):
+        raise HTTPException(409, "Take the speaking test before submitting. Blank listening, reading or writing answers are fine: they are marked as wrong.")
     return grade_mock(db, exam, user)
 
 
 @app.post("/api/mock-exams/{exam_id}/end")
 def end_mock(exam_id: int, data: MockEndInput | None = None, user: User = Depends(learner), db: Session = Depends(get_db)):
-    """End a mock early or when time runs out: a finished exam is marked, an unfinished one is recorded as incomplete."""
+    """End a mock early or when time runs out: it is marked with what was answered (blanks count as wrong),
+    unless the speaking test was never taken, in which case it is recorded as incomplete (UC5 4a)."""
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already finished")
     if not mock_missing(db, exam):
-        return grade_mock(db, exam, user)  # Everything was finished: mark it (and let UC7 propose an adapted plan).
+        return grade_mock(db, exam, user)  # Mark it (and let UC7 propose an adapted plan).
     record_incomplete(db, exam, "time expired" if (data or MockEndInput()).reason == "time" else "ended by learner")
     db.commit()
     return mock_view(exam, db)
