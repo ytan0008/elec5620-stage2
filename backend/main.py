@@ -14,12 +14,13 @@ from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
 from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport, AgentMemory
-from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
+from backend.schemas import AvailabilityInput, RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
 from backend import adaptation
+from backend import escalation
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
@@ -1354,7 +1355,9 @@ def cases(user: User = Depends(instructor), db: Session = Depends(get_db)):
 @app.post("/api/instructor/cases/{case_id}/decision")
 def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor), db: Session = Depends(get_db)):
     case = db.get(Escalation, case_id)
-    if not case or case.status not in ("PENDING", "MORE_INFO"):
+    if case and case.status == escalation.QUEUED:
+        raise HTTPException(409, "Case is queued until an instructor is available; mark yourself available first")
+    if not case or case.status not in escalation.OPEN:
         raise HTTPException(409, "Case is not pending")
     package = db.get(ResultPackage, case.package_id)
     if data.decision == "correct" and not data.correction:
@@ -1382,14 +1385,13 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
             package.payload = corrected
             package.confidence = corrected["confidence"]
     db.add(InstructorDecision(case_id=case.id, instructor_id=user.id, decision=data.decision, note=data.note, correction=data.correction))
-    outcome = {"approve": "approved unchanged (likely a false alarm)", "correct": "corrected", "request_information": "asked for more information on"}.get(data.decision, data.decision)
-    agent_core.remember(db, "quality", None, f"Instructor {outcome} a held {package.kind} result; it was held for: {(case.reason or '')[:200]}" + (f". Note: {data.note[:200]}" if data.note else "."),
-                        "lesson", {"package_id": package.id, "decision": data.decision})
     db.add(AuditLog(user_id=user.id, action="instructor_decision", detail={"case_id": case.id, "decision": data.decision}))
-    db.add(AgentEvent(user_id=package.user_id, workflow=package.kind, agent="Human Instructor", phase="decision", detail={"decision": data.decision, "package_id": package.id, "next_agent": "Quality Manager"}, mode=package.source_mode))
+    undelivered: list[str] = []
     if data.decision == "request_information":
         case.status = "MORE_INFO"
         package.state = "HUMAN_REVIEW"
+        escalation.notify_agents(db, case, package, data.decision, data.note, only=["quality"])
+        escalation.gather_evidence(db, case, package, user.id)  # 5c: the requested information comes back and the case returns for review
         db.add(AgentEvent(user_id=package.user_id, workflow=package.kind, agent="Quality Manager", phase="state", detail={"package_id": package.id, "state": "HUMAN_REVIEW"}, mode=package.source_mode))
     else:
         package.state = "APPROVED" if data.decision == "approve" else "CORRECTED"
@@ -1398,12 +1400,60 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
         AgentRuntime(db).release_after_human(package)
         if package.kind in ("writing", "speaking"):
             notebook.record_feedback(db, package.user_id, package.payload, package.kind, "Instructor-reviewed result")
-        case.status = "RESOLVED"
+        case.status = "RESOLVED"  # 7a: stays resolved even if an agent cannot be told right away
+        escalation.log(db, user.id, "case_resolved", case.id, decision=data.decision)
+        undelivered = escalation.notify_agents(db, case, package, data.decision, data.note)
         for plan in db.scalars(select(Plan).where(Plan.package_id == package.id)):
             plan.content = package.payload
             plan.status = "PROPOSED"
     db.commit()
-    return {"status": case.status, "package": package_view(package, True)}
+    return {"status": case.status, "package": package_view(package, True), "notifications_pending": undelivered}
+
+
+@app.get("/api/instructor/cases/{case_id}")
+def case_detail(case_id: int, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """UC8 steps 3-4: the held result with the learner's earlier results, previous decisions, highlights and the case history."""
+    case = db.get(Escalation, case_id)
+    if not case:
+        raise HTTPException(404, "Case not found")
+    return {**dto(case, "id", "status", "reason", "created_at"), "package": package_view(db.get(ResultPackage, case.package_id), True), **escalation.case_detail(db, case)}
+
+
+@app.post("/api/instructor/cases/{case_id}/request-evidence")
+def request_case_evidence(case_id: int, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """UC8 3a: the case stays open while the Quality Manager gathers the missing evidence."""
+    case = db.get(Escalation, case_id)
+    if not case or case.status not in escalation.OPEN:
+        raise HTTPException(409, "Case is not open for review")
+    escalation.gather_evidence(db, case, db.get(ResultPackage, case.package_id), user.id)
+    db.commit()
+    return case_detail(case_id, user, db)
+
+
+@app.post("/api/instructor/cases/{case_id}/retry-notifications")
+def retry_case_notifications(case_id: int, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """UC8 7a: re-deliver the outcome to any agent that has not received it."""
+    case = db.get(Escalation, case_id)
+    if not case or case.status != "RESOLVED":
+        raise HTTPException(409, "Only a resolved case has an outcome to deliver")
+    delivered = escalation.retry_notifications(db, case)
+    db.commit()
+    return {"delivered": delivered, "notifications_pending": escalation.pending_agents(db, case.id)}
+
+
+@app.get("/api/instructor/availability")
+def instructor_availability(user: User = Depends(instructor), db: Session = Depends(get_db)):
+    return {"available": escalation.is_available(db, user.id), "queued": db.scalar(select(func.count()).select_from(Escalation).where(Escalation.status == escalation.QUEUED)),
+            "notifications": escalation.notifications(db, user.id)}
+
+
+@app.put("/api/instructor/availability")
+def set_instructor_availability(data: AvailabilityInput, user: User = Depends(instructor), db: Session = Depends(get_db)):
+    """UC8 2a: becoming available releases the queued cases to this instructor."""
+    released = escalation.set_available(db, user, data.available)
+    db.add(AuditLog(user_id=user.id, action="instructor_available" if data.available else "instructor_away", detail={"released": released}))
+    db.commit()
+    return {"available": data.available, "released": released}
 
 
 @app.get("/api/instructor/quality")
