@@ -65,8 +65,12 @@ test('learner practises all four skills, talks to the examiner and starts a mock
   await page.getByRole('button', { name: /Start short mock/ }).click()
   await expect(page.getByText('Unofficial computer-delivered practice')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open agent assistant' })).toHaveCount(0)
+  // IELTS test day: the written test runs section by section; speaking is a separate session the same day.
+  await expect(page.getByRole('heading', { name: 'Speaking test' })).toBeVisible()
+  await page.getByRole('button', { name: /Start written test/ }).click()
   await page.getByLabel('Answer 1', { exact: true }).fill('Kowalski')
-  await page.getByRole('button', { name: /Reading/ }).click()
+  await page.getByRole('button', { name: /Finish Listening/ }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: /Finish Listening/ }).click()
   await expect(page.locator('article').first()).toBeVisible()
 })
 

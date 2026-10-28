@@ -77,6 +77,8 @@ class ExamAnswerInput(BaseModel):
 
 class MockCreateInput(BaseModel):
     length: Literal["full", "short"] = "short"
+    # The learner's time zone (minutes east of UTC), so "the same day" for the IELTS speaking test means their day.
+    tz_offset_minutes: int | None = Field(default=None, ge=-840, le=840)
 
 
 class MockEndInput(BaseModel):

@@ -19,6 +19,7 @@ from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend import analytics as analytics_module
+from backend import mock_timing
 from backend.analytics import objective_output, latest_progress, split_skills, mock_insights, progress_recommendations, issue_history, skill_trends, progress_readiness
 from backend.agents import AgentRuntime, MockUnavailable, LocalGenerationUnavailable, practice_prompt
 from backend import adaptation
@@ -334,6 +335,12 @@ def active_mock(db: Session, user_id: int) -> MockExam | None:
     """A mock exam that is still running locks dictionary meanings and the tutor chat."""
     now_ = datetime.now(timezone.utc)
     for exam in db.scalars(select(MockExam).where(MockExam.user_id == user_id, MockExam.status == "IN_PROGRESS")):
+        if mock_timing.is_timed(exam.sections):  # IELTS: locked while the written test or the speaking test is running
+            deadline = mock_timing.section_deadline(exam.sections, exam.sections["timing"])
+            speaking = db.scalar(select(SpeakingSession.id).where(SpeakingSession.mock_id == exam.id, SpeakingSession.status == "ACTIVE"))
+            if (deadline and deadline > now_) or speaking:
+                return exam
+            continue
         created = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
         duration = sum(exam.sections.get(skill, {}).get("duration_seconds", 0) for skill in ("listening", "reading", "writing", "speaking"))
         if created + timedelta(seconds=duration) > now_:
@@ -877,8 +884,14 @@ def start_speaking(data: SpeakingStartInput, user: User = Depends(learner), db: 
     practice_id = None
     if data.mock_id is not None:
         exam = owned(db, MockExam, data.mock_id, user)
+        run_mock_clock(db, exam, user)
         if exam.status != "IN_PROGRESS" or "test" not in exam.sections.get("speaking", {}):
             raise HTTPException(409, "This mock exam has no open speaking section")
+        if mock_timing.is_timed(exam.sections):
+            if mock_timing.written_running(exam.sections["timing"]):
+                raise HTTPException(409, "The speaking test is separate: take it before you start the written test or after you finish it.")
+            if mock_timing.day_over(exam.sections["timing"], datetime.now(timezone.utc)):
+                raise HTTPException(409, "The speaking test had to be taken on the day the mock was started")
         test = exam.sections["speaking"]["test"]
     else:
         practice = start_practice("speaking", data.question_id, user, db)
@@ -946,7 +959,8 @@ def finish_speaking(session_id: int, user: User = Depends(learner), db: Session 
         else:
             db.add(ExamResponse(exam_id=exam.id, skill="speaking", answer=payload))
         db.commit()
-        return {**speaking_view(session), "saved_to_mock": True, "metrics": metrics}
+        run_mock_clock(db, exam, user)  # IELTS: if the written test is already done, the mock is marked now
+        return {**speaking_view(session), "saved_to_mock": True, "metrics": metrics, "mock_status": exam.status}
     practice = owned(db, Practice, session.practice_id, user)
     profile = profile_for(db, user)
     runtime = AgentRuntime(db)
@@ -1010,6 +1024,9 @@ def create_mock(data: MockCreateInput | None = None, user: User = Depends(learne
         db.commit()  # keep the agent's record of the failed attempts
         raise HTTPException(503, str(exc))
     sections["length"] = length
+    timing = mock_timing.new_timing(profile.exam, datetime.now(timezone.utc), (data or MockCreateInput()).tz_offset_minutes)
+    if timing:
+        sections["timing"] = timing
     exam = MockExam(user_id=user.id, exam=profile.exam, sections=sections)
     db.add(exam)
     db.commit()
@@ -1029,7 +1046,10 @@ def mock_view(exam: MockExam, db: Session):
         if skill in ("listening", "reading") and "sections" in section and exam.status == "IN_PROGRESS":
             section = strip_answers(section)
         sections[skill] = section
-    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"), "report_id": exam.sections.get("report_id"),
+    timing = None
+    if mock_timing.is_timed(exam.sections):
+        timing = mock_timing.view(exam.sections, exam.sections["timing"], datetime.now(timezone.utc), bool(parse_json(answers.get("speaking", "")).get("transcript")))
+    return {"id": exam.id, "exam": exam.exam, "status": exam.status, "timing": timing, "length": exam.sections.get("length", "short"), "legacy": legacy, "created_at": created_at, "ended": exam.sections.get("ended"), "report_id": exam.sections.get("report_id"),
             "duration_seconds": sum(exam.sections[skill].get("duration_seconds", 0) for skill in SKILLS if skill in exam.sections),
             "sections": sections, "answers": answers, "result": package_view(db.get(ResultPackage, exam.package_id)) if exam.package_id else None}
 
@@ -1059,9 +1079,29 @@ def record_incomplete(db: Session, exam: MockExam, reason: str) -> None:
     AgentRuntime(db).assessment.record_incomplete(exam, reason, mock_attempted(db, exam))
 
 
+def run_mock_clock(db: Session, exam: MockExam, user: User) -> dict | None:
+    """IELTS: close written sections whose time is up; mark the mock once the written test and the speaking test are
+    both done; record it incomplete when the day ends without them (a written test already running may finish first)."""
+    if exam.status != "IN_PROGRESS" or not mock_timing.is_timed(exam.sections):
+        return None
+    now = datetime.now(timezone.utc)
+    timing = mock_timing.advance(exam.sections, now)
+    if timing != exam.sections["timing"]:
+        exam.sections = {**exam.sections, "timing": timing}
+    speaking_done = not mock_missing(db, exam)
+    if mock_timing.written_done(timing) and speaking_done:
+        return grade_mock(db, exam, user)
+    if mock_timing.day_over(timing, now) and not mock_timing.written_running(timing) and (not speaking_done or not timing.get("written_started")):
+        record_incomplete(db, exam, "not finished on the day")
+    db.commit()
+    return None
+
+
 def expire_overdue(db: Session, exam: MockExam, user: User) -> bool:
     """When a mock's time (plus a short grace period) is over, it ends as on test day: it is marked with what was answered,
     or recorded as incomplete if the speaking test was never taken."""
+    if mock_timing.is_timed(exam.sections):
+        return run_mock_clock(db, exam, user) is not None or exam.status != "IN_PROGRESS"
     if exam.status != "IN_PROGRESS" or "test" not in exam.sections.get("speaking", {}):
         return False
     created = exam.created_at if exam.created_at.tzinfo else exam.created_at.replace(tzinfo=timezone.utc)
@@ -1096,13 +1136,57 @@ def save_exam_answer(exam_id: int, skill: str, data: ExamAnswerInput, user: User
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS" or skill not in SKILLS:
         raise HTTPException(409, "Section cannot be edited")
+    if mock_timing.is_timed(exam.sections):
+        now = datetime.now(timezone.utc)
+        timing = mock_timing.advance(exam.sections, now)  # move the clock on, but save before any marking
+        if timing != exam.sections["timing"]:
+            exam.sections = {**exam.sections, "timing": timing}
+        if not mock_timing.can_edit(exam.sections, skill, now):
+            db.commit()
+            raise HTTPException(409, f"The {skill} section is not open: sections run in order and close when their time is up.")
     response = db.scalar(select(ExamResponse).where(ExamResponse.exam_id == exam.id, ExamResponse.skill == skill))
     if response:
         response.answer = data.answer
     else:
         db.add(ExamResponse(exam_id=exam.id, skill=skill, answer=data.answer))
     db.commit()
+    run_mock_clock(db, exam, user)
     return {"saved": True}
+
+
+@app.post("/api/mock-exams/{exam_id}/written/start")
+def start_written_test(exam_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    """IELTS: start Listening; Reading and Writing follow in order, each with its own clock."""
+    exam = owned(db, MockExam, exam_id, user)
+    if exam.status != "IN_PROGRESS" or not mock_timing.is_timed(exam.sections):
+        raise HTTPException(409, "This mock has no separate written test")
+    run_mock_clock(db, exam, user)
+    timing = exam.sections["timing"]
+    if timing.get("written_started"):
+        raise HTTPException(409, "The written test has already started")
+    if exam.status != "IN_PROGRESS" or mock_timing.day_over(timing, datetime.now(timezone.utc)):
+        raise HTTPException(409, "This mock had to be finished on the day it was started")
+    if db.scalar(select(SpeakingSession.id).where(SpeakingSession.mock_id == exam.id, SpeakingSession.status == "ACTIVE")):
+        raise HTTPException(409, "Finish your speaking test first")
+    exam.sections = {**exam.sections, "timing": mock_timing.start_written(timing, datetime.now(timezone.utc))}
+    db.commit()
+    return mock_view(exam, db)
+
+
+@app.post("/api/mock-exams/{exam_id}/written/next")
+def finish_written_section(exam_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    """IELTS: finish the running section early and move on; it cannot be reopened."""
+    exam = owned(db, MockExam, exam_id, user)
+    if exam.status != "IN_PROGRESS" or not mock_timing.is_timed(exam.sections):
+        raise HTTPException(409, "This mock has no separate written test")
+    marked = run_mock_clock(db, exam, user)
+    if marked or exam.status != "IN_PROGRESS":
+        return marked or mock_view(exam, db)
+    if not mock_timing.written_running(exam.sections["timing"]):
+        raise HTTPException(409, "No written section is running")
+    exam.sections = {**exam.sections, "timing": mock_timing.finish_current(exam.sections["timing"], datetime.now(timezone.utc))}
+    db.commit()
+    return run_mock_clock(db, exam, user) or mock_view(exam, db)
 
 
 def parse_json(value: str) -> dict:
@@ -1118,6 +1202,14 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already submitted")
+    if mock_timing.is_timed(exam.sections):
+        marked = run_mock_clock(db, exam, user)
+        if marked:
+            return marked
+        if exam.status != "IN_PROGRESS":
+            return mock_view(exam, db)
+        left = ([] if mock_timing.written_done(exam.sections["timing"]) else ["the written test"]) + (["the speaking test"] if mock_missing(db, exam) else [])
+        raise HTTPException(409, f"Finish {' and '.join(left)} first; the mock is marked automatically when both are done.")
     if mock_missing(db, exam):
         raise HTTPException(409, "Take the speaking test before submitting. Blank listening, reading or writing answers are fine: they are marked as wrong.")
     return grade_mock(db, exam, user)
@@ -1130,6 +1222,8 @@ def end_mock(exam_id: int, data: MockEndInput | None = None, user: User = Depend
     exam = owned(db, MockExam, exam_id, user)
     if exam.status != "IN_PROGRESS":
         raise HTTPException(409, "Exam already finished")
+    if mock_timing.is_timed(exam.sections):
+        exam.sections = {**exam.sections, "timing": mock_timing.close_all(exam.sections["timing"], datetime.now(timezone.utc))}
     if not mock_missing(db, exam):
         return grade_mock(db, exam, user)  # Mark it (and let UC7 propose an adapted plan).
     record_incomplete(db, exam, "time expired" if (data or MockEndInput()).reason == "time" else "ended by learner")
