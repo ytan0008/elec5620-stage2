@@ -19,7 +19,7 @@ from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend import analytics as analytics_module
-from backend.analytics import latest_progress, split_skills, mock_insights, progress_recommendations, issue_history, skill_trends, progress_readiness
+from backend.analytics import objective_output, latest_progress, split_skills, mock_insights, progress_recommendations, issue_history, skill_trends, progress_readiness
 from backend.agents import AgentRuntime, MockUnavailable, LocalGenerationUnavailable, practice_prompt
 from backend import adaptation
 from backend import agent_core
@@ -822,33 +822,6 @@ def latest_unused_audio(db: Session, user_id: int, practice_id: int) -> str | No
     return next((str(item) for item in files if str(item) not in used), None)
 
 
-def objective_output(prompt: dict, answers: dict, skill: str, exam: str) -> dict:
-    test = prompt["test"]
-    graded = grade_objective(test, answers, skill, exam)
-    wrong = [item for item in graded["items"] if not item["correct"]]
-    comments = [{"issue": f"Question {item['n']}", "suggestion": f"Correct answer: {item['answer']}" + (f" — {item['evidence']}" if item["evidence"] else ""), "sentence": f"Your answer: {item['given'] or '(blank)'}"} for item in wrong[:12]]
-    if not comments:
-        comments = [{"issue": "All answers correct", "suggestion": "Try a harder part or a full test under timed conditions."}]
-    types = {}
-    for item in graded["items"]:
-        bucket = types.setdefault(item["type"], [0, 0])
-        bucket[0] += item["correct"]
-        bucket[1] += 1
-    weakest = min(types.items(), key=lambda pair: pair[1][0] / pair[1][1])[0] if types else None
-    names = {"completion": "completion", "mcq": "multiple choice", "matching": "matching", "tfng": "True/False/Not Given", "ynng": "Yes/No/Not Given", "cwords": "Complete the Words"}
-    summary = (f"You answered {graded['raw']} of {graded['total']} correctly"
-               + (f" (equivalent to about {graded['scaled_40']}/40)" if graded["scaled_40"] is not None else "")
-               + f". Estimated {graded['score_scale'].split(' ')[0]} {skill} score: {graded['band']}."
-               + (f" Your weakest question type was {names.get(weakest, weakest)}." if weakest and len(types) > 1 else ""))
-    output = {"summary": summary, "criteria": {skill: graded["band"]}, "estimated_overall": graded["band"], "score_scale": graded["score_scale"], "official": False,
-              "raw_score": graded["raw"], "total": graded["total"], "review": graded["items"], "confidence": {skill: .92}, "comments": comments,
-              "question_types": {names.get(k, k): f"{v[0]}/{v[1]}" for k, v in types.items()}}
-    if skill == "listening":
-        output["transcript"] = [{"title": section.get("title"), "script": section.get("script", []),
-                                 "clips": [q.get("clip") for g in section.get("groups", []) for q in g.get("questions", []) if q.get("clip")]} for section in test["sections"]]
-    return output
-
-
 @app.post("/api/practice/{practice_id}/submit")
 def submit_practice(practice_id: int, data: SubmitInput, user: User = Depends(learner), db: Session = Depends(get_db)):
     practice = owned(db, Practice, practice_id, user)
@@ -1082,15 +1055,8 @@ def mock_missing(db: Session, exam: MockExam) -> list[str]:
 
 
 def record_incomplete(db: Session, exam: MockExam, reason: str) -> None:
-    """UC5 4a: a mock left before the speaking test is recorded as incomplete and gets no final result. Saved answers are kept."""
-    attempted = mock_attempted(db, exam)
-    missing = [skill for skill in SKILLS if skill not in attempted]
-    exam.status = "INCOMPLETE"
-    exam.sections = {**exam.sections, "ended": {"reason": reason, "at": datetime.now(timezone.utc).isoformat(), "missing": missing,
-                                                "completed": attempted}}
-    db.add(AuditLog(user_id=exam.user_id, action="mock_incomplete", detail={"exam_id": exam.id, "reason": reason, "missing": missing}))
-    db.add(AgentEvent(user_id=exam.user_id, workflow="mock_exam", agent="Assessment & Analytics", phase="decision",
-                      detail={"decision": "recorded as incomplete; no final result", "exam_id": exam.id, "reason": reason, "missing": missing}, mode=settings().ai_mode))
+    """UC5 4a, carried out by the Assessment & Analytics agent."""
+    AgentRuntime(db).assessment.record_incomplete(exam, reason, mock_attempted(db, exam))
 
 
 def expire_overdue(db: Session, exam: MockExam, user: User) -> bool:
@@ -1177,7 +1143,7 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
     runtime = AgentRuntime(db)
     scores, details, unscored = {}, {}, []
     for skill in ("listening", "reading"):
-        graded = objective_output(exam.sections[skill] | {"test": exam.sections[skill]}, answers[skill], skill, exam.exam)
+        graded = runtime.assessment.score_objective(user.id, exam.exam, skill, exam.sections[skill], answers[skill])
         scores[skill] = graded["estimated_overall"]
         details[skill] = {k: graded[k] for k in ("raw_score", "total", "review", "summary")} | ({"transcript": graded["transcript"]} if skill == "listening" else {})
     task_scores, writing_feedback, confidence = [], {}, {"listening": .95, "reading": .95}
@@ -1292,7 +1258,8 @@ def analytics(user: User = Depends(learner), db: Session = Depends(get_db)):
     db.commit()
     progress["target_score"] = profile.target_score
     progress["exam"] = profile.exam
-    progress["recommendations"] = progress_recommendations(progress) if progress["sample_count"] else ["Complete a practice session to unlock personalised insights"]
+    progress["recommendations"] = AgentRuntime(db).assessment.recommend(user.id, progress)
+    db.commit()
     return progress
 
 

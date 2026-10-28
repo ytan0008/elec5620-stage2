@@ -689,6 +689,30 @@ class AssessmentAgent(Agent):
                 self.event(state, "decision", {"decision": f"{skill} ({task}) could not be scored", "attempt": attempt, "error_type": type(exc).__name__}, started)
         return None
 
+    def score_objective(self, user_id: int, exam: str, skill: str, test: dict, answers: dict) -> dict:
+        """Step 5: mark listening or reading against the answer key and convert the raw score to a band."""
+        started = time.perf_counter()
+        graded = analytics.objective_output(test | {"test": test}, answers, skill, exam)
+        self.event({"user_id": user_id, "workflow": "mock_exam"}, "action", {"decision": f"marked {skill} against the answer key",
+                   "raw_score": graded["raw_score"], "total": graded["total"], "band": graded["estimated_overall"]}, started)
+        return graded
+
+    def record_incomplete(self, exam_record, reason: str, attempted: list[str]) -> None:
+        """4a: a mock left before the speaking test is recorded as incomplete and gets no final result. Saved answers are kept."""
+        missing = [skill for skill in ("listening", "reading", "writing", "speaking") if skill not in attempted]
+        exam_record.status = "INCOMPLETE"
+        exam_record.sections = {**exam_record.sections, "ended": {"reason": reason, "at": datetime.now(timezone.utc).isoformat(), "missing": missing,
+                                                                  "completed": attempted}}
+        self.db.add(AuditLog(user_id=exam_record.user_id, action="mock_incomplete", detail={"exam_id": exam_record.id, "reason": reason, "missing": missing}))
+        self.event({"user_id": exam_record.user_id, "workflow": "mock_exam"}, "decision",
+                   {"decision": "recorded as incomplete; no final result", "exam_id": exam_record.id, "reason": reason, "missing": missing})
+
+    def recommend(self, user_id: int, progress: dict) -> list[str]:
+        """UC6 step 6 on the Performance page: recommendations from skill gaps, declining trends and repeated problems."""
+        tips = analytics.progress_recommendations(progress) if progress["sample_count"] else ["Complete a practice session to unlock personalised insights"]
+        self.event({"user_id": user_id, "workflow": "report"}, "action", {"decision": "recommended next steps", "count": len(tips)})
+        return tips
+
     def analyse_mock(self, user_id: int, scores: dict, overall: float, target: float | None, issues: list[str]) -> dict:
         """Steps 6-7: strengths and weaknesses, comparison with earlier assessments and readiness."""
         insights = analytics.mock_insights(self.db, user_id, scores, overall, target, issues)

@@ -930,3 +930,20 @@ def test_report_breaks_down_every_section():
         assert "mistakes_by_type" in report["patterns"] and report["mock_summary"]["estimated_overall"] == done["result"]["payload"]["estimated_overall"]
         other = auth(client, "report.other@example.com")
         assert client.get(f"/api/reports/{done['report_id']}", headers=other).status_code == 404
+
+
+def test_assessment_agent_marks_records_and_recommends():
+    import json
+    with TestClient(app) as client:
+        headers = auth(client, "assessment.agent@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        assert client.get("/api/analytics", headers=headers).json()["recommendations"]  # recommend
+        quit_early = client.post("/api/mock-exams", headers=headers).json()
+        client.post(f"/api/mock-exams/{quit_early['id']}/end", headers=headers, json={"reason": "learner"})  # record_incomplete
+        complete_mock(client, headers)  # score_objective for listening and reading
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        decisions = [str(e["detail"].get("decision")) for e in client.get("/api/events?limit=300&agent=Assessment%20%26%20Analytics", headers=instructor).json()]
+        assert "recommended next steps" in decisions
+        assert "recorded as incomplete; no final result" in decisions
+        assert {"marked listening against the answer key", "marked reading against the answer key"} <= set(decisions)

@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from backend.models import MockExam, Profile, ResultPackage
+from backend.scoring import grade_objective
 
 
 def latest_progress(db: Session, user_id: int):
@@ -357,3 +358,32 @@ def learning_patterns(db: Session, user_id: int) -> dict:
     from backend import notebook
     summary = notebook.stats(db, user_id)
     return {"mistakes_by_type": summary.get("mistakes_by_type", [])[:5], "grammar_issues": summary.get("grammar_issues", [])[:5]}
+
+
+# ---------------------------------------------------------------- answer-key marking (listening and reading)
+
+def objective_output(prompt: dict, answers: dict, skill: str, exam: str) -> dict:
+    test = prompt["test"]
+    graded = grade_objective(test, answers, skill, exam)
+    wrong = [item for item in graded["items"] if not item["correct"]]
+    comments = [{"issue": f"Question {item['n']}", "suggestion": f"Correct answer: {item['answer']}" + (f" — {item['evidence']}" if item["evidence"] else ""), "sentence": f"Your answer: {item['given'] or '(blank)'}"} for item in wrong[:12]]
+    if not comments:
+        comments = [{"issue": "All answers correct", "suggestion": "Try a harder part or a full test under timed conditions."}]
+    types = {}
+    for item in graded["items"]:
+        bucket = types.setdefault(item["type"], [0, 0])
+        bucket[0] += item["correct"]
+        bucket[1] += 1
+    weakest = min(types.items(), key=lambda pair: pair[1][0] / pair[1][1])[0] if types else None
+    names = {"completion": "completion", "mcq": "multiple choice", "matching": "matching", "tfng": "True/False/Not Given", "ynng": "Yes/No/Not Given", "cwords": "Complete the Words"}
+    summary = (f"You answered {graded['raw']} of {graded['total']} correctly"
+               + (f" (equivalent to about {graded['scaled_40']}/40)" if graded["scaled_40"] is not None else "")
+               + f". Estimated {graded['score_scale'].split(' ')[0]} {skill} score: {graded['band']}."
+               + (f" Your weakest question type was {names.get(weakest, weakest)}." if weakest and len(types) > 1 else ""))
+    output = {"summary": summary, "criteria": {skill: graded["band"]}, "estimated_overall": graded["band"], "score_scale": graded["score_scale"], "official": False,
+              "raw_score": graded["raw"], "total": graded["total"], "review": graded["items"], "confidence": {skill: .92}, "comments": comments,
+              "question_types": {names.get(k, k): f"{v[0]}/{v[1]}" for k, v in types.items()}}
+    if skill == "listening":
+        output["transcript"] = [{"title": section.get("title"), "script": section.get("script", []),
+                                 "clips": [q.get("clip") for g in section.get("groups", []) for q in g.get("questions", []) if q.get("clip")]} for section in test["sections"]]
+    return output
