@@ -1,7 +1,7 @@
 """Run daily via Task Scheduler or cron: the UC7 weekly review, plus retries of failed agent notifications."""
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
-from backend import adaptation
+from backend import adaptation, escalation
 from backend.db import SessionLocal
 from backend.main import latest_progress, profile_data
 from backend.models import Plan, Profile
@@ -24,8 +24,9 @@ def run():
             else:
                 kept += 1  # not enough evidence, or the model failed twice: the learner keeps the existing plan and is told why
         retried = adaptation.retry_pending_notifications(db)
+        cases = escalation.retry_all_pending(db)  # UC8 7a: outcomes of resolved cases that an agent has not received yet
         db.commit()
-    print(f"Created {proposed} weekly adaptation proposals; kept {kept} existing plans; delivered {retried} pending agent notifications")
+    print(f"Created {proposed} weekly adaptation proposals; kept {kept} existing plans; delivered {retried} pending plan notifications and {cases} pending case outcomes")
 
 
 if __name__ == "__main__":

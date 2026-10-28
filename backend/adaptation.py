@@ -72,6 +72,8 @@ def _reason(skill: str, direction: str, scores: dict, target: float | None) -> s
         evidence = f"Your verified {skill} average is {score:g}, at or above your target of {target:g}"
     else:
         evidence = f"Your verified {skill} average is {score:g}"
+    if direction == "lowered" and target is not None and score < target:
+        return evidence + ", but other skills are further behind, so it gets less of your week for now."
     return evidence + (", so it gets more of your week." if direction == "raised" else ", so it needs less of your week." if direction == "lowered" else ".")
 
 
