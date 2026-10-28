@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Activity, AlertTriangle, ArrowRight, Minus, TrendingDown, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
@@ -22,6 +22,7 @@ import SpeakingPage from './exam/SpeakingPage'
 import TutorPage from './notebook/TutorPage'
 import NotebookPage from './notebook/NotebookPage'
 import SelectionCapture from './notebook/SelectionCapture'
+import ReportPage from './ReportPage'
 import { AgentActivity, AgentMemoryPage, AnomaliesPage, DevOverview, ReportsPage } from './dev/DevConsole'
 import { MyReports } from './ReportProblem'
 
@@ -214,18 +215,12 @@ function PlansPage({ notify }: { notify: Notify }) {
 const chartAxis = { stroke: '#b9b0e0', fontFamily: 'Pixelify Sans' }
 function AnalyticsPage({ notify }: { notify: Notify }) {
   const { data, loading, error, reload } = useLoad<any>('/analytics')
-  const reports = useLoad<{ id: number; result: Result }[]>('/reports')
+  const reports = useLoad<{ id: number; created_at: string; result: Result }[]>('/reports')
   const [busy, setBusy] = useState(false)
-  const [open, setOpen] = useState<Result | null>(null)
+  const navigate = useNavigate()
   const [params] = useSearchParams()
-  const reportPanel = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    // "View full report" from a mock result opens the report generated for it.
-    const id = Number(params.get('report'))
-    const found = id && reports.data?.find(r => r.id === id)
-    if (found) { setOpen(found.result); window.setTimeout(() => reportPanel.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 150) }
-  }, [reports.data])
-  const generate = async () => { setBusy(true); try { await post('/reports'); reports.reload(); notify('Verified report saved') } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
+  const generate = async () => { setBusy(true); try { const made = await post<{ id: number }>('/reports'); notify('Verified report saved'); navigate(`/report/${made.id}`) } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
+  if (params.get('report')) return <Navigate to={`/report/${params.get('report')}`} replace />
   // UC6 2b/8a: the data could not be loaded; nothing is lost and the learner can try again.
   if (error && !data) return <div className="panel panel-sun mx-auto mt-10 max-w-xl space-y-4 p-7 text-center anim-pop" role="alert">
     <h2 className="section-title">Report temporarily unavailable</h2><p className="font-read text-mist">{error}</p>
@@ -254,18 +249,10 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
         {data.repeated_errors?.length > 0 && <div className="mt-4 space-y-1">{data.repeated_errors.map((r: any) => <p key={r.issue} className="font-read text-sm text-mist">▸ {r.issue} ×{r.count}</p>)}</div>}
         <div className="mt-5 space-y-2">{data.recommendations?.map((r: string) => <p key={r} className="tile font-read text-sm">{r}</p>)}</div>
         {data.sample_count > 0 && <Link to="/materials?recommend=1" className="btn-cyan mt-4 inline-flex">Recommended for me <Sparkles size={15} /></Link>}</div>
-      <div ref={reportPanel} className="panel p-6"><h2 className="section-title">Saved reports</h2><div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <button key={r.id} onClick={() => setOpen(r.result)} className="tile flex w-full items-center justify-between font-pixel"><span>Report #{r.id}</span><Status value={r.result.state} /></button>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
-        {open && !open.payload && <p className="mt-4 tile font-read text-sm text-sun">This report is being double-checked before it is shown.</p>}
-        {open?.payload && <div className="mt-4 tile space-y-1 font-read text-sm">
-          {open.payload.trigger?.kind === 'mock_exam' && <p className="font-pixel text-xs text-cyan">Generated after mock #{open.payload.trigger.mock_id}</p>}
-          <p>{open.payload.summary}</p>
-          {open.payload.readiness && <p className="text-cyan">Readiness: {open.payload.readiness}{open.payload.readiness_note ? ` · ${open.payload.readiness_note}` : ''}</p>}
-          {open.payload.skill_scores && <p>Skills: {Object.entries(open.payload.skill_scores).map(([k, v]) => `${nice(k)} ${v}`).join(' · ')}</p>}
-          {open.payload.strengths?.length > 0 && <p className="text-lime">Strengths: {open.payload.strengths.map(nice).join(', ')}</p>}
-          {open.payload.weaknesses?.length > 0 && <p className="text-sun">To improve: {open.payload.weaknesses.map(nice).join(', ')}</p>}
-          {open.payload.trends && Object.keys(open.payload.trends).length > 0 && <p className="text-mist">Trends: {Object.entries(open.payload.trends).map(([k, t]: [string, any]) => `${nice(k)} ${t.direction}`).join(' · ')}</p>}
-          {open.payload.recommendations?.map((r: string) => <p key={r} className="text-mist">▸ {r}</p>)}
-          {open.payload.recommendations_unavailable && <p className="text-sun">Recommendations were temporarily unavailable for this report. Generate a new report later to get them.</p>}</div>}</div>
+      <div className="panel p-6"><h2 className="section-title">Saved reports</h2><p className="mt-1 font-read text-sm text-mist">A full report is created after every mock exam; open one for the section-by-section breakdown.</p>
+        <div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <Link key={r.id} to={`/report/${r.id}`} className="tile flex w-full items-center justify-between gap-3 font-pixel hover:bg-plum">
+          <span>Report #{r.id}<span className="ml-2 font-read text-xs text-mist">{r.result.payload?.trigger?.kind === 'mock_exam' ? `after mock #${r.result.payload.trigger.mock_id}` : 'manual'} · {stamp(r.created_at)}</span></span><Status value={r.result.state} /></Link>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
+</div>
     </div>
   </>
 }
@@ -446,6 +433,7 @@ function AppInner() {
             <Route path="/knowledge" element={<KnowledgeGraphPage />} />
             <Route path="/portrait" element={<PortraitPage />} />
             <Route path="/analytics" element={<AnalyticsPage notify={notify} />} />
+            <Route path="/report/:id" element={<ReportPage />} />
             <Route path="/materials" element={<MaterialsPage notify={notify} />} />
             <Route path="/tutor" element={<TutorPage notify={notify} />} />
             <Route path="/notebook" element={<NotebookPage notify={notify} />} />

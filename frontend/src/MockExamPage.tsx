@@ -30,7 +30,7 @@ function Results({ exam }: { exam: Mock }) {
     <Insights p={p} />
     <div className="panel panel-flat flex flex-wrap items-center justify-between gap-3 p-5">
       <p className="font-read text-sm text-mist">{exam.report_id ? 'Your full performance report has been updated with this mock: all four skills, trends over time and what to focus on next.' : 'See how this mock fits into your progress across all your verified results.'}</p>
-      <Link to={exam.report_id ? `/analytics?report=${exam.report_id}` : '/analytics'} className="btn-primary">View full report <ChevronRight size={16} /></Link>
+      <Link to={exam.report_id ? `/report/${exam.report_id}` : '/analytics'} className="btn-primary">View full report <ChevronRight size={16} /></Link>
     </div>
     {details.listening && <div className="panel p-6">
       <div className="flex flex-wrap gap-2">{SECTIONS.map(s => <button key={s} className={open === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setOpen(s)}>{nice(s)}</button>)}</div>

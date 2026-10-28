@@ -18,6 +18,7 @@ from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, Pas
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
+from backend import analytics as analytics_module
 from backend.analytics import latest_progress, split_skills, mock_insights, progress_recommendations, issue_history, skill_trends, progress_readiness
 from backend.agents import AgentRuntime, MockUnavailable, LocalGenerationUnavailable, practice_prompt
 from backend import adaptation
@@ -1191,7 +1192,8 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
             continue
         band = round(sum(feedback.criteria.values()) / len(feedback.criteria) * 2) / 2
         task_scores.append((task["task"], band))
-        writing_feedback[task["task"]] = {"criteria": feedback.criteria, "summary": feedback.summary, "comments": feedback.comments[:4], "band": band}
+        writing_feedback[task["task"]] = {"criteria": feedback.criteria, "summary": feedback.summary, "comments": feedback.comments, "band": band,
+                                          "analysis": feedback.analysis, "improved_sentences": feedback.improved_sentences, "improvements": feedback.improvements}
         # The section is only as certain as its least certain criterion.
         confidence["writing"] = min([confidence.get("writing", 1.0), *feedback.confidence.values()])
     weights = {"task2": 2, "task1": 1}
@@ -1208,7 +1210,8 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
     else:
         scores["speaking"] = round(sum(speaking.criteria.values()) / len(speaking.criteria) * 2) / 2
         confidence["speaking"] = min(speaking.confidence.values()) if speaking.confidence else .5
-        details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments[:4], "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note}
+        details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments, "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note,
+                               "analysis": speaking.analysis, "improved_sentences": speaking.improved_sentences, "improvements": speaking.improvements}
     overall = (overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / len(scores) * 2) / 2) if scores else 0
     target = db.scalar(select(Profile.target_score).where(Profile.user_id == user.id))
     current_issues = [c.get("issue") for fb in writing_feedback.values() for c in fb["comments"]] + [c.get("issue") for c in details["speaking"]["comments"]]
@@ -1245,7 +1248,10 @@ def report_after_mock(db: Session, exam: MockExam) -> int | None:
     comprehensive performance report (UC6) that includes it. A failure here never affects the saved mock result."""
     try:
         target = db.scalar(select(Profile.target_score).where(Profile.user_id == exam.user_id))
-        report = build_report(db, AgentRuntime(db), exam.user_id, exam.exam, target, {"kind": "mock_exam", "mock_id": exam.id})
+        answers = mock_answers(db, exam)
+        texts = {**{f"writing:{task}": str(text) for task, text in answers["writing"].items()}, "speaking": answers["speaking"].get("transcript", "")}
+        report = build_report(db, AgentRuntime(db), exam.user_id, exam.exam, target, {"kind": "mock_exam", "mock_id": exam.id},
+                              mock_payload=db.get(ResultPackage, exam.package_id).payload, texts=texts)
         if report:
             exam.sections = {**exam.sections, "report_id": report.id}
         db.commit()
@@ -1290,7 +1296,8 @@ def analytics(user: User = Depends(learner), db: Session = Depends(get_db)):
     return progress
 
 
-def build_report(db: Session, runtime: AgentRuntime, user_id: int, exam: str, target: float | None, trigger: dict | None = None) -> PerformanceReport | None:
+def build_report(db: Session, runtime: AgentRuntime, user_id: int, exam: str, target: float | None, trigger: dict | None = None,
+                 mock_payload: dict | None = None, texts: dict | None = None) -> PerformanceReport | None:
     """UC6: the Assessment & Analytics agent analyses verified results and writes the report; the Quality Manager checks it.
     Returns None when there is no verified result yet (2a)."""
     data = runtime.assessment.analyse_progress(user_id)
@@ -1299,6 +1306,10 @@ def build_report(db: Session, runtime: AgentRuntime, user_id: int, exam: str, ta
     data["target_score"] = target
     if trigger:
         data["trigger"] = trigger
+    data["sections"] = runtime.assessment.diagnose_sections(user_id, target, mock_payload, texts)
+    data["patterns"] = analytics_module.learning_patterns(db, user_id)
+    if mock_payload:
+        data["mock_summary"] = {key: mock_payload.get(key) for key in ("estimated_overall", "section_scores", "readiness", "readiness_detail", "comparison", "score_scale")}
     data = runtime.assessment.write_report(user_id, exam, data)
     package = runtime.verify_output(user_id, "report", data)
     report = PerformanceReport(user_id=user_id, package_id=package.id)
@@ -1320,6 +1331,12 @@ def create_report(user: User = Depends(learner), db: Session = Depends(get_db)):
         raise HTTPException(409, "Complete practice before generating a report")  # 2a
     db.commit()
     return {"id": report.id, "result": package_view(db.get(ResultPackage, report.package_id))}
+
+
+@app.get("/api/reports/{report_id}")
+def report_detail(report_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    report = owned(db, PerformanceReport, report_id, user)
+    return {"id": report.id, "created_at": report.created_at, "result": package_view(db.get(ResultPackage, report.package_id))}
 
 
 @app.get("/api/reports")

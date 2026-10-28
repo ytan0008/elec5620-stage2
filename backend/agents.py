@@ -717,6 +717,13 @@ class AssessmentAgent(Agent):
                     raise
                 self.event(state, "decision", {"decision": "performance analysis failed; retrying", "attempt": attempt, "error_type": type(exc).__name__})
 
+    def diagnose_sections(self, user_id: int, target: float | None, mock_payload: dict | None = None, texts: dict | None = None) -> dict:
+        """Section by section: what went well, what to improve, missed question types and words, grammar by type."""
+        sections = analytics.mock_section_report(mock_payload, texts or {}, target) if mock_payload else analytics.practice_section_report(self.db, user_id, target)
+        self.event({"user_id": user_id, "workflow": "report"}, "decision", {"decision": "diagnosed each section", "sections": sorted(sections),
+                   "source": "mock exam" if mock_payload else "latest practice"})
+        return sections
+
     def write_report(self, user_id: int, exam: str, progress: dict) -> dict:
         """Step 6: the report narrative and recommendations. 6a: if they fail, keep the verified analysis without recommendations."""
         state: FlowState = {"user_id": user_id, "workflow": "report"}

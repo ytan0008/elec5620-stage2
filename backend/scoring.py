@@ -53,7 +53,7 @@ def grade_objective(test: dict, answers: dict, skill: str, exam: str) -> dict:
     for section, group, question in iter_questions(test):
         given = answers.get(str(question["n"]), "")
         correct = is_correct(question, given, group["type"])
-        items.append({"n": question["n"], "section": section.get("title"), "given": given, "answer": question["answer"],
+        items.append({"n": question["n"], "section": section.get("title"), "prompt": question.get("prompt") or question.get("text", ""), "given": given, "answer": question["answer"],
                       "correct": correct, "evidence": question.get("evidence", ""), "type": group["type"]})
     total = len(items)
     raw = sum(item["correct"] for item in items)
@@ -160,6 +160,10 @@ ERRORS = [
     (r"\ba (?!uni|use|usu|one|euro|u\b)([aeiou]\w*)", "Use 'an' before a vowel sound.", lambda s: re.sub(r"\ba (?!uni|use|usu|one|euro)([aeiou]\w*)", r"an \1", s)),
     (r"\bsince (\d+ )?(years|months|days|weeks)\b", "Use 'for' with a period of time (for two years).", None),
     (r"\b(we|they|you) am\b|\bi (is|are)\b", "Check subject-verb agreement (I am, we are).", None),
+    (r"\b(they|we|you|people|children|students|workers|companies|parents) (works|goes|wants|likes|needs|thinks|makes|gets|says|lives|plays|feels|seems|uses|has|does|is|was)\b",
+     "A plural subject takes a plural verb (they work, they have, they are).", lambda s: re.sub(
+         r"\b(they|we|you|people|children|students|workers|companies|parents) (works|goes|wants|likes|needs|thinks|makes|gets|says|lives|plays|feels|seems|uses|has|does|is|was)\b",
+         lambda m: f"{m.group(1)} " + {"has": "have", "does": "do", "is": "are", "was": "were", "goes": "go"}.get(m.group(2), m.group(2)[:-1]), s, flags=re.I)),
 ]
 STOP = set("the a an and or but of to in on at for with by from this that these those is are was were be been being it its as into than then there their they them some many much more most other such can could should would will may might must not no do does did have has had about also very what which who whom whose when where why how all any each few both own same so too only just your you our we i he she his her my me".split())
 
@@ -191,9 +195,17 @@ def find_errors(text: str, spoken: bool = False) -> list[dict]:
         lower = sentence.lower()
         hits = [(advice, fix) for pattern, advice, fix in ERRORS if re.search(pattern, lower, flags=re.I)]
         # One corrected version per sentence with every automatic fix applied, keeping the opening capital.
+        # Fixing one error can reveal the next ("peoples is" -> "people is" -> "people are"), so repeat until stable.
         corrected = lower
-        for _, fix in hits:
-            corrected = fix(corrected) if fix else corrected
+        for _ in range(3):
+            before = corrected
+            for pattern, advice, fix in ERRORS:
+                if fix and re.search(pattern, corrected, flags=re.I):
+                    corrected = fix(corrected)
+                    if all(advice != seen for seen, _ in hits):
+                        hits.append((advice, fix))
+            if corrected == before:
+                break
         if corrected != lower and sentence[:1].isupper():
             corrected = corrected[:1].upper() + corrected[1:]
         corrected = re.sub(r"\bi\b", "I", corrected) if corrected != lower else ""
@@ -319,7 +331,9 @@ def analyse_response(exam: str, skill: str, text: str, prompt: str = "", task: s
         if spoken and isinstance(repeat, (int, float)):
             criteria["language_use"] = max(1.0, min(6.0, round(((criteria["language_use"] + 1 + repeat * 5) / 2) * 2) / 2))
     comments = []
-    for error in f["errors"][:5]:
+    # One comment per distinct problem; real grammar errors (with a correction) before capitalisation and style.
+    distinct = list({error["issue"]: error for error in sorted(f["errors"], key=lambda e: "correction" not in e)[::-1]}.values())[::-1]
+    for error in sorted(distinct, key=lambda e: "correction" not in e)[:6]:
         comments.append({k: v for k, v in error.items()})
     if f["words"] < min_words:
         comments.append({"sentence": "", "issue": "Response is under length", "suggestion": f"You wrote {f['words']} words; aim for at least {min_words}. Under-length answers are limited in Task Response." if not spoken else f"You spoke {f['words']} words in total. Extend each answer with a reason and an example."})

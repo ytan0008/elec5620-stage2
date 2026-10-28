@@ -5,6 +5,9 @@ weaknesses against the target, trends, readiness, recommendations and mock
 comparisons. AssessmentAgent in backend/agents.py calls these and records what it
 did; nothing here talks to the language model.
 """
+import re
+from collections import Counter
+from difflib import SequenceMatcher
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from backend.models import MockExam, Profile, ResultPackage
@@ -147,3 +150,210 @@ def progress_recommendations(progress: dict) -> list[str]:
              if t["direction"] == "declining" and skill not in progress["weaknesses"][:2]]
     tips += [f"'{item['issue']}' came up {item['count']} times in your feedback: make it your focus in the next task." for item in progress["repeated_errors"][:2]]
     return tips or ["Keep practising all four skills to maintain your level."]
+
+
+# ---------------------------------------------------------------- section-by-section diagnosis for the report
+
+TYPE_NAMES = {"completion": "Form / note / sentence completion", "mcq": "Multiple choice", "matching": "Matching", "tfng": "True / False / Not Given",
+              "ynng": "Yes / No / Not Given", "headings": "Matching headings", "cwords": "Complete the Words"}
+
+# Feedback comments are sorted into the kind of problem they describe (works for rule-based and model-written comments).
+GRAMMAR_TYPES = [
+    ("Subject-verb agreement", r"agreement|plural verb|singular verb|third-person|'doesn't' with|people' takes"),
+    ("Plurals and uncountable nouns", r"uncountable|already plural|plural unless"),
+    ("Comparatives", r"comparative"),
+    ("Verb forms and tenses", r"base form|tense|past participle|verb form"),
+    ("Articles (a / an / the)", r"'an' before|article"),
+    ("Prepositions", r"direct object|explain to me|'for' with|preposition"),
+    ("Modal verbs", r"be able to|modal"),
+    ("Capital letters", r"capital"),
+    ("Repeated words", r"repeated by mistake"),
+    ("Sentence structure", r"long sentence|run-on|fragment|sentence structure"),
+]
+VOCABULARY_TYPES = [
+    ("Collocation", r"collocation|'do' or 'carry out'"),
+    ("Formal style", r"contraction|informal"),
+    ("Linking words", r"connector|linking|cohesive"),
+    ("Range of vocabulary", r"higher-level|wider range|vocabulary|word choice|repetit"),
+]
+TASK_TYPES = [
+    ("Length", r"under length|aim for at least"),
+    ("Overview", r"overview"),
+    ("Clear position", r"position|opinion"),
+    ("Developing ideas", r"example|develop"),
+    ("Fluency", r"filler|hesitat|pause"),
+]
+
+
+STOPWORDS = {"about", "after", "again", "because", "before", "being", "could", "every", "other", "their", "there", "these", "thing", "things",
+             "think", "those", "would", "which", "while", "where", "really", "should", "maybe", "people", "always", "usually", "something"}
+MIN_WORDS_FOR_STRENGTHS = {"writing": 80, "speaking": 40}  # too little text says nothing reliable about range or accuracy
+
+
+MARKERS = re.compile(r"\[[^\]]*\]\s*")  # transcript markers such as [Part 1]
+
+
+def clean_sentence(text: str) -> str:
+    text = MARKERS.sub("", text or "").strip()
+    return text[:1].upper() + text[1:] if text else text
+
+
+def classify_comment(comment: dict) -> tuple[str, str]:
+    text = f"{comment.get('issue', '')} {comment.get('suggestion', '')}".lower()
+    for area, table in (("grammar", GRAMMAR_TYPES), ("vocabulary", VOCABULARY_TYPES), ("task", TASK_TYPES)):
+        for label, pattern in table:
+            if re.search(pattern, text):
+                return area, label
+    return "other", comment.get("issue") or "Other"
+
+
+def objective_breakdown(skill: str, detail: dict, score: float | None) -> dict:
+    """Listening / reading: accuracy by question type and every missed question (not written, misspelled or wrong)."""
+    review = detail.get("review", [])
+    types: dict[str, dict] = {}
+    for item in review:
+        bucket = types.setdefault(item.get("type", "other"), {"correct": 0, "total": 0})
+        bucket["correct"] += bool(item.get("correct"))
+        bucket["total"] += 1
+    table = sorted(({"type": TYPE_NAMES.get(k, k), "correct": v["correct"], "total": v["total"], "accuracy": round(v["correct"] / v["total"], 2)} for k, v in types.items()),
+                   key=lambda row: row["accuracy"])
+    missed = []
+    for item in review:
+        if item.get("correct"):
+            continue
+        given, answer = str(item.get("given") or "").strip(), str(item.get("answer") or "")
+        written = item.get("type") in ("completion", "cwords")
+        kind = "not written" if not given else "misspelled" if written and SequenceMatcher(None, given.lower(), answer.lower()).ratio() >= .75 else "wrong"
+        missed.append({"n": item.get("n"), "question": item.get("prompt", ""), "your_answer": given, "correct_answer": answer, "kind": kind,
+                       "type": TYPE_NAMES.get(item.get("type"), item.get("type")), "evidence": item.get("evidence", "")})
+    counts = {kind: sum(m["kind"] == kind for m in missed) for kind in ("not written", "misspelled", "wrong")}
+    raw, total = detail.get("raw_score", sum(i.get("correct", False) for i in review)), detail.get("total", len(review))
+    well = [f"{row['type']}: {row['correct']}/{row['total']} correct" for row in reversed(table) if row["accuracy"] >= .7]
+    poor = [f"{row['type']}: only {row['correct']}/{row['total']} correct" for row in table if row["accuracy"] < .5]
+    if counts["not written"]:
+        poor.append(f"{counts['not written']} question{'s' if counts['not written'] > 1 else ''} left blank" + (" (missed while listening)" if skill == "listening" else ""))
+    if counts["misspelled"]:
+        poor.append(f"{counts['misspelled']} answer{'s' if counts['misspelled'] > 1 else ''} nearly right but misspelled (spelling counts in the real test)")
+    return {"skill": skill, "score": score, "raw": raw, "total": total, "went_well": well or (["Every question answered correctly"] if not missed else []),
+            "to_improve": poor, "question_types": table, "missed": missed, "missed_counts": counts,
+            "words_not_written": [m["correct_answer"] for m in missed if m["kind"] == "not written" and m["type"] == TYPE_NAMES["completion"]],
+            "misspelled": [{"you_wrote": m["your_answer"], "correct": m["correct_answer"]} for m in missed if m["kind"] == "misspelled"]}
+
+
+def production_breakdown(skill: str, feedback: dict, text: str, target: float | None, metrics: dict | None = None) -> dict:
+    """Writing / speaking: criteria against the target, grammar errors by type with corrections, vocabulary, task and fluency."""
+    from backend.scoring import find_errors, text_features
+    spoken = skill == "speaking"
+    criteria = feedback.get("criteria") or {}
+    rows = [{"name": name.replace("_", " "), "score": value, "status": "strength" if target is not None and value >= target else "to improve"} for name, value in criteria.items()]
+    text = MARKERS.sub("", text or "")
+    comments = [{**c, "sentence": clean_sentence(c.get("sentence", "")), "correction": clean_sentence(c.get("correction", ""))} for c in feedback.get("comments") or []]
+    # Re-check the full text so no grammar error is lost to the comment limit.
+    if text:
+        known = {(c.get("sentence", "").lower(), c.get("issue")) for c in comments}
+        comments += [{**e, "sentence": clean_sentence(e.get("sentence", "")), "correction": clean_sentence(e.get("correction", ""))}
+                     for e in find_errors(text, spoken) if (clean_sentence(e.get("sentence", "")).lower(), e.get("issue")) not in known]
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for comment in comments:
+        groups.setdefault(classify_comment(comment), []).append(comment)
+    def listing(area: str) -> list[dict]:
+        rows = []
+        for (kind, label), items in groups.items():
+            if kind != area:
+                continue
+            distinct = {(c.get("sentence", "").lower(), c.get("issue")): c for c in items}  # one error per sentence and rule
+            examples = {}
+            for c in distinct.values():  # show each sentence once, however many errors it has
+                if c.get("sentence") and c["sentence"] not in examples:
+                    examples[c["sentence"]] = {"sentence": c["sentence"], "correction": c.get("correction", "")}
+            rows.append({"type": label, "count": len(distinct), "advice": items[0].get("suggestion", ""), "examples": list(examples.values())[:3]})
+        return sorted(rows, key=lambda row: -row["count"])
+    grammar, vocabulary, task = listing("grammar"), listing("vocabulary"), listing("task") + listing("other")
+    stats = {**(text_features(text, spoken=spoken) if text else {}), **(feedback.get("analysis") or {})}
+    words = re.findall(r"[a-z][a-z']+", re.sub(r"\[[^\]]*\]", " ", (text or "").lower()))  # drop markers such as [Part 1]
+    repeated = [w for w, n in Counter(w for w in words if len(w) > 4 and w not in STOPWORDS).most_common(4) if n >= (4 if spoken else 3)]
+    enough = len(words) >= MIN_WORDS_FOR_STRENGTHS[skill]
+    vocab = {"words": stats.get("words", len(words)), "lexical_diversity": stats.get("lexical_diversity"), "academic_words": stats.get("academic_words", [])[:8],
+             "linker_variety": stats.get("linker_variety"), "repeated_words": repeated}
+    well = [f"{row['name'].title()} {row['score']} (at or above your target)" for row in rows if row["status"] == "strength"]
+    poor: list[str] = []
+    if enough and (vocab["lexical_diversity"] or 0) >= .65:
+        well.append(f"Varied vocabulary (diversity {vocab['lexical_diversity']})")
+    if vocab["academic_words"]:
+        well.append("Uses academic words: " + ", ".join(vocab["academic_words"][:5]))
+    if enough and (vocab["linker_variety"] or 0) >= 3:
+        well.append(f"Good range of linking words ({vocab['linker_variety']} different)")
+    if enough and (stats.get("complex_per_sentence") or 0) >= .5:
+        well.append("Mixes in complex sentences")
+    if enough and not grammar:
+        well.append("No grammar errors found")
+    if text and not enough:
+        poor.insert(0, f"Only {len(words)} words: too little to show your range (aim for {'250+ words' if skill == 'writing' else 'longer, developed answers'})")
+    poor += [f"{row['name'].title()} {row['score']} (below your target {target})" for row in rows if row["status"] == "to improve" and target is not None]
+    poor += [f"Grammar - {row['type']}: {row['count']} error{'s' if row['count'] > 1 else ''}" for row in grammar[:4]]
+    poor += [f"Vocabulary - {row['type']}" for row in vocabulary[:3]]
+    if repeated:
+        poor.append("Repeats the same words: " + ", ".join(repeated))
+    poor += [row["type"] for row in task[:3]]
+    fluency = None
+    if spoken:
+        m = metrics or {}
+        fluency = {"words_per_minute": m.get("words_per_minute") or stats.get("words_per_minute"), "fillers": m.get("fillers", stats.get("fillers")),
+                   "turns": m.get("turns"), "average_turn_words": m.get("average_turn_words"), "part2_words": m.get("long_turn_words")}
+        if fluency["part2_words"] is not None:
+            (well if fluency["part2_words"] >= 170 else poor).append(f"Part 2 long turn: {fluency['part2_words']} words" + ("" if fluency["part2_words"] >= 170 else " (aim for about 200 words in two minutes)"))
+        if fluency["average_turn_words"] is not None and fluency["average_turn_words"] < 25:
+            poor.append(f"Short answers: about {fluency['average_turn_words']} words per answer (extend with a reason and an example)")
+        wpm = fluency["words_per_minute"]
+        if wpm and 110 <= wpm <= 170:
+            well.append(f"Natural speaking pace ({wpm} words per minute)")
+        elif wpm:
+            poor.append(f"Speaking pace {wpm} words per minute ({'too slow' if wpm < 110 else 'very fast'}; aim for about 120-160)")
+        if fluency["fillers"] is not None:
+            (well if fluency["fillers"] <= 2 else poor).append(f"{fluency['fillers']} filler words (um, er, you know)")
+    return {"skill": skill, "criteria": rows, "went_well": well, "to_improve": poor, "grammar": grammar, "vocabulary": {**vocab, "issues": vocabulary},
+            "task_issues": task, "fluency": fluency,
+            "better_sentences": list({clean_sentence(b.get("original", "")): {"original": clean_sentence(b.get("original", "")), "improved": clean_sentence(b.get("improved", ""))}
+                                      for b in feedback.get("improved_sentences") or [] if b.get("original")}.values())[:4],
+            "pronunciation_note": feedback.get("pronunciation_note")}
+
+
+def mock_section_report(payload: dict, texts: dict, target: float | None) -> dict:
+    """The four sections of one marked mock exam."""
+    details, scores = payload.get("details", {}), payload.get("section_scores", {})
+    sections = {skill: objective_breakdown(skill, details.get(skill, {}), scores.get(skill)) for skill in ("listening", "reading")}
+    tasks = []
+    for task, feedback in (details.get("writing") or {}).items():
+        tasks.append({"task": task, "band": feedback.get("band"), **production_breakdown("writing", feedback, texts.get(f"writing:{task}", ""), target)})
+    label = (lambda t: f"{t['task'].replace('task', 'Task ')}: ") if len(tasks) > 1 else (lambda t: "")  # name the task only when there are two
+    sections["writing"] = {"skill": "writing", "score": scores.get("writing"), "tasks": tasks,
+                           "went_well": [f"{label(t)}{item}" for t in tasks for item in t["went_well"]],
+                           "to_improve": [f"{label(t)}{item}" for t in tasks for item in t["to_improve"]]}
+    speaking = details.get("speaking") or {}
+    sections["speaking"] = {**production_breakdown("speaking", speaking, texts.get("speaking", ""), target, speaking.get("metrics")), "score": scores.get("speaking")}
+    return sections
+
+
+def practice_section_report(db: Session, user_id: int, target: float | None) -> dict:
+    """Without a mock: the latest verified result in each skill."""
+    from backend.models import Submission
+    sections = {}
+    for skill in ("listening", "reading", "writing", "speaking"):
+        package = db.scalar(select(ResultPackage).where(ResultPackage.user_id == user_id, ResultPackage.kind == skill, ResultPackage.state == "RELEASED").order_by(ResultPackage.id.desc()))
+        if not package:
+            continue
+        payload = package.payload or {}
+        if skill in ("listening", "reading"):
+            sections[skill] = objective_breakdown(skill, payload, payload.get("estimated_overall"))
+        else:
+            text = db.scalar(select(Submission.text).where(Submission.package_id == package.id)) or ""
+            sections[skill] = {**production_breakdown(skill, payload, text, target, payload.get("metrics")), "score": payload.get("estimated_overall")}
+        sections[skill]["source"] = f"Latest {skill} practice ({package.created_at.date().isoformat()})"
+    return sections
+
+
+def learning_patterns(db: Session, user_id: int) -> dict:
+    """Patterns across all verified practice: most-missed question types and repeated grammar problems."""
+    from backend import notebook
+    summary = notebook.stats(db, user_id)
+    return {"mistakes_by_type": summary.get("mistakes_by_type", [])[:5], "grammar_issues": summary.get("grammar_issues", [])[:5]}

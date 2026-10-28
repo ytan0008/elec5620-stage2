@@ -898,3 +898,35 @@ def test_verified_mock_generates_its_performance_report(monkeypatch):
         assert approved.status_code == 200, approved.text
         after = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
         assert after["result"]["state"] == "RELEASED" and after["report_id"]
+
+
+def test_report_breaks_down_every_section():
+    import json
+    with TestClient(app) as client:
+        headers = auth(client, "report.sections@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. " * 4
+        tasks = {task["task"]: essay for task in mock["sections"]["writing"]["tasks"]}
+        listening = {"1": "Kowalsky", "2": ""}  # 1 misspelled, 2 left blank
+        for skill, answer in {"listening": listening, "reading": {"1": "TRUE"}, "writing": tasks}.items():
+            client.put(f"/api/mock-exams/{mock['id']}/{skill}", headers=headers, json={"answer": json.dumps(answer)})
+        speak_mock(client, headers, mock["id"])
+        done = client.post(f"/api/mock-exams/{mock['id']}/submit", headers=headers).json()
+        report = client.get(f"/api/reports/{done['report_id']}", headers=headers).json()["result"]["payload"]
+        sections = report["sections"]
+        assert set(sections) == {"listening", "reading", "writing", "speaking"}
+        heard = sections["listening"]
+        assert heard["question_types"] and heard["went_well"] is not None and heard["to_improve"]
+        first, second = (next(m for m in heard["missed"] if m["n"] == n) for n in (1, 2))
+        assert first["kind"] == "misspelled" and first["correct_answer"] == "Kowalski" and first["question"]
+        assert second["kind"] == "not written" and second["correct_answer"] in heard["words_not_written"]
+        task = sections["writing"]["tasks"][0]
+        grammar = {g["type"]: g for g in task["grammar"]}
+        assert {"Subject-verb agreement", "Plurals and uncountable nouns", "Comparatives"} <= set(grammar)
+        assert "people are better when they work" in grammar["Subject-verb agreement"]["examples"][0]["correction"]
+        assert sections["speaking"]["fluency"]["words_per_minute"] and sections["speaking"]["criteria"]
+        assert "mistakes_by_type" in report["patterns"] and report["mock_summary"]["estimated_overall"] == done["result"]["payload"]["estimated_overall"]
+        other = auth(client, "report.other@example.com")
+        assert client.get(f"/api/reports/{done['report_id']}", headers=other).status_code == 404
