@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Activity, AlertTriangle, ArrowRight, Gauge, MessageSquareWarning, BookMarked, BookOpen, GraduationCap, BrainCircuit, ChevronRight, ClipboardCheck, Clock3, FileText, Headphones, LayoutDashboard, Library, LogOut, Menu, Mic, Settings, ShieldCheck, Sparkles, Target, TrendingUp, UserRound, Wand2, X } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
+import { AdaptationNotice, Health, NotebookStats, Persona, Plan, Profile, Result, User, health, post, put } from './api'
 import { Empty, Metric, Notify, PageTitle, SKILL_COLOR, Spinner, Status, nice, skills, stamp, useLoad } from './ui'
 import { PixelAvatar, personaName } from './pixel/Avatar'
 import Scene from './pixel/Scene'
@@ -155,24 +155,56 @@ function ProfilePage({ notify }: { notify: Notify }) {
   </>
 }
 
+const TRIGGER_LABEL: Record<string, string> = { learner_request: 'your request', weekly_review: 'your weekly review', major_assessment: 'your mock exam' }
+const CHANGE_LABEL: Record<string, string> = { raised: 'more time', lowered: 'less time', reordered: 'reordered' }
+
 function PlansPage({ notify }: { notify: Notify }) {
   const { data, reload, loading } = useLoad<Plan[]>('/plans')
+  const notice = useLoad<{ notice: AdaptationNotice | null }>('/plans/adaptation-notice')
   const [busy, setBusy] = useState(false)
   const [changeText, setChangeText] = useState('')
-  const act = async (fn: () => Promise<unknown>, message: string) => { setBusy(true); try { await fn(); reload(); notify(message) } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
+  const refresh = () => { reload(); notice.reload() }
+  const act = async (fn: () => Promise<unknown>, message: string) => { setBusy(true); try { await fn(); refresh(); notify(message) } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
   const active = data?.some(p => p.status === 'ACTIVE')
+  const requestPlan = async () => {
+    setBusy(true)
+    try {
+      const result = await post<{ outcome?: string; message?: string }>(`/plans/generate?adapt=${!!active}`)
+      refresh()
+      notify(result.message ?? (active ? 'Adapted plan proposed' : 'Plan generated'))  // the existing plan was kept: say why
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const decide = async (plan: Plan, accept: boolean) => {
+    setBusy(true)
+    try {
+      const result = await post<{ notifications_pending?: string[] }>(`/plans/${plan.id}/decision?accept=${accept}`)
+      refresh()
+      notify(!accept ? 'Proposal rejected; existing plan preserved' : result.notifications_pending?.length ? 'Plan activated. Your study agents will get the update shortly.' : 'Plan activated')
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const message = notice.data?.notice
   return <>
     <PageTitle eyebrow="Learning coordinator" title="Your learning plan" subtitle="A weekly path shaped by your exam goal and verified progress."
-      action={<button disabled={busy} onClick={() => act(() => post(`/plans/generate?adapt=${!!active}`), active ? 'Adapted plan proposed' : 'Plan generated')} className="btn-primary">{active ? 'Request adaptation' : 'Generate first plan'}<Sparkles size={16} /></button>} />
+      action={<button disabled={busy} onClick={requestPlan} className="btn-primary">{active ? 'Request adaptation' : 'Generate first plan'}<Sparkles size={16} /></button>} />
+    {message && <div className="panel panel-cyan mb-5 p-5" role="status"><h2 className="section-title">Your plan was not changed</h2><p className="mt-2 font-read text-mist">{message.message}</p></div>}
     {loading ? <Spinner /> : !data?.length ? <Empty title="No plan yet" body="Generate a personal plan from your confirmed profile." action={<button onClick={() => act(() => post('/plans/generate'), 'Plan generated')} className="btn-primary">Generate plan</button>} />
       : <div className="stagger space-y-5">{data.map(plan => <div className={`panel p-6 ${plan.status === 'ACTIVE' ? 'panel-lime' : ''}`} key={plan.id}>
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><span className="eyebrow">Version {plan.version} · {plan.kind}</span><h2 className="heading mt-2 text-2xl">{plan.content?.title || 'Plan in quality review'}</h2></div><Status value={plan.status} /></div>
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><span className="eyebrow">Version {plan.version} · {plan.kind}</span><h2 className="heading mt-2 text-2xl">{plan.content?.title || 'Plan in quality review'}</h2>
+          {plan.kind === 'adaptation' && plan.content?.trigger && <p className="mt-1 font-read text-xs text-fog">Proposed after {TRIGGER_LABEL[plan.content.trigger] ?? 'a progress review'}</p>}</div><Status value={plan.status} /></div>
         {plan.content ? <><p className="mt-4 font-read text-mist">{plan.content.rationale}</p>
+          {plan.content.change_details?.length > 0 && <div className="mt-5"><h3 className="font-pixel text-sm">What changed and why</h3>
+            <ul className="mt-2 space-y-2">{plan.content.change_details.map((c: Record<string, any>) => <li key={c.skill} className="tile">
+              <span className="font-pixel text-xs" style={{ color: SKILL_COLOR[c.skill] }}>{nice(c.skill)}: {CHANGE_LABEL[c.change] ?? c.change} · priority {c.from_priority ?? '–'} → {c.to_priority ?? '–'} · {c.minutes_before} → {c.minutes_after} min a week</span>
+              <p className="mt-1 font-read text-sm">{c.reason}</p></li>)}</ul></div>}
           <div className="mt-5 grid gap-3 sm:grid-cols-2">{plan.content.activities?.map((a: Record<string, any>, i: number) => <div key={i} className="tile"><span className="font-pixel text-xs uppercase" style={{ color: SKILL_COLOR[a.skill] }}>{a.skill} · {a.minutes_per_week} min / week</span><p className="mt-1 font-read">{a.title}</p><p className="mt-1 font-read text-xs text-fog">{a.reason}</p></div>)}</div>
-          {plan.content.changes?.length > 0 && <p className="mt-4 font-read text-sm text-cyan">Changes: {plan.content.changes.join('; ')}</p>}</>
+          {plan.content.resources?.length > 0 && <div className="mt-5"><h3 className="font-pixel text-sm">Study resources for your focus</h3>
+            <ul className="mt-2 grid gap-2 sm:grid-cols-3">{plan.content.resources.map((r: Record<string, any>) => <li key={r.skill} className="tile font-read text-sm">
+              <span className="font-pixel text-xs" style={{ color: SKILL_COLOR[r.skill] }}>{nice(r.skill)}</span>
+              {r.title ? <Link to={`/materials?open=${r.material_id}`} className="mt-1 block text-cyan underline">{r.title}</Link> : <p className="mt-1 text-fog">No material for this area yet.</p>}</li>)}</ul></div>}
+          {!plan.content.change_details?.length && plan.content.changes?.length > 0 && <p className="mt-4 font-read text-sm text-cyan">{plan.kind === 'adaptation' ? plan.content.changes.join('; ') : `Changes: ${plan.content.changes.join('; ')}`}</p>}</>
           : <p className="mt-4 font-read text-sun">Awaiting human quality review. The plan content is held.</p>}
         {plan.status === 'PROPOSED' && <div className="mt-5 space-y-3">
-          <div className="flex flex-wrap gap-2"><button className="btn-lime" disabled={busy} onClick={() => act(() => post(`/plans/${plan.id}/decision?accept=true`), 'Plan activated')}>Accept plan</button><button className="btn-secondary" disabled={busy} onClick={() => act(() => post(`/plans/${plan.id}/decision?accept=false`), 'Proposal rejected; existing plan preserved')}>Reject</button></div>
+          <div className="flex flex-wrap gap-2"><button className="btn-lime" disabled={busy} onClick={() => decide(plan, true)}>Accept plan</button><button className="btn-secondary" disabled={busy} onClick={() => decide(plan, false)}>Reject</button></div>
           <div className="flex flex-wrap gap-2"><input className="input max-w-md" placeholder="Request a change, e.g. more speaking practice" value={changeText} onChange={e => setChangeText(e.target.value)} /><button className="btn-secondary" disabled={busy || changeText.trim().length < 5} onClick={() => act(async () => { await post(`/plans/${plan.id}/request-changes`, { note: changeText }); setChangeText('') }, 'Revised plan proposed')}>Request changes</button></div>
         </div>}
       </div>)}</div>}
@@ -226,6 +258,8 @@ function MaterialsPage({ notify }: { notify: Notify }) {
       else { setDismissed(ids => [...ids, selected.id]); setSelected(null); notify("Removed. It won't be recommended again.") }
     } catch (e) { notify((e as Error).message, 'error') }
   }
+  const [params] = useSearchParams()
+  useEffect(() => { const id = Number(params.get('open')); const item = id && data?.find(m => m.id === id); if (item) view(item) }, [data])  // a plan's resource link opens its lesson
   // When a new list is held for checking, keep showing the last list that passed (UC10 6a).
   const list = recommendations?.payload ?? recommendations?.last_verified
   return <>

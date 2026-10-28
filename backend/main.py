@@ -19,6 +19,7 @@ from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
 from backend.agents import AgentRuntime, LocalGenerationUnavailable, practice_prompt
+from backend import adaptation
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import grade_objective, strip_answers, overall_band, find_errors
@@ -618,14 +619,26 @@ def generate_plan(adapt: bool = False, user: User = Depends(learner), db: Sessio
     profile = profile_for(db, user)
     if adapt and not db.scalar(select(Plan.id).where(Plan.user_id == user.id, Plan.status == "ACTIVE")):
         raise HTTPException(409, "Accept an initial plan first")
+    if adapt:  # UC7, triggered by the learner
+        result = adaptation.propose(db, user.id, profile_data(profile), latest_progress(db, user.id), "learner_request")
+        db.commit()
+        if result["plan"] is None:  # 3a / 4a: the existing plan stays active
+            return {"id": None, "status": "KEPT_EXISTING", "outcome": result["outcome"], "message": result["message"], "package": None}
+        return {"id": result["plan"].id, "status": result["plan"].status, "outcome": result["outcome"], "package": package_view(result["package"])}
     runtime = AgentRuntime(db)
-    state = runtime.plan_graph().invoke({"user_id": user.id, "workflow": "adaptation" if adapt else "plan", "profile": profile_data(profile), "progress": latest_progress(db, user.id)})
+    state = runtime.plan_graph().invoke({"user_id": user.id, "workflow": "plan", "profile": profile_data(profile), "progress": latest_progress(db, user.id)})
     package = db.get(ResultPackage, state["package_id"])
     version = (db.scalar(select(func.max(Plan.version)).where(Plan.user_id == user.id)) or 0) + 1
-    plan = Plan(user_id=user.id, version=version, kind="adaptation" if adapt else "initial", status="PROPOSED" if package.state == "RELEASED" else "HELD", content=package.payload, package_id=package.id)
+    plan = Plan(user_id=user.id, version=version, kind="initial", status="PROPOSED" if package.state == "RELEASED" else "HELD", content=package.payload, package_id=package.id)
     db.add(plan)
     db.commit()
     return {"id": plan.id, "status": plan.status, "package": package_view(package)}
+
+
+@app.get("/api/plans/adaptation-notice")
+def adaptation_notice(user: User = Depends(learner), db: Session = Depends(get_db)):
+    """UC7 3a / 4a: why the learner's existing plan was kept the last time an adaptation was attempted."""
+    return {"notice": adaptation.latest_notice(db, user.id)}
 
 
 @app.post("/api/plans/{plan_id}/decision")
@@ -633,13 +646,16 @@ def plan_decision(plan_id: int, accept: bool, user: User = Depends(learner), db:
     plan = owned(db, Plan, plan_id, user)
     if plan.status != "PROPOSED" or db.get(ResultPackage, plan.package_id).state != "RELEASED":
         raise HTTPException(409, "Only verified proposed plans can be decided")
+    undelivered: list[str] = []
     if accept:
+        previous = None
         for old in db.scalars(select(Plan).where(Plan.user_id == user.id, Plan.status == "ACTIVE")):
+            previous = previous or old.content
             old.status = "SUPERSEDED"
         plan.status = "ACTIVE"
         for item in plan.content["activities"]:
             db.add(StudyTask(user_id=user.id, plan_id=plan.id, skill=item["skill"], title=item["title"]))
-        db.add(AgentEvent(user_id=user.id, workflow="adaptation" if plan.kind == "adaptation" else "plan", agent="Learning Coordinator", phase="handoff", detail={"decision": "activated", "next_agent": "AI Tutor + Assessment & Analytics", "plan_id": plan.id}, mode=settings().ai_mode))
+        undelivered = adaptation.notify_agents(db, plan, previous)  # 8a: the plan stays active even if a delivery fails
     else:
         plan.status = "REJECTED"
     priorities = ", ".join((plan.content or {}).get("priorities", [])[:4])
@@ -647,7 +663,7 @@ def plan_decision(plan_id: int, accept: bool, user: User = Depends(learner), db:
                         "episode" if accept else "lesson", {"plan_id": plan.id, "accepted": accept})
     db.add(AuditLog(user_id=user.id, action="plan_accepted" if accept else "plan_rejected", detail={"plan_id": plan.id}))
     db.commit()
-    return {"id": plan.id, "status": plan.status}
+    return {"id": plan.id, "status": plan.status, "notifications_pending": undelivered}
 
 
 @app.post("/api/plans/{plan_id}/request-changes")
@@ -1145,7 +1161,26 @@ def submit_mock(exam_id: int, user: User = Depends(learner), db: Session = Depen
         notebook.record_feedback(db, user.id, details["speaking"], "speaking", f"Mock #{exam.id}")
         notebook.remember(db, user.id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {overall}; sections {scores}", key="progress:mock", source="assessment")
     db.commit()
-    return mock_view(exam, db)
+    view = mock_view(exam, db)
+    if package.state == "RELEASED":
+        view["adaptation"] = adapt_after_major_assessment(db, user)
+    return view
+
+
+def adapt_after_major_assessment(db: Session, user: User) -> dict | None:
+    """UC7 trigger: a completed mock exam (UC5) proposes an adapted plan, unless one is already waiting for the learner.
+    The mock result is already saved, so a failure here can never lose it."""
+    if not db.scalar(select(Plan.id).where(Plan.user_id == user.id, Plan.status == "ACTIVE")):
+        return None
+    if db.scalar(select(Plan.id).where(Plan.user_id == user.id, Plan.kind == "adaptation", Plan.status.in_(("PROPOSED", "HELD")))):
+        return None
+    try:
+        result = adaptation.propose(db, user.id, profile_data(profile_for(db, user)), latest_progress(db, user.id), "major_assessment")
+        db.commit()
+    except Exception:
+        db.rollback()
+        return None
+    return {"outcome": result["outcome"], "plan_id": result["plan"].id if result["plan"] else None, "message": result["message"]}
 
 
 @app.get("/api/analytics")

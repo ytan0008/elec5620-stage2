@@ -138,12 +138,21 @@ def test_speaking_mock_resume_recommendations_ownership():
         completed = client.post(f"/api/mock-exams/{exam_id}/submit", headers=headers)
         assert completed.status_code == 200, completed.text
         assert completed.json()["result"]["state"] == "RELEASED"
+        assert completed.json()["adaptation"]["outcome"] == "PROPOSED"  # UC7 trigger: a completed mock exam (UC5) proposes an adapted plan
         assert client.post("/api/materials/recommend", headers=headers).json()["state"] == "RELEASED"
         assert client.get("/api/analytics", headers=headers).json()["sample_count"] >= 2
         other = auth(client, "third@example.com")
         assert client.get(f"/api/practice/submissions/{attempt['id']}/audio", headers=other).status_code == 404
         assert client.get(f"/api/mock-exams/{exam_id}", headers=other).status_code == 404
         assert client.get(f"/api/results/{response.json()['result']['id']}", headers=other).status_code == 404
+
+
+def add_evidence(client, headers, count=2):
+    """UC7 only adapts a plan from verified results (it needs at least two assessments)."""
+    practice = client.post("/api/practice/writing", headers=headers).json()
+    for _ in range(count):
+        result = client.post(f"/api/practice/{practice['id']}/submit", headers=headers, json={"text": "Remote work gives people flexibility, but teams still need shared routines so that collaboration stays effective and fair."})
+        assert result.json()["result"]["state"] == "RELEASED", result.text
 
 
 def test_invalid_output_and_adaptation_preserve_release_boundary():
@@ -170,6 +179,7 @@ def test_invalid_output_and_adaptation_preserve_release_boundary():
         approved = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=ih, json={"decision": "correct", "note": "Replaced invalid output.", "correction": {"summary": "Human reviewed this short writing response.", "criteria": {"task_response": 5.0}, "comments": [{"issue": "Short response", "suggestion": "Add more evidence."}], "confidence": {"task_response": 1.0}}})
         assert approved.status_code == 200
         assert client.get(f"/api/results/{held_id}", headers=headers).json()["state"] == "RELEASED"
+        add_evidence(client, headers, 1)  # the corrected result above plus this one make two verified assessments
         proposal = client.post("/api/plans/generate?adapt=true", headers=headers).json()
         assert proposal["package"]["state"] == "RELEASED"
         accepted = client.post(f"/api/plans/{proposal['id']}/decision?accept=true", headers=headers)
@@ -195,6 +205,7 @@ def test_weekly_adaptation_is_idempotent():
     with TestClient(app) as client:
         headers = auth(client, "scheduled@example.com")
         plan_id = active_plan(client, headers)
+        add_evidence(client, headers)
         with SessionLocal.begin() as db:
             plan = db.get(Plan, plan_id)
             plan.created_at = datetime.now(timezone.utc) - timedelta(days=8)
