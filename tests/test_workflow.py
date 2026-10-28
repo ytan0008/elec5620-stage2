@@ -46,6 +46,13 @@ def active_plan(client, headers):
     return plan_id
 
 
+def practise_once(client, headers):
+    """One verified practice result: the preparation a learner needs before a mock exam (UC5 2a)."""
+    task = client.post("/api/practice/writing", headers=headers).json()
+    done = client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": "Remote work offers flexibility, although teams need clear routines to collaborate well."})
+    assert done.status_code == 200, done.text
+
+
 def test_contextual_agent_chat_persists_and_respects_roles():
     with TestClient(app) as client:
         headers = auth(client, "chat@example.com")
@@ -385,6 +392,7 @@ def test_conversational_onboarding_portrait_questions_and_graph():
         other = auth(client, "question-other@example.com")
         assert client.post(f"/api/practice/speaking?question_id={generated.json()['id']}", headers=other).status_code == 404
         active_plan(client, headers)
+        practise_once(client, headers)
         mock = client.post("/api/mock-exams", headers=headers)
         assert mock.status_code == 200
         assert mock.json()["duration_seconds"] == (16 + 20 + 40 + 14) * 60
@@ -578,6 +586,7 @@ def test_developer_console_reports_dictionary_and_exam_lock():
         assert looked["word"] == "mitigate" and looked["translation"] and looked["saved"] is False
         # During a running mock: meanings and the tutor are locked, but words can still be saved.
         active_plan(client, headers)
+        practise_once(client, headers)
         assert client.post("/api/mock-exams", headers=headers).status_code == 200
         assert client.get("/api/dictionary?word=brittle", headers=headers).status_code == 423
         assert client.post("/api/chat/dashboard", headers=headers, json={"message": "What does brittle mean?"}).status_code == 423
@@ -674,6 +683,7 @@ def test_unfinished_mock_is_recorded_incomplete():
     with TestClient(app) as client:
         headers = auth(client, "incomplete.mock@example.com")
         active_plan(client, headers)
+        practise_once(client, headers)
         mock = client.post("/api/mock-exams", headers=headers).json()
         assert client.put(f"/api/mock-exams/{mock['id']}/reading", headers=headers, json={"answer": json.dumps({"1": "TRUE"})}).status_code == 200
         assert client.put(f"/api/mock-exams/{mock['id']}/listening", headers=headers, json={"answer": json.dumps({})}).status_code == 200  # empty sheet
@@ -698,6 +708,7 @@ def test_mock_result_compares_with_previous_and_explains_readiness():
     with TestClient(app) as client:
         headers = auth(client, "mock.insights@example.com")
         active_plan(client, headers)
+        practise_once(client, headers)
         first = complete_mock(client, headers)["result"]["payload"]
         assert first["readiness_detail"]["trend"].startswith("This is your first mock")
         assert first["readiness"] in ("On track", "Close to target", "Needs further practice")
@@ -757,3 +768,62 @@ def test_performance_report_trends_readiness_and_partial_report(monkeypatch):
         assert partial["state"] == "RELEASED"  # the verified analysis is still delivered (UC6 6a)
         assert partial["payload"]["recommendations_unavailable"] is True and partial["payload"]["recommendations"] == []
         assert "writing" in partial["payload"]["summary"]
+
+
+def test_mock_preparation_scoring_by_assessment_agent_and_failures(monkeypatch):
+    import backend.agents as agents_module
+    from backend import content as bank
+    with TestClient(app) as client:
+        headers = auth(client, "uc5.flows@example.com")
+        active_plan(client, headers)
+        # 2a: not prepared yet
+        early = client.post("/api/mock-exams", headers=headers)
+        assert early.status_code == 409 and "practice" in early.json()["detail"]
+        practise_once(client, headers)
+        # 3a: preparing the mock fails once, the retry succeeds
+        real, calls = bank.mock_sections, []
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("bank unavailable")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(bank, "mock_sections", flaky)
+        assert client.post("/api/mock-exams", headers=headers).status_code == 200 and len(calls) == 2
+        # 3a: it keeps failing, so the learner is told the mock is unavailable
+        monkeypatch.setattr(bank, "mock_sections", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+        unavailable = client.post("/api/mock-exams", headers=headers)
+        assert unavailable.status_code == 503 and "temporarily unavailable" in unavailable.json()["detail"]
+        monkeypatch.setattr(bank, "mock_sections", real)
+        # Step 5: the Assessment & Analytics agent scores writing and speaking
+        scored = complete_mock(client, headers)
+        assert scored["result"]["state"] == "RELEASED"
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        events = client.get("/api/events?limit=300&workflow=mock_exam", headers=instructor).json()
+        assert any(e["agent"] == "Assessment & Analytics" and str(e["detail"].get("decision", "")).startswith("scored speaking") for e in events)
+        assert any(e["agent"] == "Assessment & Analytics" and e["detail"].get("decision") == "estimated readiness" for e in events)
+        # 5a: speaking cannot be scored even after a retry: the result is held for the teacher, answers kept
+        real_feedback = agents_module.LLMProviderAdapter.feedback
+        def no_speaking(self, exam, skill, *args, **kwargs):
+            if skill == "speaking":
+                raise TimeoutError("scoring service down")
+            return real_feedback(self, exam, skill, *args, **kwargs)
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "feedback", no_speaking)
+        held = complete_mock(client, headers)
+        assert held["result"]["state"] in ("HELD", "HUMAN_REVIEW") and not held["result"].get("payload")  # nothing unverified reaches the learner
+        assert len(held["answers"]) == 4  # nothing the learner did is lost
+        case = next(c for c in client.get("/api/instructor/cases", headers=instructor).json() if c["package"]["id"] == held["result"]["id"])
+        assert case["package"]["payload"]["unscored_sections"] == ["speaking"]
+
+
+def test_performance_page_reports_unavailable_data(monkeypatch):
+    from backend import analytics as analytics_module
+    with TestClient(app) as client:
+        headers = auth(client, "uc6.unavailable@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        assert client.get("/api/analytics", headers=headers).status_code == 200
+        monkeypatch.setattr(analytics_module, "latest_progress", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database read failed")))
+        page = client.get("/api/analytics", headers=headers)
+        assert page.status_code == 503 and "temporarily unavailable" in page.json()["detail"]  # 2b
+        report = client.post("/api/reports", headers=headers)
+        assert report.status_code == 503 and "try again" in report.json()["detail"]  # 3a after one retry

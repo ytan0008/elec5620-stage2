@@ -32,9 +32,14 @@ from backend.onboarding import parse_demo_message
 from backend import content as bank
 from backend import local_tutor
 from backend import adaptation
+from backend import analytics
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
+
+
+class MockUnavailable(Exception):
+    """UC5 3a: the mock examination could not be prepared."""
 
 
 class LocalGenerationUnavailable(Exception):
@@ -652,6 +657,83 @@ class TutorAgent(Agent):
 
 class AssessmentAgent(Agent):
     name, memory_key = "Assessment & Analytics", "assessment"
+    ATTEMPTS = 2  # first try plus one retry (UC5 3a/5a, UC6 3a)
+
+    # ---- UC5 Take Mock Examination
+    def prepare_mock(self, user_id: int, exam: str, length: str) -> dict:
+        """Step 3: assemble the four sections from the exam bank. 3a: retry once, then report the mock as unavailable."""
+        state: FlowState = {"user_id": user_id, "workflow": "mock_exam"}
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                sections = bank.mock_sections(exam, length)
+                self.event(state, "action", {"decision": "prepared mock examination", "exam": exam, "length": length, "attempt": attempt, "next_agent": "Learner"})
+                return sections
+            except Exception as exc:
+                self.event(state, "decision", {"decision": "mock preparation failed", "attempt": attempt, "error_type": type(exc).__name__})
+        raise MockUnavailable("The mock exam is temporarily unavailable. Please try again later.")
+
+    def score_section(self, user_id: int, exam: str, skill: str, text: str, prompt: str = "", task: str = "task2", metrics: dict | None = None) -> FeedbackOutput | None:
+        """Step 5: score a writing task or the speaking test against the rubric with the Assessment tools
+        (band descriptors, score history, text measures). 5a: retry once; None means the section could not be scored."""
+        state: FlowState = {"user_id": user_id, "workflow": "mock_exam"}
+        kit = self.toolkit(user_id, exam)
+        for attempt in range(1, self.ATTEMPTS + 1):
+            started = time.perf_counter()
+            try:
+                result = self.llm.feedback(exam, skill, text, "normal", prompt, task, metrics, kit)
+                kit.log("mock_exam", self.llm.mode)
+                self.event(state, "action", {"decision": f"scored {skill} ({task}) against the {exam} rubric", "attempt": attempt, "criteria": result.criteria}, started)
+                return result
+            except Exception as exc:
+                kit.log("mock_exam", self.llm.mode)
+                self.event(state, "decision", {"decision": f"{skill} ({task}) could not be scored", "attempt": attempt, "error_type": type(exc).__name__}, started)
+        return None
+
+    def analyse_mock(self, user_id: int, scores: dict, overall: float, target: float | None, issues: list[str]) -> dict:
+        """Steps 6-7: strengths and weaknesses, comparison with earlier assessments and readiness."""
+        insights = analytics.mock_insights(self.db, user_id, scores, overall, target, issues)
+        readiness = insights["readiness_detail"]
+        self.event({"user_id": user_id, "workflow": "mock_exam"}, "decision", {"decision": "estimated readiness", "readiness": readiness["level"], "gap": readiness["gap"],
+                   "weaknesses": [w["skill"] for w in insights["weaknesses"]], "compared_with": (insights["comparison"] or {}).get("against"), "next_agent": "Quality Manager"})
+        agent_core.remember(self.db, self.memory_key, user_id, f"Mock estimate {overall}: {readiness['level']}" + (f", weakest {insights['weaknesses'][0]['skill']}" if insights["weaknesses"] else "") + ".",
+                            data={"overall": overall, "readiness": readiness["level"]})
+        return insights
+
+    # ---- UC6 View Performance Report and Identify Weaknesses
+    def analyse_progress(self, user_id: int) -> dict:
+        """Steps 2-5: verified results across the four skills, strengths, weaknesses, repeated problems and trends.
+        3a: retry the analysis once before giving up."""
+        state: FlowState = {"user_id": user_id, "workflow": "report"}
+        for attempt in range(1, self.ATTEMPTS + 1):
+            started = time.perf_counter()
+            try:
+                progress = analytics.latest_progress(self.db, user_id)
+                self.event(state, "perception", {"decision": "analysed verified results", "results": progress["sample_count"], "weaknesses": progress["weaknesses"],
+                                                 "trends": {skill: t["direction"] for skill, t in progress["trends"].items()}, "attempt": attempt}, started)
+                return progress
+            except Exception as exc:
+                self.db.rollback()
+                if attempt == self.ATTEMPTS:
+                    raise
+                self.event(state, "decision", {"decision": "performance analysis failed; retrying", "attempt": attempt, "error_type": type(exc).__name__})
+
+    def write_report(self, user_id: int, exam: str, progress: dict) -> dict:
+        """Step 6: the report narrative and recommendations. 6a: if they fail, keep the verified analysis without recommendations."""
+        state: FlowState = {"user_id": user_id, "workflow": "report"}
+        kit = self.toolkit(user_id, exam)
+        data = dict(progress)
+        try:
+            data.update(self.llm.report(data, kit).model_dump())
+            kit.log("report", self.llm.mode)
+            self.event(state, "action", {"decision": "wrote performance report", "recommendations": len(data.get("recommendations", [])), "next_agent": "Quality Manager"})
+        except Exception as exc:
+            kit.log("report", self.llm.mode)
+            scores = ", ".join(f"{skill} {score}" for skill, score in data["skill_scores"].items())
+            data.update({"summary": f"Verified estimates: {scores}. {data['readiness_note']} {data['trend_note']}".strip(), "recommendations": [], "recommendations_unavailable": True,
+                         "confidence": {"report": .8}})
+            self.db.add(AuditLog(user_id=user_id, action="report_recommendations_failed", detail={"error_type": type(exc).__name__}))
+            self.event(state, "decision", {"decision": "report saved without recommendations; retry later", "error_type": type(exc).__name__, "next_agent": "Quality Manager"})
+        return data
 
     def provide_insights(self, state: FlowState) -> dict:
         self.event(state, "handoff", {"decision": "return verified progress insights", "weaknesses": state.get("progress", {}).get("weaknesses", []), "next_agent": "Learning Coordinator"})

@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     tts_model: str = "gpt-4o-mini-tts"
     transcription_model: str = "whisper-1"
     quality_threshold: float = 0.70
+    # UC5 2a: verified practice results a learner needs before starting a mock exam (0 turns the check off).
+    mock_min_practice: int = 1
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     instructor_email: str = "instructor@example.com"
     instructor_password: str = "ChangeMe123!"

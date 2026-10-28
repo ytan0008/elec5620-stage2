@@ -213,11 +213,15 @@ function PlansPage({ notify }: { notify: Notify }) {
 
 const chartAxis = { stroke: '#b9b0e0', fontFamily: 'Pixelify Sans' }
 function AnalyticsPage({ notify }: { notify: Notify }) {
-  const { data, loading } = useLoad<any>('/analytics')
+  const { data, loading, error, reload } = useLoad<any>('/analytics')
   const reports = useLoad<{ id: number; result: Result }[]>('/reports')
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState<Result | null>(null)
   const generate = async () => { setBusy(true); try { await post('/reports'); reports.reload(); notify('Verified report saved') } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
+  // UC6 2b/8a: the data could not be loaded; nothing is lost and the learner can try again.
+  if (error && !data) return <div className="panel panel-sun mx-auto mt-10 max-w-xl space-y-4 p-7 text-center anim-pop" role="alert">
+    <h2 className="section-title">Report temporarily unavailable</h2><p className="font-read text-mist">{error}</p>
+    <button className="btn-primary" disabled={loading} onClick={reload}>{loading ? 'Trying…' : 'Try again'}</button></div>
   if (loading || !data) return <Spinner />
   const max = data.exam === 'IELTS' ? 9 : 6
   return <>
@@ -240,7 +244,8 @@ function AnalyticsPage({ notify }: { notify: Notify }) {
             <b>{nice(skill)}</b> {t.direction === 'not enough data' ? <span className="text-mist">one result so far ({t.latest})</span> : <span>{t.direction} · {t.first} → {t.latest} ({t.change > 0 ? '+' : ''}{t.change} vs earlier average, {t.results} results)</span>}</p>)}
           {data.trend_note && <p className="mt-2 font-read text-xs text-sun">{data.trend_note}</p>}</div>}
         {data.repeated_errors?.length > 0 && <div className="mt-4 space-y-1">{data.repeated_errors.map((r: any) => <p key={r.issue} className="font-read text-sm text-mist">▸ {r.issue} ×{r.count}</p>)}</div>}
-        <div className="mt-5 space-y-2">{data.recommendations?.map((r: string) => <p key={r} className="tile font-read text-sm">{r}</p>)}</div></div>
+        <div className="mt-5 space-y-2">{data.recommendations?.map((r: string) => <p key={r} className="tile font-read text-sm">{r}</p>)}</div>
+        {data.sample_count > 0 && <Link to="/materials?recommend=1" className="btn-cyan mt-4 inline-flex">Recommended for me <Sparkles size={15} /></Link>}</div>
       <div className="panel p-6"><h2 className="section-title">Saved reports</h2><div className="mt-4 space-y-2">{reports.data?.length ? reports.data.map(r => <button key={r.id} onClick={() => setOpen(r.result)} className="tile flex w-full items-center justify-between font-pixel"><span>Report #{r.id}</span><Status value={r.result.state} /></button>) : <p className="font-read text-mist">No saved reports yet.</p>}</div>
         {open?.payload && <div className="mt-4 tile space-y-1 font-read text-sm"><p>{open.payload.summary}</p>
           {open.payload.readiness && <p className="text-cyan">Readiness: {open.payload.readiness}{open.payload.readiness_note ? ` · ${open.payload.readiness_note}` : ''}</p>}
@@ -273,6 +278,7 @@ function MaterialsPage({ notify }: { notify: Notify }) {
   }
   const [params] = useSearchParams()
   useEffect(() => { const id = Number(params.get('open')); const item = id && data?.find(m => m.id === id); if (item) view(item) }, [data])  // a plan's resource link opens its lesson
+  useEffect(() => { if (params.get('recommend')) void recommend() }, [])  // "Recommended for me" from the performance report (UC10 trigger)
   // When a new list is held for checking, keep showing the last list that passed (UC10 6a).
   const list = recommendations?.payload ?? recommendations?.last_verified
   return <>
