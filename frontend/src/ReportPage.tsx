@@ -97,8 +97,13 @@ function SectionCard({ skill, s }: { skill: keyof typeof ICONS; s: Section }) {
 
 export default function ReportPage() {
   const { id } = useParams()
-  const { data, loading, error } = useLoad<{ id: number; created_at: string; result: Result }>(`/reports/${id}`, [id])
-  if (error && !data) return <div className="panel panel-sun mx-auto mt-10 max-w-xl p-7 text-center" role="alert"><p className="font-read">{error}</p><Link to="/analytics" className="btn-secondary mt-4 inline-flex">Back to performance</Link></div>
+  const { data, loading, error, reload } = useLoad<{ id: number; created_at: string; result: Result }>(`/reports/${id}`, [id])
+  // UC6 8a: the report cannot be displayed; the assessment data is kept for a later attempt.
+  if (error && !data) return <div className="panel panel-sun mx-auto mt-10 max-w-xl space-y-4 p-7 text-center" role="alert">
+    <h2 className="section-title">Report currently unavailable</h2><p className="font-read text-mist">{error}</p>
+    <p className="font-read text-sm text-mist">Your results are kept, so you can try again later.</p>
+    <div className="flex flex-wrap justify-center gap-2"><button className="btn-primary" disabled={loading} onClick={reload}>{loading ? 'Trying…' : 'Try again'}</button>
+      <Link to="/analytics" className="btn-secondary">Back to performance</Link></div></div>
   if (loading || !data) return <Spinner label="Opening your report…" />
   const result = data.result
   if (result.state !== 'RELEASED' || !result.payload) return <><PageTitle eyebrow="Performance report" title={`Report #${data.id}`} /><HeldNotice result={result} /></>
