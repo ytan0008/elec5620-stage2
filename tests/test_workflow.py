@@ -919,8 +919,9 @@ def test_verified_mock_generates_its_performance_report(monkeypatch):
         assert held["result"]["state"] != "RELEASED" and held["report_id"] is None
         instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
         case = next(c for c in client.get("/api/instructor/cases", headers=instructor).json() if c["package"]["id"] == held["result"]["id"])
-        approved = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=instructor, json={"decision": "approve", "note": "Speaking re-checked by hand."})
-        assert approved.status_code == 200, approved.text
+        scores = {**case["package"]["payload"]["section_scores"], "speaking": 6.0}  # the teacher supplies the missing score (UC5 5a)
+        released = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=instructor, json={"decision": "correct", "note": "Speaking re-checked by hand.", "correction": {"section_scores": scores}})
+        assert released.status_code == 200, released.text
         after = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
         assert after["result"]["state"] == "RELEASED" and after["report_id"]
 
@@ -1076,3 +1077,59 @@ def test_sign_in_lasts_seven_days():
         days = (datetime.fromtimestamp(jwt.decode(token, settings().jwt_secret, algorithms=["HS256"])["exp"], timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 86400
         assert 6.9 < days <= 7
         assert client.get("/api/me", headers={"Authorization": "Bearer not-a-token"}).status_code == 401
+
+
+def held_mock(client, monkeypatch, email):
+    """UC5 5a: speaking cannot be scored, so the whole mock is held and escalated to the teacher (UC8)."""
+    import backend.agents as agents_module
+    real = agents_module.LLMProviderAdapter.feedback
+
+    def no_speaking(self, exam, skill, *args, **kwargs):
+        if skill == "speaking":
+            raise TimeoutError("LLM service did not respond")
+        return real(self, exam, skill, *args, **kwargs)
+    headers = auth(client, email)
+    active_plan(client, headers)
+    practise_once(client, headers)
+    monkeypatch.setattr(agents_module.LLMProviderAdapter, "feedback", no_speaking)
+    held = complete_mock(client, headers)
+    monkeypatch.undo()
+    assert held["result"]["state"] == "HELD"
+    teacher = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+    case = next(c for c in client.get("/api/instructor/cases", headers=teacher).json() if c["package"]["id"] == held["result"]["id"])
+    assert "speaking" not in case["package"]["payload"]["section_scores"]
+    return headers, teacher, held, case
+
+
+def test_teacher_cannot_release_a_mock_missing_a_section_score(monkeypatch):
+    from backend.scoring import overall_band
+    with TestClient(app) as client:
+        _, teacher, _, case = held_mock(client, monkeypatch, "mock.missing.section@example.com")
+        decide = f"/api/instructor/cases/{case['id']}/decision"
+        approved = client.post(decide, headers=teacher, json={"decision": "approve", "note": "Looks fine to me."})
+        assert approved.status_code == 422  # three section scores are not a complete mock result
+        scores = {**case["package"]["payload"]["section_scores"], "speaking": 6.0}
+        # Only the missing score is needed; it is merged with the three the system already marked.
+        corrected = client.post(decide, headers=teacher, json={"decision": "correct", "note": "I scored the speaking recording myself.", "correction": {"section_scores": {"speaking": 6.0}}})
+        assert corrected.status_code == 200, corrected.text
+        payload = corrected.json()["package"]["payload"]
+        assert set(payload["section_scores"]) == {"listening", "reading", "writing", "speaking"}
+        assert payload["estimated_overall"] == overall_band(list(scores.values()), "IELTS")  # the overall follows all four sections
+        assert "unscored_sections" not in payload and "Not scored yet" not in payload["summary"]
+
+
+def test_teacher_released_mock_gets_the_same_follow_up_as_a_verified_one(monkeypatch):
+    with TestClient(app) as client:
+        headers, teacher, held, case = held_mock(client, monkeypatch, "mock.teacher.release@example.com")
+
+        def objective_mistakes():
+            return [item for item in client.get("/api/notebook?kind=mistake", headers=headers).json() if item["skill"] in ("listening", "reading")]
+        assert not objective_mistakes()  # nothing from a held mock reaches the learner
+        scores = {**case["package"]["payload"]["section_scores"], "speaking": 6.0}
+        decided = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=teacher, json={"decision": "correct", "note": "I scored the speaking recording myself.", "correction": {"section_scores": scores}})
+        assert decided.status_code == 200, decided.text
+        mock = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
+        assert mock["result"]["state"] == "RELEASED"
+        assert mock["report_id"]  # UC6: the full report
+        assert mock["adaptation"] is not None  # UC7: the plan review a completed mock triggers
+        assert objective_mistakes()  # the mock's wrong answers reach the Mistake book

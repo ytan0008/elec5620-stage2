@@ -1273,7 +1273,7 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
         confidence["speaking"] = min(speaking.confidence.values()) if speaking.confidence else .5
         details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments, "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note,
                                "analysis": speaking.analysis, "improved_sentences": speaking.improved_sentences, "improvements": speaking.improvements}
-    overall = (overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / len(scores) * 2) / 2) if scores else 0
+    overall = mock_overall(scores, exam.exam)
     target = db.scalar(select(Profile.target_score).where(Profile.user_id == user.id))
     current_issues = [c.get("issue") for fb in writing_feedback.values() for c in fb["comments"]] + [c.get("issue") for c in details["speaking"]["comments"]]
     insights = runtime.assessment.analyse_mock(user.id, scores, overall, target, [issue for issue in current_issues if issue])
@@ -1288,21 +1288,32 @@ def grade_mock(db: Session, exam: MockExam, user: User) -> dict:
     package = runtime.verify_output(user.id, "mock_exam", output)
     exam.package_id = package.id
     exam.status = "SUBMITTED"
-    if package.state == "RELEASED":
-        for skill in ("listening", "reading"):
-            notebook.record_objective_mistakes(db, user.id, exam.sections[skill], details[skill]["review"], skill, f"Mock #{exam.id}")
-        for task, fb in details["writing"].items():
-            notebook.record_feedback(db, user.id, fb, "writing", f"Mock #{exam.id} · {task}")
-        notebook.record_feedback(db, user.id, details["speaking"], "speaking", f"Mock #{exam.id}")
-        notebook.remember(db, user.id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {overall}; sections {scores}", key="progress:mock", source="assessment")
     db.commit()
     if package.state == "RELEASED":
-        report_after_mock(db, exam)
-    if package.state == "RELEASED":
-        # UC7: keep the outcome with the mock so every view shows it, however the mock was marked.
-        exam.sections = {**exam.sections, "adaptation": adapt_after_major_assessment(db, user)}
-        db.commit()
+        after_mock_released(db, exam)
     return mock_view(exam, db)
+
+
+def mock_overall(scores: dict, exam: str) -> float:
+    return (overall_band(list(scores.values()), exam) if exam == "IELTS" else round(sum(scores.values()) / len(scores) * 2) / 2) if scores else 0
+
+
+def after_mock_released(db: Session, exam: MockExam) -> None:
+    """What follows a released mock, whether it passed the quality gate or the teacher released it (UC8):
+    notebook entries, the progress memory, the full report (UC6) and the plan adaptation (UC7)."""
+    payload = db.get(ResultPackage, exam.package_id).payload
+    details = payload["details"]
+    for skill in ("listening", "reading"):
+        notebook.record_objective_mistakes(db, exam.user_id, exam.sections[skill], details[skill]["review"], skill, f"Mock #{exam.id}")
+    for task, fb in details["writing"].items():
+        notebook.record_feedback(db, exam.user_id, fb, "writing", f"Mock #{exam.id} · {task}")
+    notebook.record_feedback(db, exam.user_id, details["speaking"], "speaking", f"Mock #{exam.id}")
+    notebook.remember(db, exam.user_id, "progress", f"Mock exam #{exam.id} ({exam.exam}): overall {payload['estimated_overall']}; sections {payload['section_scores']}", key="progress:mock", source="assessment")
+    db.commit()
+    report_after_mock(db, exam)
+    # UC7: keep the outcome with the mock so every view shows it, however the mock was marked.
+    exam.sections = {**exam.sections, "adaptation": adapt_after_major_assessment(db, db.get(User, exam.user_id))}
+    db.commit()
 
 
 def report_after_mock(db: Session, exam: MockExam) -> int | None:
@@ -1567,6 +1578,17 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
             raise HTTPException(422, "Plan is incomplete; supply a complete correction")
         if package.kind == "recommendations" and not corrected.get("items"):
             raise HTTPException(422, "Recommendations are incomplete")
+        if package.kind == "mock_exam":  # UC5 success condition: scored across all four skills
+            if data.decision == "correct":  # the teacher may send only the missing section, e.g. {"section_scores": {"speaking": 6}}
+                corrected["section_scores"] = {**(package.payload.get("section_scores") or {}), **(corrected.get("section_scores") or {})}
+            scores = corrected.get("section_scores") or {}
+            ielts = str(corrected.get("score_scale", "")).startswith("IELTS")
+            if set(scores) != set(SKILLS) or any(not isinstance(v, (int, float)) or not 0 <= v <= (9 if ielts else 6) for v in scores.values()):
+                raise HTTPException(422, "Mock result needs all four section scores; supply a complete correction")
+            if data.decision == "correct":  # 5a: the teacher's scores complete the result, so the overall and the note follow them
+                corrected["estimated_overall"] = mock_overall(scores, "IELTS" if ielts else "TOEFL")
+                corrected.pop("unscored_sections", None)
+                corrected["summary"] = str(corrected.get("summary", "")).split(" Not scored yet:")[0]
         if data.decision == "correct":
             package.payload = corrected
             package.confidence = corrected["confidence"]
@@ -1596,7 +1618,7 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
     if package.kind == "mock_exam" and package.state == "RELEASED":
         mock = db.scalar(select(MockExam).where(MockExam.package_id == package.id))
         if mock:
-            report_after_mock(db, mock)  # the report follows the teacher-approved mock result
+            after_mock_released(db, mock)  # the same follow-up as a mock that passed the quality gate
     return {"status": case.status, "package": package_view(package, True), "notifications_pending": undelivered}
 
 
