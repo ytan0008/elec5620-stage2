@@ -92,13 +92,15 @@ class LLMProviderAdapter(LLMService):
     def __init__(self):
         self.config = settings()
         self.mode = self.config.ai_mode
-        self.llm = self.scorer = None
+        self.llm = self.scorer = self.verifier = None
         if self.mode == "REAL":
             self.llm = self._client(self.config.llm_reasoning_effort)
             self.scorer = self._client(self.config.llm_scoring_effort) if self.config.llm_scoring_effort != self.config.llm_reasoning_effort else self.llm
+            # UC9 4a: the Quality Manager owns the single retry, so its client has no hidden retries of its own.
+            self.verifier = self._client(self.config.llm_scoring_effort, retries=0)
 
-    def _client(self, effort: str) -> ChatOpenAI:
-        options = {"model": self.config.llm_model, "api_key": self.config.openai_api_key, "base_url": self.config.openai_base_url or None, "timeout": 90, "max_retries": 1}
+    def _client(self, effort: str, retries: int = 1) -> ChatOpenAI:
+        options = {"model": self.config.llm_model, "api_key": self.config.openai_api_key, "base_url": self.config.openai_base_url or None, "timeout": 90, "max_retries": retries}
         if self.config.llm_use_responses_api:
             options["use_responses_api"] = True
         if effort:
@@ -109,12 +111,13 @@ class LLMProviderAdapter(LLMService):
     def local(self) -> bool:
         return self.mode == "LOCAL"
 
-    def structured(self, schema, system: str, user: dict, local: dict, toolkit: Toolkit | None = None, scoring: bool = False):
+    def structured(self, schema, system: str, user: dict, local: dict, toolkit: Toolkit | None = None, scoring: bool = False, once: bool = False):
         """Structured output from the cloud model. With a toolkit the agent sees its memory, may call its tools,
-        and then submits the answer through a final tool shaped like the schema."""
+        and then submits the answer through a final tool shaped like the schema. `once` makes a single attempt
+        with no fallback or retry, for callers that own their retry policy."""
         if self.local:
             return schema.model_validate(local)
-        llm = self.scorer if scoring else self.llm
+        llm = (self.verifier or self.scorer) if once else self.scorer if scoring else self.llm
         # Callers pass only exam goals, learning text and scores; account identity is excluded.
         if toolkit:
             user = {**user, "your_memory": agent_core.recall(toolkit.db, toolkit.agent, toolkit.user_id, 8, include_cohort=True)}
@@ -125,8 +128,12 @@ class LLMProviderAdapter(LLMService):
             try:
                 return self._agent_loop(llm, schema, messages, toolkit)
             except Exception:
+                if once:
+                    raise
                 pass  # Fall back to a plain structured call with the tool results gathered so far.
         chain = llm.with_structured_output(schema)
+        if once:
+            return chain.invoke(messages)
         try:
             return chain.invoke(messages)
         except Exception:
@@ -399,13 +406,14 @@ class LLMProviderAdapter(LLMService):
         return output
 
     def check_consistency(self, payload: dict, toolkit: Toolkit | None = None) -> VerdictOutput:
+        """One attempt only; OpsQualityManager retries once (UC9 4a)."""
         scores = payload.get("criteria", {})
         summary = payload.get("summary", "").lower()
         issues = bool(scores) and ("excellent" in summary or "no weaknesses" in summary) and min(scores.values()) <= 3
         local = {"consistent": not issues, "reason": "Praise conflicts with a very low criterion score" if issues else "No obvious score and feedback contradiction", "confidence": .85}
         return self.structured(VerdictOutput, "You are the Operations & Quality Manager. Check whether feedback statements contradict criterion scores. Be conservative and return a short reason. "
                                "Learn from earlier instructor decisions: if the instructor approved similar results you held, do not repeat that false alarm.",
-                               {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True)
+                               {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True, once=True)
 
     def rank_and_explain(self, weaknesses: list[str], candidates: list[dict], toolkit: Toolkit | None = None) -> RecommendationOutput:
         ranked = sorted(candidates, key=lambda item: item["skill"] not in weaknesses)[:5]
@@ -807,16 +815,21 @@ class OpsQualityManager(Agent):
         if payload.get("basis") in ("tags", "starter"):
             return [], "RULES", False  # No AI-written text to check; the rule checks above cover it.
         kit = Toolkit(self.db, self.memory_key, state["user_id"], (state.get("profile") or {}).get("exam", "IELTS"))
-        issues = []
-        try:
-            verdict = self.llm.check_consistency(payload, kit)
+        issues, verdict = [], None
+        for attempt in (1, 2):  # 4a: retry once, then fall back to the rule-based checks
+            try:
+                verdict = self.llm.check_consistency(payload, kit)
+                break
+            except Exception as exc:
+                self.event(state, "decision", {"decision": "consistency verdict failed", "attempt": attempt, "error": type(exc).__name__})
+        if verdict:
             if not verdict.consistent:
                 issues.append(verdict.reason)
             if verdict.confidence < self.threshold():
                 issues.append("Consistency verdict confidence below threshold")
             method = "LLM" if self.llm.mode == "REAL" else "DEMO_RULES"
             unchecked = False
-        except Exception:
+        else:
             method, unchecked = "FALLBACK_RULES", True
             if self.llm.mode == "REAL":
                 issues.append("LLM consistency verification unavailable")

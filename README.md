@@ -15,7 +15,7 @@ ELEC5620 Stage 2 implementation · Group 3 (Wednesday 09–11). The design follo
 5. [Running without Docker (for development)](#5-running-without-docker-for-development)
 6. [Features in detail](#6-features-in-detail)
 7. [The four AI agents](#7-the-four-ai-agents)
-8. [Architecture](#8-architecture)
+8. [Architecture](#8-architecture) · [Stage 1 design → code](#stage-1-design--code)
 9. [Project structure](#9-project-structure)
 10. [Configuration reference](#10-configuration-reference)
 11. [Testing](#11-testing)
@@ -238,20 +238,54 @@ The system uses a layered architecture with centralised quality control (Stage 1
                 Coordinator ─┐                                           backend/agent_core.py
                 Tutor → Assessment & Analytics ─┼─→ Quality Manager ─→ RELEASE
                                                 └──────────────────→ HOLD → Instructor review
- Service layer  ProviderAdapter (one LLM interface, LOCAL or REAL),      backend/agents.py
+ Service layer  LLMService interface → LLMProviderAdapter (LOCAL/REAL)  backend/llm_service.py, agents.py
                 exam content, scoring, examiner, speech, dictionary      backend/content, scoring.py, examiner.py, speech.py, notebook.py
  Data layer     SQLAlchemy + Alembic (SQLite)                            backend/models.py, migrations/
 ```
 
 Key rules:
 
-- **One LLM interface.** Every model call goes through `ProviderAdapter`, so the provider can be changed or run offline without touching the agents.
+- **One LLM interface.** Agents depend only on the `«interface» LLMService`. `LLMProviderAdapter` realises it, so the provider can be changed or run offline without touching the agents. A second provider would be a new class that realises the same interface.
 - **Release boundary.** Each AI output is stored as a `result_package`. Learners only see packages in state `RELEASED`; held packages wait for the teacher.
 - **Structured output with confidence.** Results below the threshold, or with contradictions between scores and comments, are held.
 - **Answer keys stay on the server** until a test is submitted.
 - **Privacy.** Account identity is not sent to the model; requests contain only exam goals, learning text and scores.
 
 Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`, `langchain-core`), Pydantic, React 19, TypeScript, Vite, Tailwind CSS, Recharts, Playwright, Docker Compose with nginx.
+
+### Stage 1 design → code
+
+Where each Stage 1 use case lives. Pages without their own file are components in `frontend/src/App.tsx`. Backend paths are in `backend/`, tests in `tests/`.
+
+| Use case | Agent and backend | API | Page | Tests |
+|---|---|---|---|---|
+| UC1 Register and create learner profile | Learning Coordinator onboarding interview: `onboarding.py` | `POST /api/auth/register`, `/api/onboarding/*`, `PUT /api/profile` | `AuthPage.tsx`, `OnboardingPage.tsx`, Profile | `test_workflow.py` |
+| UC2 Create personalised learning plan | `LearningCoordinatorAgent.create_plan` | `POST /api/plans/generate`, `/api/plans/{id}/decision`, `/api/plans/{id}/request-changes` | Plans | `test_workflow.py` |
+| UC3 Complete speaking practice | `TutorAgent.give_feedback`, `examiner.py` (speaking-test state machine), `speech.py` | `/api/speaking/sessions/*`, `POST /api/practice/{id}/audio` | `exam/SpeakingStudio.tsx`, `exam/SpeakingPage.tsx` | `test_workflow.py` |
+| UC4 Writing practice with feedback | `TutorAgent.give_feedback`, `scoring.py` | `POST /api/practice/{skill}`, `POST /api/practice/{id}/submit`, `GET /api/practice/{id}/attempts` | `exam/WritingPractice.tsx` | `test_workflow.py`, `test_uc9_uc10.py` |
+| UC5 Take mock examination | `AssessmentAgent.score`, `scoring.py` | `/api/mock-exams/*` | `MockExamPage.tsx` | `test_workflow.py` |
+| UC6 View performance report | `AssessmentAgent.provide_insights`, `LearningCoordinatorAgent.request_insights` | `GET /api/analytics`, `/api/reports` | Analytics, `KnowledgeGraphPage.tsx` | `test_workflow.py` |
+| UC7 Receive adapted learning plan | `adaptation.py` (one flow for all three triggers), `scheduled_review.py` (weekly trigger) | `GET /api/plans/adaptation-notice`, `POST /api/plans/{id}/decision` | Plans | `test_uc7.py` |
+| UC8 Review escalated case | `escalation.py`; `OpsQualityManager.notify_escalation` opens the case | `/api/instructor/cases/*`, `/api/instructor/availability` | Instructor | `test_uc8.py` |
+| UC9 Check agent output quality | `OpsQualityManager`: `submit_result`, `validate`, `check_confidence`, `rule_based_check`, `release`; states in `ResultStatus` (`llm_service.py`) | `GET /api/instructor/quality`, `PUT /api/instructor/quality/threshold`, `GET /api/results/{id}` | Quality | `test_uc9_uc10.py` |
+| UC10 Access recommended materials | `LearningCoordinatorAgent.request_recommendations`, `MaterialLibrary` (`materials.py`) | `POST /api/materials/recommend`, `POST /api/materials/{id}/interaction` | Materials | `test_uc9_uc10.py` |
+
+Class diagram names that differ in code (all database models are in `backend/models.py`):
+
+| Class diagram | Code |
+|---|---|
+| `Agent` (abstract) and its four agents | Same names, `backend/agents.py` |
+| `«interface» LLMService`, `LLMProviderAdapter` | `backend/llm_service.py`, `backend/agents.py` |
+| `ResultStatus`, `IssueType`, `AgentStatus` | Enums in `backend/llm_service.py` |
+| `Verdict` | `VerdictOutput` (`backend/schemas.py`) |
+| `Learner`, `HumanInstructor` | `User` with role `learner` or `instructor` |
+| `LearnerProfile`, `LearningPlan` | `Profile`, `Plan` |
+| `PracticeSession` | `Practice` (and `SpeakingSession` for live speaking) |
+| `Feedback`, `BandScore` | Fields of a `ResultPackage` payload (`comments`, `criteria`) |
+| `EscalationCase`, `Review` «association class» | `Escalation`, `InstructorDecision` |
+| `RecommendationList`, `RankedItem` | A `ResultPackage` of kind `recommendations` and its `items` |
+| `Weakness` | Worked out from verified scores when needed; not stored |
+| `ExamType`, `Skill`, `Decision` | Stored as plain strings (`exam`, `skill`, `decision` columns) |
 
 ---
 
@@ -260,8 +294,12 @@ Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`,
 ```
 ├── backend/
 │   ├── main.py              FastAPI app: all REST endpoints
-│   ├── agents.py            LangGraph workflows, ProviderAdapter (LOCAL / REAL), quality gate
+│   ├── agents.py            LangGraph workflows, the four agent classes, LLMProviderAdapter (LOCAL / REAL), quality gate
+│   ├── llm_service.py       «interface» LLMService and the ResultStatus, IssueType and AgentStatus enums
 │   ├── agent_core.py        Per-agent memory and tool sets
+│   ├── adaptation.py        UC7 plan adaptation (learner request, weekly review, completed mock)
+│   ├── escalation.py        UC8 review queue, instructor availability and outcome delivery
+│   ├── materials.py         UC10 MaterialLibrary (search, starter materials, dismissed items)
 │   ├── models.py            Database models
 │   ├── schemas.py           Pydantic request and structured-output schemas
 │   ├── config.py            Settings loaded from .env
