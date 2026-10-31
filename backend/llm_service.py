@@ -46,7 +46,8 @@ class LLMService(ABC):
 
     @abstractmethod
     def check_consistency(self, payload: dict, toolkit=None):
-        """Return a Verdict (consistent, reason, confidence) for feedback against its scores."""
+        """Return a Verdict (consistent, reason, confidence) for feedback against its scores.
+        One attempt; the Quality Manager owns the single retry (UC9 4a)."""
 
     @abstractmethod
     def rank_and_explain(self, weaknesses: list[str], candidates: list[dict], toolkit=None):
