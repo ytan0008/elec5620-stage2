@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Keyboard, Mic, MicOff, Play, RotateCcw, Square, Volume2 } from 'lucide-react'
-import { Result, SpeakingView, health, post, request } from '../api'
+import { Result, SpeakingView, health, post, request, retryOnce } from '../api'
 import { PixelAvatar, personaName } from '../pixel/Avatar'
 import { moodFor, usePersona } from '../persona'
 import { Listener, listen, monitorLevel, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
@@ -30,6 +30,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const [mode, setMode] = useState<'server' | 'browser' | 'none'>(recognitionSupported() ? 'browser' : 'none')
   const [level, setLevel] = useState(0)
   const [error, setError] = useState('')
+  const [starting, setStarting] = useState(false)
   const modeRef = useRef(mode)
   const stopLevel = useRef<(() => void) | null>(null)
   const finishing = useRef(false)
@@ -64,13 +65,17 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   }
 
   const begin = async () => {
-    setError(''); setResult(null)
+    setError(''); setResult(null); setStarting(true)
     try { recorder.current = await recordMicrophone() } catch { recorder.current = null }
     try {
-      const view = await post<SpeakingView>('/speaking/sessions', { persona, ...(mockId ? { mock_id: mockId } : {}), ...(questionId ? { question_id: Number(questionId) } : {}) })
+      const view = await retryOnce(() => post<SpeakingView>('/speaking/sessions', { persona, ...(mockId ? { mock_id: mockId } : {}), ...(questionId ? { question_id: Number(questionId) } : {}) }))
       apply(view)
       void say(view.log[view.log.length - 1].text, view)
-    } catch (e) { setError((e as Error).message) }
+    } catch (e) {
+      // UC3 4a: still no task after one retry, so stop (and switch the microphone off) and say practice is unavailable.
+      void recorder.current?.stop(); recorder.current = null
+      setError(`Speaking practice is temporarily unavailable: ${(e as Error).message}. Please try again later.`)
+    } finally { setStarting(false) }
   }
 
   const startListening = () => {
@@ -225,7 +230,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
       <p className="font-read text-mist">{personaName(persona)} runs a complete speaking test out loud: {mockId ? 'the speaking section of your mock exam' : 'IELTS Part 1 interview, Part 2 cue card (1 minute to prepare, 2 minutes to talk) and Part 3 discussion — or the TOEFL 2026 Listen & Repeat and Interview tasks'}. Answer with your microphone; your session is recorded for replay.</p>
       {mode === 'none' && <p className="tile font-read text-sm text-sun">Speech recognition is not available here, so please type your answers. (Ask your teacher to enable server speech recognition.)</p>}
       {error && <p role="alert" className="font-read text-rose">{error}</p>}
-      <button className="btn-primary" onClick={begin}><Play size={17} /> Start speaking test</button>
+      <button className="btn-primary" disabled={starting} onClick={begin}><Play size={17} /> {starting ? 'Starting…' : 'Start speaking test'}</button>
     </div>
   </div>
 
