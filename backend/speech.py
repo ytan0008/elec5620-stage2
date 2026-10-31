@@ -8,6 +8,7 @@ be recognised even where the browser's online recognition service is blocked.
 import hashlib
 import logging
 import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from backend.config import settings
@@ -47,9 +48,15 @@ def synthesise(text: str, voice: str = "female", speed: float = 1.0) -> Path:
     return path
 
 
+_load_failed_at: float | None = None
+RETRY_LOAD_AFTER = 600  # seconds
+
+
 def local_stt_available() -> bool:
     if not settings().local_stt:
         return False
+    if _load_failed_at is not None and time.monotonic() - _load_failed_at < RETRY_LOAD_AFTER:
+        return False  # the model could not be loaded (e.g. offline without the files): let the browser recognise instead
     try:
         import faster_whisper  # noqa: F401
         return True
@@ -75,10 +82,13 @@ def warm_up() -> None:
 
 
 def _safe(fn):
+    global _load_failed_at
     try:
         fn()
-    except Exception as exc:  # The model can still be loaded on first use.
-        log.warning("Offline speech model not loaded yet: %s", exc)
+        _load_failed_at = None
+    except Exception as exc:
+        _load_failed_at = time.monotonic()
+        log.warning("Offline speech model could not be loaded: %s", exc)
 
 
 def decode_audio(path: Path):
@@ -98,7 +108,13 @@ def transcribe_local(path: Path) -> str:
     audio = decode_audio(path)
     if len(audio) < 1600:  # under 0.1 s
         return ""
-    segments, _ = _local_model().transcribe(audio, language="en", beam_size=1, vad_filter=True, condition_on_previous_text=False)
+    global _load_failed_at
+    try:
+        model = _local_model()
+    except Exception:
+        _load_failed_at = time.monotonic()
+        raise
+    segments, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=True, condition_on_previous_text=False)
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 

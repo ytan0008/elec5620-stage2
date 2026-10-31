@@ -714,12 +714,14 @@ class AssessmentAgent(Agent):
         self.event({"user_id": user_id, "workflow": "report"}, "action", {"decision": "recommended next steps", "count": len(tips)})
         return tips
 
-    def analyse_mock(self, user_id: int, scores: dict, overall: float, target: float | None, issues: list[str]) -> dict:
+    def analyse_mock(self, user_id: int, scores: dict, overall: float, target: float | None, issues: list[str], partial: bool = False) -> dict:
         """Steps 6-7: strengths and weaknesses, comparison with earlier assessments and readiness."""
         insights = analytics.mock_insights(self.db, user_id, scores, overall, target, issues)
         readiness = insights["readiness_detail"]
         self.event({"user_id": user_id, "workflow": "mock_exam"}, "decision", {"decision": "estimated readiness", "readiness": readiness["level"], "gap": readiness["gap"],
                    "weaknesses": [w["skill"] for w in insights["weaknesses"]], "compared_with": (insights["comparison"] or {}).get("against"), "next_agent": "Quality Manager"})
+        if partial:  # a section is still unscored: do not remember an estimate that leaves it out
+            return insights
         agent_core.remember(self.db, self.memory_key, user_id, f"Mock estimate {overall}: {readiness['level']}" + (f", weakest {insights['weaknesses'][0]['skill']}" if insights["weaknesses"] else "") + ".",
                             data={"overall": overall, "readiness": readiness["level"]})
         return insights

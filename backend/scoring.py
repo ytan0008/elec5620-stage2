@@ -141,6 +141,16 @@ ACADEMIC = {"significant", "consequently", "substantial", "approximately", "cons
             "detrimental", "fundamental", "crucial", "inevitable", "phenomenon", "sustainable", "infrastructure", "implement", "facilitate",
             "enhance", "promote", "alleviate", "comprehensive", "diverse", "potential", "access", "economic", "environmental", "individual",
             "particularly", "whereas", "furthermore", "nevertheless", "illustrate", "demonstrate", "emphasise", "emphasize", "decline", "fluctuate"}
+SINGULAR_VERBS = r"(works|goes|wants|likes|needs|thinks|makes|gets|says|lives|plays|feels|seems|uses|has|does|is|was)"
+PLURAL_PRONOUN = r"\b(they|we) " + SINGULAR_VERBS + r"\b"
+PLURAL_NOUN = (r"(^|[.,;!?]\s+|\b(?:the|many|most|some|all|these|those|our|their|my|young|older)\s+)"
+               r"(people|children|students|workers|companies|parents) " + SINGULAR_VERBS + r"\b")
+
+
+def _plural_verb(verb: str) -> str:
+    return {"has": "have", "does": "do", "is": "are", "was": "were", "goes": "go"}.get(verb.lower(), verb[:-1])
+
+
 ERRORS = [
     (r"\bpeoples\b(?!')", "Use 'people' (already plural) unless you mean nations.", lambda s: re.sub(r"\bpeoples\b", "people", s)),
     (r"\b(informations|advices|knowledges|equipments|furnitures|homeworks|researches|evidences|feedbacks)\b", "This noun is uncountable; drop the -s.", lambda s: re.sub(r"\b(information|advice|knowledge|equipment|furniture|homework|research|evidence|feedback)s\b", r"\1", s)),
@@ -160,10 +170,12 @@ ERRORS = [
     (r"\ba (?!uni|use|usu|one|euro|u\b)([aeiou]\w*)", "Use 'an' before a vowel sound.", lambda s: re.sub(r"\ba (?!uni|use|usu|one|euro)([aeiou]\w*)", r"an \1", s)),
     (r"\bsince (\d+ )?(years|months|days|weeks)\b", "Use 'for' with a period of time (for two years).", None),
     (r"\b(we|they|you) am\b|\bi (is|are)\b", "Check subject-verb agreement (I am, we are).", None),
-    (r"\b(they|we|you|people|children|students|workers|companies|parents) (works|goes|wants|likes|needs|thinks|makes|gets|says|lives|plays|feels|seems|uses|has|does|is|was)\b",
-     "A plural subject takes a plural verb (they work, they have, they are).", lambda s: re.sub(
-         r"\b(they|we|you|people|children|students|workers|companies|parents) (works|goes|wants|likes|needs|thinks|makes|gets|says|lives|plays|feels|seems|uses|has|does|is|was)\b",
-         lambda m: f"{m.group(1)} " + {"has": "have", "does": "do", "is": "are", "was": "were", "goes": "go"}.get(m.group(2), m.group(2)[:-1]), s, flags=re.I)),
+    # Only real subjects: "they"/"we", or a plural noun at the start of a clause or after a determiner
+    # ("The advice I give you is useful" and "the teacher who helps students is kind" are correct).
+    (PLURAL_PRONOUN, "A plural subject takes a plural verb (they work, they have, they are).",
+     lambda s: re.sub(PLURAL_PRONOUN, lambda m: f"{m.group(1)} {_plural_verb(m.group(2))}", s, flags=re.I)),
+    (PLURAL_NOUN, "A plural subject takes a plural verb (they work, they have, they are).",
+     lambda s: re.sub(PLURAL_NOUN, lambda m: f"{m.group(1)}{m.group(2)} {_plural_verb(m.group(3))}", s, flags=re.I)),
 ]
 STOP = set("the a an and or but of to in on at for with by from this that these those is are was were be been being it its as into than then there their they them some many much more most other such can could should would will may might must not no do does did have has had about also very what which who whom whose when where why how all any each few both own same so too only just your you our we i he she his her my me".split())
 

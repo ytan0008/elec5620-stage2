@@ -186,8 +186,9 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
     if (!exam) return
     setBusy(true); setConfirmEnd(false)
     try {
-      window.clearTimeout(saveTimer.current)
-      for (const skill of ['listening', 'reading', 'writing']) await put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(answers[skill] || {}) })
+      // IELTS: only the running section can still be saved (the others are closed or not started yet).
+      if (exam.timing) await flush(exam.timing.current)
+      else { window.clearTimeout(saveTimer.current); for (const skill of ['listening', 'reading', 'writing']) await put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(answers[skill] || {}) }) }
       const done = await post<Mock>(`/mock-exams/${exam.id}/end`, { reason })
       open(done); setExams(prev => (prev || []).map(m => m.id === done.id ? done : m))
       notify(done.status === 'INCOMPLETE' ? (reason === 'time' ? 'Time is up: the mock was recorded as incomplete' : 'Mock ended and recorded as incomplete') : 'Time is up: your mock was marked', done.status === 'INCOMPLETE' ? 'error' : 'success')
