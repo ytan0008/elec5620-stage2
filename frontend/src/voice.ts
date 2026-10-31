@@ -129,12 +129,52 @@ export async function speak(text: string, role: VoiceRole = 'witch', options: { 
 /* ---------------- recognition ---------------- */
 type RecognitionLike = { lang: string; continuous: boolean; interimResults: boolean; maxAlternatives: number; onresult: ((event: any) => void) | null; onerror: ((event: any) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void; abort: () => void }
 const RecognitionCtor = () => (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-export const recognitionSupported = () => Boolean(RecognitionCtor())
+// Recognition on our server (offline Whisper, or the cloud model) works even where the browser's online service is blocked.
+let serverRecognition = false
+health().then(h => { serverRecognition = h.server_stt }).catch(() => {})
+export const recognitionSupported = () => serverRecognition || Boolean(RecognitionCtor())
 
 export type Listener = { stop: () => void; abort: () => void }
 /* Continuous recognition that reports final text and the live interim caption.
    It restarts itself if the browser ends the session early. */
-export function listen(handlers: { onText: (finalText: string, interim: string) => void; onError?: (message: string) => void; onEnd?: () => void; lang?: string }): Listener {
+type ListenHandlers = { onText: (finalText: string, interim: string) => void; onError?: (message: string) => void; onEnd?: () => void; lang?: string; silenceMs?: number }
+
+export function listen(handlers: ListenHandlers): Listener {
+  if (serverRecognition) return serverListen(handlers)
+  return browserListen(handlers)
+}
+
+/* Records until the speaker pauses (or stop() is called), then sends the audio to the server for recognition. */
+function serverListen(handlers: ListenHandlers): Listener {
+  const silence = handlers.silenceMs ?? 2500
+  const started = Date.now()
+  let rec: { stop: () => Promise<Blob>; stream: MediaStream } | null = null
+  let stopLevel: (() => void) | null = null
+  let done = false, aborted = false, heard = false, lastVoice = Date.now(), floor = 0.01
+  const finish = async () => {
+    if (done) return
+    done = true
+    stopLevel?.()
+    const blob = rec ? await rec.stop() : null
+    if (!aborted && blob && blob.size) {
+      try { const text = (await transcribeOnServer(blob)).trim(); if (text) handlers.onText(text, '') }
+      catch (error) { handlers.onError?.(`Speech recognition failed: ${(error as Error).message}`) }
+    }
+    handlers.onEnd?.()
+  }
+  recordMicrophone().then(recording => {
+    rec = recording
+    if (done) { void recording.stop(); return }
+    stopLevel = monitorLevel(recording.stream, level => {
+      if (level > Math.max(0.02, floor * 2.5)) { heard = true; lastVoice = Date.now() }
+      else if (!heard) floor = floor * .9 + level * .1
+      if (heard && Date.now() - lastVoice > silence && Date.now() - started > 1200) void finish()
+    })
+  }).catch(() => { done = true; handlers.onError?.('Microphone permission was blocked. Allow microphone access in the address bar.'); handlers.onEnd?.() })
+  return { stop() { void finish() }, abort() { aborted = true; void finish() } }
+}
+
+function browserListen(handlers: ListenHandlers): Listener {
   const Ctor = RecognitionCtor()
   if (!Ctor) { handlers.onError?.('Speech recognition is not available in this browser. Use Chrome or Edge, or type your answer.'); return { stop() {}, abort() {} } }
   let finalText = ''
@@ -172,19 +212,40 @@ export function listen(handlers: { onText: (finalText: string, interim: string) 
 }
 
 /* Records the microphone (used for replay and for server transcription). */
-export async function recordMicrophone(): Promise<{ stop: () => Promise<Blob> }> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+export async function recordMicrophone(): Promise<{ stop: () => Promise<Blob>; stream: MediaStream }> {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
   const chunksList: BlobPart[] = []
   const type = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : ''
   const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined)
   recorder.ondataavailable = event => { if (event.data.size) chunksList.push(event.data) }
   recorder.start(1000)
   return {
+    stream,
     stop: () => new Promise<Blob>(resolve => {
       recorder.onstop = () => { stream.getTracks().forEach(track => track.stop()); resolve(new Blob(chunksList, { type: 'audio/webm' })) }
       if (recorder.state !== 'inactive') recorder.stop(); else resolve(new Blob(chunksList, { type: 'audio/webm' }))
     }),
   }
+}
+
+/* Reports the microphone loudness (0-1, RMS) about ten times a second; returns a function that stops monitoring. */
+export function monitorLevel(stream: MediaStream, onLevel: (level: number) => void): () => void {
+  const Ctx = window.AudioContext || (window as any).webkitAudioContext
+  if (!Ctx) return () => {}
+  const context: AudioContext = new Ctx()
+  // Browsers may create the context suspended when it is not started by a click; it would then report silence.
+  if (context.state === 'suspended') void context.resume().catch(() => {})
+  const analyser = context.createAnalyser()
+  analyser.fftSize = 1024
+  context.createMediaStreamSource(stream).connect(analyser)
+  const samples = new Float32Array(analyser.fftSize)
+  const timer = window.setInterval(() => {
+    analyser.getFloatTimeDomainData(samples)
+    let sum = 0
+    for (const value of samples) sum += value * value
+    onLevel(Math.sqrt(sum / samples.length))
+  }, 100)
+  return () => { window.clearInterval(timer); void context.close().catch(() => {}) }
 }
 
 export async function transcribeOnServer(blob: Blob): Promise<string> {

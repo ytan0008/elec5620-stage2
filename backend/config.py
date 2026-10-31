@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     speech_base_url: str = ""
     tts_model: str = "gpt-4o-mini-tts"
     transcription_model: str = "whisper-1"
+    # Offline speech recognition (faster-whisper) for answers when no cloud key is set or the cloud fails.
+    # It does not depend on the browser's online recognition service.
+    local_stt: bool = True
+    local_stt_model: str = "base.en"
+    local_stt_dir: str = "models"
     quality_threshold: float = 0.70
+    # UC5 2a: verified practice results a learner needs before starting a mock exam (0 turns the check off).
+    mock_min_practice: int = 1
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     instructor_email: str = "instructor@example.com"
     instructor_password: str = "ChangeMe123!"

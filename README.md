@@ -353,6 +353,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 | `SERVER_SPEECH` | `true` | Use cloud voice when a key is set; otherwise browser voice. |
 | `TTS_MODEL` / `TRANSCRIPTION_MODEL` | `gpt-4o-mini-tts` / `whisper-1` | Cloud speech models. |
 | `SPEECH_BASE_URL` | empty | Separate endpoint for speech (empty = same as OpenAI). |
+| `LOCAL_STT` / `LOCAL_STT_MODEL` | `true` / `base.en` | Offline speech recognition of spoken answers on the server (faster-whisper). Used when there is no key or the cloud fails, so speaking works even when the browser's online recognition is unavailable. |
 | `DEMO_MODE` | `false` | `true` forces LOCAL mode even with a key (used by tests). |
 | `QUALITY_THRESHOLD` | `0.70` | Initial confidence threshold (also adjustable in the console). |
 | `INSTRUCTOR_EMAIL` / `INSTRUCTOR_PASSWORD` | `instructor@example.com` / `ChangeMe123!` | Teacher account created at startup. |
@@ -430,6 +431,7 @@ KAN-3 #comment Examiner now asks follow-ups #time 2h #done
 | `docker compose` says it cannot connect | Start Docker Desktop and wait until it says it is running. |
 | Port 8080 already in use | Stop the other program, or change `"8080:80"` in `compose.yaml` (for example `"8081:80"`). |
 | Microphone does nothing | Use Chrome or Edge on `localhost` (or HTTPS) and allow microphone access. You can always type answers. |
+| "Speech recognition error: network" | The browser's own recognition service cannot be reached. With `LOCAL_STT=true` (default) answers are recognised offline on the server instead; rebuild with `docker compose up -d --build`. |
 | No voice | Check the system volume; the speaker icon in the chat toggles spoken replies. Edge's "Natural" voices sound best in LOCAL mode. |
 | "needs a cloud AI model" when generating listening/reading | Add an API key, or use the built-in tests in the **Question bank**. |
 | Mock exam returns 409 | Accept a learning plan first. |

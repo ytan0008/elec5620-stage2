@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 os.environ["DATABASE_URL"] = "sqlite:///./test_suite.db"
 os.environ["DEMO_MODE"] = "true"
+os.environ["LOCAL_STT"] = "false"  # keep the suite fast; tests/test_speech.py covers recognition
 from fastapi.testclient import TestClient
 from backend.main import app
 from backend.db import Base, engine
@@ -44,6 +45,13 @@ def active_plan(client, headers):
     plan_id = response.json()["id"]
     assert client.post(f"/api/plans/{plan_id}/decision?accept=true", headers=headers).status_code == 200
     return plan_id
+
+
+def practise_once(client, headers):
+    """One verified practice result: the preparation a learner needs before a mock exam (UC5 2a)."""
+    task = client.post("/api/practice/writing", headers=headers).json()
+    done = client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": "Remote work offers flexibility, although teams need clear routines to collaborate well."})
+    assert done.status_code == 200, done.text
 
 
 def test_contextual_agent_chat_persists_and_respects_roles():
@@ -129,14 +137,19 @@ def test_speaking_mock_resume_recommendations_ownership():
         assert client.post(f"/api/mock-exams/{exam_id}/submit", headers=headers).status_code == 409
         import json
         tasks = {task["task"]: "I think remote work offers meaningful flexibility while teams need clear routines to collaborate effectively." for task in mock.json()["sections"]["writing"]["tasks"]}
-        for skill, answer in {"reading": {"1": "TRUE"}, "listening": {"1": "Kowalski"}, "writing": tasks}.items():
-            assert client.put(f"/api/mock-exams/{exam_id}/{skill}", headers=headers, json={"answer": json.dumps(answer)}).status_code == 200
         speak_mock(client, headers, exam_id)
-        with TestClient(app) as resumed_client:
-            assert len(resumed_client.get(f"/api/mock-exams/{exam_id}", headers=headers).json()["answers"]) == 4
-        assert len(client.get(f"/api/mock-exams/{exam_id}", headers=headers).json()["answers"]) == 4
-        completed = client.post(f"/api/mock-exams/{exam_id}/submit", headers=headers)
+        assert client.post(f"/api/mock-exams/{exam_id}/written/start", headers=headers).status_code == 200
+        assert client.put(f"/api/mock-exams/{exam_id}/listening", headers=headers, json={"answer": json.dumps({"1": "Kowalski"})}).status_code == 200
+        with TestClient(app) as resumed_client:  # closing the browser and coming back keeps every saved answer
+            resumed = resumed_client.get(f"/api/mock-exams/{exam_id}", headers=headers).json()
+            assert len(resumed["answers"]) == 2 and resumed["timing"]["current"] == "listening"
+        client.post(f"/api/mock-exams/{exam_id}/written/next", headers=headers)
+        assert client.put(f"/api/mock-exams/{exam_id}/reading", headers=headers, json={"answer": json.dumps({"1": "TRUE"})}).status_code == 200
+        client.post(f"/api/mock-exams/{exam_id}/written/next", headers=headers)
+        assert client.put(f"/api/mock-exams/{exam_id}/writing", headers=headers, json={"answer": json.dumps(tasks)}).status_code == 200
+        completed = client.post(f"/api/mock-exams/{exam_id}/written/next", headers=headers)  # last section: marked automatically
         assert completed.status_code == 200, completed.text
+        assert len(completed.json()["answers"]) == 4
         assert completed.json()["result"]["state"] == "RELEASED"
         assert completed.json()["adaptation"]["outcome"] == "PROPOSED"  # UC7 trigger: a completed mock exam (UC5) proposes an adapted plan
         assert client.post("/api/materials/recommend", headers=headers).json()["state"] == "RELEASED"
@@ -385,6 +398,7 @@ def test_conversational_onboarding_portrait_questions_and_graph():
         other = auth(client, "question-other@example.com")
         assert client.post(f"/api/practice/speaking?question_id={generated.json()['id']}", headers=other).status_code == 404
         active_plan(client, headers)
+        practise_once(client, headers)
         mock = client.post("/api/mock-exams", headers=headers)
         assert mock.status_code == 200
         assert mock.json()["duration_seconds"] == (16 + 20 + 40 + 14) * 60
@@ -578,7 +592,10 @@ def test_developer_console_reports_dictionary_and_exam_lock():
         assert looked["word"] == "mitigate" and looked["translation"] and looked["saved"] is False
         # During a running mock: meanings and the tutor are locked, but words can still be saved.
         active_plan(client, headers)
-        assert client.post("/api/mock-exams", headers=headers).status_code == 200
+        practise_once(client, headers)
+        running = client.post("/api/mock-exams", headers=headers)
+        assert running.status_code == 200
+        assert client.post(f"/api/mock-exams/{running.json()['id']}/written/start", headers=headers).status_code == 200
         assert client.get("/api/dictionary?word=brittle", headers=headers).status_code == 423
         assert client.post("/api/chat/dashboard", headers=headers, json={"message": "What does brittle mean?"}).status_code == 423
         saved = client.post("/api/notebook", headers=headers, json={"kind": "word", "text": "brittle", "context": "paper became brittle"}).json()
@@ -652,6 +669,402 @@ def test_cloud_agent_loop_calls_tools_then_submits_structured_result():
     finally:
         db.rollback()
         db.close()
+
+
+def take_written(client, headers, mock_id, answers=None):
+    """IELTS written test: start Listening, then answer and finish each section in order. Returns the last view."""
+    import json
+    started = client.post(f"/api/mock-exams/{mock_id}/written/start", headers=headers)
+    assert started.status_code == 200, started.text
+    view = started.json()
+    for skill in ("listening", "reading", "writing"):
+        assert view["timing"]["current"] == skill
+        if answers and skill in answers:
+            saved = client.put(f"/api/mock-exams/{mock_id}/{skill}", headers=headers, json={"answer": json.dumps(answers[skill])})
+            assert saved.status_code == 200, saved.text
+        moved = client.post(f"/api/mock-exams/{mock_id}/written/next", headers=headers)
+        assert moved.status_code == 200, moved.text
+        view = moved.json()
+    return view
+
+
+def complete_mock(client, headers):
+    """Speaking first (a separate session), then the written test; the mock is marked when both are done."""
+    mock = client.post("/api/mock-exams", headers=headers).json()
+    tasks = {task["task"]: "I think remote work offers meaningful flexibility while teams need clear routines to collaborate effectively." for task in mock["sections"]["writing"]["tasks"]}
+    speak_mock(client, headers, mock["id"])
+    done = take_written(client, headers, mock["id"], {"listening": {"1": "Kowalski"}, "reading": {"1": "TRUE"}, "writing": tasks})
+    assert done["status"] == "SUBMITTED" and done["result"], done
+    return done
+
+
+def test_unfinished_mock_is_recorded_incomplete():
+    import json
+    from datetime import timedelta
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "incomplete.mock@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        assert client.post(f"/api/mock-exams/{mock['id']}/written/start", headers=headers).status_code == 200
+        assert client.put(f"/api/mock-exams/{mock['id']}/listening", headers=headers, json={"answer": json.dumps({})}).status_code == 200  # empty sheet
+        client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers)
+        assert client.put(f"/api/mock-exams/{mock['id']}/reading", headers=headers, json={"answer": json.dumps({"1": "TRUE"})}).status_code == 200
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 423  # locked while running
+        ended = client.post(f"/api/mock-exams/{mock['id']}/end", headers=headers, json={"reason": "learner"}).json()
+        assert ended["status"] == "INCOMPLETE" and ended["result"] is None
+        assert ended["ended"]["reason"] == "ended by learner" and ended["ended"]["completed"] == ["reading"]
+        assert set(ended["ended"]["missing"]) == {"listening", "writing", "speaking"}
+        assert client.post(f"/api/mock-exams/{mock['id']}/submit", headers=headers).status_code == 409
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 200  # lock released
+        # A mock not finished on the day it was started is closed as incomplete when the learner returns.
+        overdue = client.post("/api/mock-exams", headers=headers).json()
+        with SessionLocal() as db:
+            row = db.get(MockExam, overdue["id"])
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "day_deadline": (row.created_at - timedelta(hours=1)).isoformat()}}
+            db.commit()
+        reopened = client.get(f"/api/mock-exams/{overdue['id']}", headers=headers).json()
+        assert reopened["status"] == "INCOMPLETE" and reopened["ended"]["reason"] == "not finished on the day"
+
+
+def test_mock_result_compares_with_previous_and_explains_readiness():
+    with TestClient(app) as client:
+        headers = auth(client, "mock.insights@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        first = complete_mock(client, headers)["result"]["payload"]
+        assert first["readiness_detail"]["trend"].startswith("This is your first mock")
+        assert first["readiness"] in ("On track", "Close to target", "Needs further practice")
+        assert first["confidence"]["listening"] == .95 and 0 < first["confidence"]["writing"] <= 1
+        second = complete_mock(client, headers)
+        payload = second["result"]["payload"]
+        assert payload["comparison"]["against"].startswith(f"Mock #{second['id'] - 1}")
+        assert set(payload["comparison"]["skills"]) == {"listening", "reading", "writing", "speaking"}
+        assert payload["comparison"]["overall_change"] == round(payload["estimated_overall"] - first["estimated_overall"], 1)
+        strong = {item["skill"] for item in payload["strengths"]}
+        weak = {item["skill"] for item in payload["weaknesses"]}
+        assert not strong & weak and weak  # target 7 is above these scores, so there are weaknesses
+        assert payload["persistent_issues"]  # the same writing issues appeared in the first mock
+        assert str(payload["readiness_detail"]["target"]) in payload["readiness_detail"]["explanation"]
+
+
+def test_strengths_and_weaknesses_never_overlap():
+    from backend.main import split_skills
+    strong, weak = split_skills({"writing": 6.0}, 7.0)
+    assert not strong and [w["skill"] for w in weak] == ["writing"]
+    strong, weak = split_skills({"writing": 7.5, "reading": 8.0}, 7.0)
+    assert [s["skill"] for s in strong] == ["reading"] and [w["skill"] for w in weak] == ["writing"]
+    strong, weak = split_skills({"writing": 7.0, "reading": 7.0}, 7.0)
+    assert [s["skill"] for s in strong] == ["reading", "writing"] and not weak
+
+
+def test_performance_report_trends_readiness_and_partial_report(monkeypatch):
+    import backend.agents as agents_module
+    with TestClient(app) as client:
+        headers = auth(client, "uc6.report@example.com")
+        active_plan(client, headers)
+        task = client.post("/api/practice/writing", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. Companies should allow it because workers save time."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": essay}).status_code == 200
+        first = client.get("/api/analytics", headers=headers).json()
+        assert not set(first["strengths"]) & set(first["weaknesses"])  # one skill is never both
+        assert first["weaknesses"] == ["writing"] and first["strengths"] == []  # far below the target of 7
+        assert first["trend_note"].startswith("Not enough results to show a trend")
+        assert first["readiness"] == "Insufficient data"
+        better = essay + " Moreover, flexible schedules can improve wellbeing, although managers need clear routines to keep teams connected."
+        assert client.post(f"/api/practice/{task['id']}/submit", headers=headers, json={"text": better}).status_code == 200
+        progress = client.get("/api/analytics", headers=headers).json()
+        trend = progress["trends"]["writing"]
+        assert trend["results"] == 2 and trend["direction"] in ("improving", "steady", "declining")
+        assert trend["change"] == round(trend["latest"] - trend["first"], 2)
+        assert progress["readiness"] in ("On track", "Close to target", "Needs further practice") and progress["readiness_note"]
+        assert any("writing" in tip.lower() for tip in progress["recommendations"])
+        report = client.post("/api/reports", headers=headers).json()["result"]
+        assert report["state"] == "RELEASED"
+        assert report["payload"]["readiness"] == progress["readiness"]  # the saved report agrees with the page
+        assert report["payload"]["trends"]["writing"]["direction"] == trend["direction"]
+
+        def broken(*args, **kwargs):
+            raise TimeoutError("model unavailable")
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "report", broken)
+        partial = client.post("/api/reports", headers=headers).json()["result"]
+        assert partial["state"] == "RELEASED"  # the verified analysis is still delivered (UC6 6a)
+        assert partial["payload"]["recommendations_unavailable"] is True and partial["payload"]["recommendations"] == []
+        assert "writing" in partial["payload"]["summary"]
+
+
+def test_mock_preparation_scoring_by_assessment_agent_and_failures(monkeypatch):
+    import backend.agents as agents_module
+    from backend import content as bank
+    with TestClient(app) as client:
+        headers = auth(client, "uc5.flows@example.com")
+        active_plan(client, headers)
+        # 2a: not prepared yet
+        early = client.post("/api/mock-exams", headers=headers)
+        assert early.status_code == 409 and "practice" in early.json()["detail"]
+        practise_once(client, headers)
+        # 3a: preparing the mock fails once, the retry succeeds
+        real, calls = bank.mock_sections, []
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("bank unavailable")
+            return real(*args, **kwargs)
+        monkeypatch.setattr(bank, "mock_sections", flaky)
+        assert client.post("/api/mock-exams", headers=headers).status_code == 200 and len(calls) == 2
+        # 3a: it keeps failing, so the learner is told the mock is unavailable
+        monkeypatch.setattr(bank, "mock_sections", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+        unavailable = client.post("/api/mock-exams", headers=headers)
+        assert unavailable.status_code == 503 and "temporarily unavailable" in unavailable.json()["detail"]
+        monkeypatch.setattr(bank, "mock_sections", real)
+        # Step 5: the Assessment & Analytics agent scores writing and speaking
+        scored = complete_mock(client, headers)
+        assert scored["result"]["state"] == "RELEASED"
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        events = client.get("/api/events?limit=300&workflow=mock_exam", headers=instructor).json()
+        assert any(e["agent"] == "Assessment & Analytics" and str(e["detail"].get("decision", "")).startswith("scored speaking") for e in events)
+        assert any(e["agent"] == "Assessment & Analytics" and e["detail"].get("decision") == "estimated readiness" for e in events)
+        # 5a: speaking cannot be scored even after a retry: the result is held for the teacher, answers kept
+        real_feedback = agents_module.LLMProviderAdapter.feedback
+        def no_speaking(self, exam, skill, *args, **kwargs):
+            if skill == "speaking":
+                raise TimeoutError("scoring service down")
+            return real_feedback(self, exam, skill, *args, **kwargs)
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "feedback", no_speaking)
+        held = complete_mock(client, headers)
+        assert held["result"]["state"] in ("HELD", "HUMAN_REVIEW") and not held["result"].get("payload")  # nothing unverified reaches the learner
+        assert len(held["answers"]) == 4  # nothing the learner did is lost
+        case = next(c for c in client.get("/api/instructor/cases", headers=instructor).json() if c["package"]["id"] == held["result"]["id"])
+        assert case["package"]["payload"]["unscored_sections"] == ["speaking"]
+
+
+def test_performance_page_reports_unavailable_data(monkeypatch):
+    from backend import analytics as analytics_module
+    with TestClient(app) as client:
+        headers = auth(client, "uc6.unavailable@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        assert client.get("/api/analytics", headers=headers).status_code == 200
+        monkeypatch.setattr(analytics_module, "latest_progress", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database read failed")))
+        page = client.get("/api/analytics", headers=headers)
+        assert page.status_code == 503 and "temporarily unavailable" in page.json()["detail"]  # 2b
+        report = client.post("/api/reports", headers=headers)
+        assert report.status_code == 503 and "try again" in report.json()["detail"]  # 3a after one retry
+
+
+def test_blank_answers_do_not_block_a_mock_only_the_speaking_test_does():
+    import json
+    from datetime import timedelta
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "blank.answers@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        # Listening, reading and writing answered but no speaking test: cannot be marked yet.
+        no_speaking = client.post("/api/mock-exams", headers=headers).json()
+        written = take_written(client, headers, no_speaking["id"], {"listening": {"1": "Kowalski"}, "reading": {"1": "TRUE"}})
+        assert written["status"] == "IN_PROGRESS" and written["timing"]["written_done"]
+        refused = client.post(f"/api/mock-exams/{no_speaking['id']}/submit", headers=headers)
+        assert refused.status_code == 409 and "speaking" in refused.json()["detail"]
+        # Every listening, reading and writing answer left blank: still marked, blanks count as wrong.
+        blank = client.post("/api/mock-exams", headers=headers).json()
+        speak_mock(client, headers, blank["id"])
+        marked = take_written(client, headers, blank["id"], {"listening": {}, "reading": {}, "writing": {}})
+        assert marked["status"] == "SUBMITTED", marked
+        payload = marked["result"]["payload"]
+        assert payload["details"]["listening"]["raw_score"] == 0 and payload["details"]["reading"]["raw_score"] == 0
+        assert payload["section_scores"]["writing"] == 1.0  # a blank task gets the lowest band
+        # "End exam" after the speaking test also marks it, blanks included.
+        ended = client.post("/api/mock-exams", headers=headers).json()
+        speak_mock(client, headers, ended["id"])
+        client.post(f"/api/mock-exams/{ended['id']}/written/start", headers=headers)
+        finished = client.post(f"/api/mock-exams/{ended['id']}/end", headers=headers, json={"reason": "learner"}).json()
+        assert finished["status"] == "SUBMITTED" and finished["result"]["state"] in ("RELEASED", "HELD", "HUMAN_REVIEW")
+        # Every written section runs out of time after the speaking test: marked automatically when the learner returns.
+        overdue = client.post("/api/mock-exams", headers=headers).json()
+        speak_mock(client, headers, overdue["id"])
+        client.post(f"/api/mock-exams/{overdue['id']}/written/start", headers=headers)
+        with SessionLocal() as db:
+            row = db.get(MockExam, overdue["id"])
+            started = (row.created_at - timedelta(hours=4)).isoformat()
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current_started": started, "written_started": started}}
+            db.commit()
+        assert client.get(f"/api/mock-exams/{overdue['id']}", headers=headers).json()["status"] == "SUBMITTED"
+
+
+def test_verified_mock_generates_its_performance_report(monkeypatch):
+    import backend.agents as agents_module
+    with TestClient(app) as client:
+        headers = auth(client, "mock.report@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        done = complete_mock(client, headers)
+        assert done["result"]["state"] == "RELEASED" and done["report_id"]
+        report = next(r for r in client.get("/api/reports", headers=headers).json() if r["id"] == done["report_id"])
+        assert report["result"]["state"] == "RELEASED"
+        payload = report["result"]["payload"]
+        assert payload["trigger"] == {"kind": "mock_exam", "mock_id": done["id"]}
+        assert {"listening", "reading", "writing", "speaking"} <= set(payload["skill_scores"])  # the mock is in the report
+        # A held mock gets its report only when the teacher releases the result.
+        real_feedback = agents_module.LLMProviderAdapter.feedback
+        def no_speaking(self, exam, skill, *args, **kwargs):
+            if skill == "speaking":
+                raise TimeoutError("scoring service down")
+            return real_feedback(self, exam, skill, *args, **kwargs)
+        monkeypatch.setattr(agents_module.LLMProviderAdapter, "feedback", no_speaking)
+        held = complete_mock(client, headers)
+        assert held["result"]["state"] != "RELEASED" and held["report_id"] is None
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        case = next(c for c in client.get("/api/instructor/cases", headers=instructor).json() if c["package"]["id"] == held["result"]["id"])
+        approved = client.post(f"/api/instructor/cases/{case['id']}/decision", headers=instructor, json={"decision": "approve", "note": "Speaking re-checked by hand."})
+        assert approved.status_code == 200, approved.text
+        after = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
+        assert after["result"]["state"] == "RELEASED" and after["report_id"]
+
+
+def test_report_breaks_down_every_section():
+    import json
+    with TestClient(app) as client:
+        headers = auth(client, "report.sections@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        essay = "i think peoples is more better when they works at home. the informations is easy. " * 4
+        tasks = {task["task"]: essay for task in mock["sections"]["writing"]["tasks"]}
+        listening = {"1": "Kowalsky", "2": ""}  # 1 misspelled, 2 left blank
+        speak_mock(client, headers, mock["id"])
+        done = take_written(client, headers, mock["id"], {"listening": listening, "reading": {"1": "TRUE"}, "writing": tasks})
+        report = client.get(f"/api/reports/{done['report_id']}", headers=headers).json()["result"]["payload"]
+        sections = report["sections"]
+        assert set(sections) == {"listening", "reading", "writing", "speaking"}
+        heard = sections["listening"]
+        assert heard["question_types"] and heard["went_well"] is not None and heard["to_improve"]
+        first, second = (next(m for m in heard["missed"] if m["n"] == n) for n in (1, 2))
+        assert first["kind"] == "misspelled" and first["correct_answer"] == "Kowalski" and first["question"]
+        assert second["kind"] == "not written" and second["correct_answer"] in heard["words_not_written"]
+        task = sections["writing"]["tasks"][0]
+        grammar = {g["type"]: g for g in task["grammar"]}
+        assert {"Subject-verb agreement", "Plurals and uncountable nouns", "Comparatives"} <= set(grammar)
+        assert "people are better when they work" in grammar["Subject-verb agreement"]["examples"][0]["correction"]
+        assert sections["speaking"]["fluency"]["words_per_minute"] and sections["speaking"]["criteria"]
+        assert "mistakes_by_type" in report["patterns"] and report["mock_summary"]["estimated_overall"] == done["result"]["payload"]["estimated_overall"]
+        other = auth(client, "report.other@example.com")
+        assert client.get(f"/api/reports/{done['report_id']}", headers=other).status_code == 404
+
+
+def test_assessment_agent_marks_records_and_recommends():
+    import json
+    with TestClient(app) as client:
+        headers = auth(client, "assessment.agent@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        assert client.get("/api/analytics", headers=headers).json()["recommendations"]  # recommend
+        quit_early = client.post("/api/mock-exams", headers=headers).json()
+        client.post(f"/api/mock-exams/{quit_early['id']}/end", headers=headers, json={"reason": "learner"})  # record_incomplete
+        complete_mock(client, headers)  # score_objective for listening and reading
+        instructor = {"Authorization": "Bearer " + client.post("/api/auth/login", json={"email": "instructor@example.com", "password": "ChangeMe123!"}).json()["token"]}
+        decisions = [str(e["detail"].get("decision")) for e in client.get("/api/events?limit=300&agent=Assessment%20%26%20Analytics", headers=instructor).json()]
+        assert "recommended next steps" in decisions
+        assert "recorded as incomplete; no final result" in decisions
+        assert {"marked listening against the answer key", "marked reading against the answer key"} <= set(decisions)
+
+
+def test_ielts_mock_runs_like_test_day():
+    import json
+    from datetime import datetime, timedelta, timezone
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "test.day@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers, json={"length": "short", "tz_offset_minutes": 660}).json()
+        timing = mock["timing"]
+        assert timing["current"] is None and not timing["written_started"]
+        local_end = datetime.fromisoformat(timing["day_deadline"]) + timedelta(minutes=660)
+        assert (local_end.hour, local_end.minute) == (23, 59)  # the end of the learner's own day
+        put = lambda skill, answer: client.put(f"/api/mock-exams/{mock['id']}/{skill}", headers=headers, json={"answer": json.dumps(answer)})
+        assert put("listening", {"1": "x"}).status_code == 409  # nothing runs before the written test starts
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 200  # not locked yet
+        started = client.post(f"/api/mock-exams/{mock['id']}/written/start", headers=headers).json()["timing"]
+        assert started["current"] == "listening" and started["current_deadline"]
+        assert put("reading", {"1": "TRUE"}).status_code == 409  # sections run in order
+        assert put("listening", {"1": "Kowalski"}).status_code == 200
+        assert client.post("/api/speaking/sessions", headers=headers, json={"mock_id": mock["id"]}).status_code == 409  # speaking is separate
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 423  # locked while the written test runs
+        # Listening's time runs out: Reading starts where Listening ended and Listening cannot be reopened.
+        with SessionLocal() as db:
+            row = db.get(MockExam, mock["id"])
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current_started": (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()}}
+            db.commit()
+        moved = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()["timing"]
+        assert moved["current"] == "reading" and moved["closed"] == ["listening"]
+        assert put("listening", {"1": "changed"}).status_code == 409
+        assert client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers).json()["timing"]["current"] == "writing"
+        done = client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers).json()
+        assert done["timing"]["written_done"] and done["status"] == "IN_PROGRESS"  # waiting for the speaking test
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 200  # free between the two parts
+        speak_mock(client, headers, mock["id"])
+        assert client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()["status"] == "SUBMITTED"  # marked once both parts are done
+
+
+def test_toefl_mock_keeps_one_sitting():
+    with TestClient(app) as client:
+        reply = client.post("/api/auth/register", json={"email": "toefl.mock@example.com", "name": "Toefl Learner", "password": "Example123!", "exam": "TOEFL", "proficiency": "intermediate",
+                                                        "target_score": 5, "exam_date": "2026-12-15", "weekly_hours": 8, "priority_skills": ["speaking"]})
+        headers = {"Authorization": "Bearer " + reply.json()["token"]}
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        assert mock["timing"] is None  # TOEFL 2026 speaking is part of the same sitting
+        assert client.put(f"/api/mock-exams/{mock['id']}/reading", headers=headers, json={"answer": "{\"1\": \"B\"}"}).status_code == 200
+
+
+def test_last_autosave_of_a_closing_section_is_kept():
+    import json
+    from datetime import datetime, timedelta, timezone
+    from backend.db import SessionLocal
+    from backend.models import MockExam
+    with TestClient(app) as client:
+        headers = auth(client, "last.autosave@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        client.post(f"/api/mock-exams/{mock['id']}/written/start", headers=headers)
+        client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers)
+        client.post(f"/api/mock-exams/{mock['id']}/written/next", headers=headers)  # Writing is running
+        with SessionLocal() as db:  # Writing ran out of time 5 seconds ago
+            row = db.get(MockExam, mock["id"])
+            started = datetime.now(timezone.utc) - timedelta(seconds=row.sections["writing"]["duration_seconds"] + 5)
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current_started": started.isoformat()}}
+            db.commit()
+        essay = {"task2": "My final sentence typed just before the time ran out."}
+        late = client.put(f"/api/mock-exams/{mock['id']}/writing", headers=headers, json={"answer": json.dumps(essay)})
+        assert late.status_code == 200, late.text  # within the grace period: nothing typed is lost
+        view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
+        assert view["timing"]["written_done"] and json.loads(view["answers"]["writing"]) == essay
+        with SessionLocal() as db:  # well after the grace period the section stays closed
+            row = db.get(MockExam, mock["id"])
+            gone = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "closed_at": {**row.sections["timing"]["closed_at"], "writing": gone}}}
+            db.commit()
+        assert client.put(f"/api/mock-exams/{mock['id']}/writing", headers=headers, json={"answer": "{}"}).status_code == 409
+
+
+def test_plan_update_notice_survives_any_marking_path():
+    with TestClient(app) as client:
+        headers = auth(client, "uc7.notice@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        take_written(client, headers, mock["id"])
+        speak_mock(client, headers, mock["id"])  # speaking last: marked when it finishes
+        view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
+        assert view["status"] == "SUBMITTED" and view["adaptation"]["outcome"] == "PROPOSED" and view["adaptation"]["plan_id"]
+        assert client.get("/api/mock-exams", headers=headers).json()[0]["adaptation"]["plan_id"] == view["adaptation"]["plan_id"]
 
 
 def test_sign_in_lasts_seven_days():

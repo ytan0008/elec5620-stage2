@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Check, ChevronRight, Clock3, FileText, Send } from 'lucide-react'
-import { Mock, ObjectiveTest, WritingTask, post, put, request } from './api'
+import { AlertTriangle, Check, ChevronRight, Circle, Clock3, FileText, Flag, Mic, PenLine, Send, TrendingDown, TrendingUp } from 'lucide-react'
+import { Mock, MockTiming, ObjectiveTest, WritingTask, post, put, request } from './api'
 import { HeldNotice, Notify, PageTitle, ScoreBar, Spinner, Status, clock, nice, words } from './ui'
 import ListeningPlayer, { useClipPlayer } from './exam/ListeningPlayer'
 import { Answers, ReviewItem, SectionQuestions, answeredCount, questionCount } from './exam/Questions'
@@ -27,6 +27,11 @@ function Results({ exam }: { exam: Mock }) {
     </div>
     {exam.adaptation?.plan_id && <div className="panel panel-cyan flex flex-wrap items-center justify-between gap-3 p-5" role="status"><p className="font-read">Your mock results changed what we suggest you study. A plan update is ready for your review.</p><Link to="/plans" className="btn-primary">Review plan update</Link></div>}
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{Object.entries(p.section_scores || {}).map(([skill, score]) => <ScoreBar key={skill} label={skill} score={Number(score)} max={max} />)}</div>
+    <Insights p={p} />
+    <div className="panel panel-flat flex flex-wrap items-center justify-between gap-3 p-5">
+      <p className="font-read text-sm text-mist">{exam.report_id ? 'Your full performance report has been updated with this mock: all four skills, trends over time and what to focus on next.' : 'See how this mock fits into your progress across all your verified results.'}</p>
+      <Link to={exam.report_id ? `/report/${exam.report_id}` : '/analytics'} className="btn-primary">View full report <ChevronRight size={16} /></Link>
+    </div>
     {details.listening && <div className="panel p-6">
       <div className="flex flex-wrap gap-2">{SECTIONS.map(s => <button key={s} className={open === s ? 'btn-primary' : 'btn-secondary'} onClick={() => setOpen(s)}>{nice(s)}</button>)}</div>
       <div className="mt-5 space-y-4 font-read">
@@ -42,6 +47,62 @@ function Results({ exam }: { exam: Mock }) {
   </div>
 }
 
+type SkillNote = { skill: string; score: number; note: string }
+
+/* UC5 steps 6-7: comparison with earlier assessments, strengths and weaknesses, and readiness from the trend. */
+function Insights({ p }: { p: Record<string, any> }) {
+  const r = p.readiness_detail
+  if (!r) return null
+  const change = (value: number) => <span className={value > 0 ? 'text-lime' : value < 0 ? 'text-rose' : 'text-fog'}>{value > 0 ? '+' : ''}{value}</span>
+  return <div className="grid gap-5 lg:grid-cols-2">
+    <div className="panel panel-cyan space-y-3 p-6">
+      <h3 className="section-title">Exam readiness</h3>
+      <p className="font-pixel text-xl text-cyan">{r.level}{r.gap > 0 ? ` · ${r.gap} to target` : ''}</p>
+      <p className="font-read text-sm leading-6">{r.explanation}</p>
+      {p.comparison && <div className="tile font-read text-sm">
+        <p className="mb-2 flex items-center gap-2 font-pixel text-sun">{(p.comparison.overall_change ?? 0) < 0 ? <TrendingDown size={16} /> : <TrendingUp size={16} />} Compared with {p.comparison.against}</p>
+        {p.comparison.overall_change !== null && p.comparison.overall_change !== undefined && <p>Overall {change(p.comparison.overall_change)}</p>}
+        <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1">{Object.entries(p.comparison.skills || {}).map(([skill, c]: [string, any]) => <p key={skill}>{nice(skill)}: {c.before} → {c.now} ({change(c.change)})</p>)}</div>
+      </div>}
+    </div>
+    <div className="panel space-y-4 p-6">
+      <div><h3 className="section-title text-lime">Strengths</h3>{p.strengths?.length ? p.strengths.map((s: SkillNote) => <p key={s.skill} className="mt-1 font-read text-sm"><b>{nice(s.skill)}</b> {s.score} · <span className="text-mist">{s.note}</span></p>) : <p className="mt-1 font-read text-sm text-mist">No section is at your target yet.</p>}</div>
+      <div><h3 className="section-title text-sun">Weaknesses</h3>{p.weaknesses?.length ? p.weaknesses.map((s: SkillNote) => <p key={s.skill} className="mt-1 font-read text-sm"><b>{nice(s.skill)}</b> {s.score} · <span className="text-mist">{s.note}</span></p>) : <p className="mt-1 font-read text-sm text-mist">Every section is at or above your target.</p>}</div>
+      {p.persistent_issues?.length > 0 && <div><h3 className="section-title text-rose">Problems that keep coming back</h3>{p.persistent_issues.map((issue: string) => <p key={issue} className="mt-1 font-read text-sm">▸ {issue}</p>)}
+        <Link to="/notebook?tab=grammar" className="mt-2 inline-block font-read text-xs text-cyan underline">Review them in your Grammar book</Link></div>}
+    </div>
+  </div>
+}
+
+/* UC5 4a: a mock left before the speaking test is kept, but it has no final result. */
+function IncompleteNotice({ exam }: { exam: Mock }) {
+  const ended = exam.ended
+  return <div className="panel panel-sun space-y-3 p-6 anim-pop">
+    <h2 className="section-title flex items-center gap-2"><AlertTriangle className="text-sun" /> Recorded as incomplete</h2>
+    <p className="font-read leading-7">This mock {ended?.reason === 'time expired' ? 'ran out of time' : 'was ended'} before the speaking test was taken, so it cannot be marked and there is <b>no final result</b>. Your saved answers are kept.</p>
+    {ended && <div className="grid gap-2 font-read text-sm sm:grid-cols-2">
+      <p className="tile">Finished: {ended.completed.length ? ended.completed.map(nice).join(', ') : 'none'}</p>
+      <p className="tile text-sun">Not finished: {ended.missing.map(nice).join(', ')}</p>
+    </div>}
+    <p className="font-read text-sm text-mist">Start a new mock when you have time to complete every section.</p>
+  </div>
+}
+
+const WRITTEN = ['listening', 'reading', 'writing'] as const
+const time = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+/* IELTS: written test (in order, each section timed) and a separate speaking test on the same day. */
+function TestDayStrip({ timing }: { timing: MockTiming }) {
+  const mark = (done: boolean, running: boolean) => done ? <Check size={15} className="text-lime" /> : running ? <Clock3 size={15} className="text-sun" /> : <Circle size={13} className="text-fog" />
+  return <div className="panel panel-flat flex flex-wrap items-center gap-x-6 gap-y-2 p-4 font-read text-sm">
+    <span className="flex items-center gap-2 font-pixel text-cyan"><PenLine size={16} /> Written test</span>
+    {WRITTEN.map((s, i) => <span key={s} className="flex items-center gap-1">{i > 0 && <ChevronRight size={14} className="text-fog" />}{mark(timing.closed.includes(s), timing.current === s)} {nice(s)} <span className="text-fog">{timing.minutes[s]} min</span></span>)}
+    <span className="flex items-center gap-2 font-pixel text-cyan"><Mic size={16} /> Speaking</span>
+    <span className="flex items-center gap-1">{mark(timing.speaking_done, false)} separate session · <span className="text-fog">about {timing.minutes.speaking} min</span></span>
+    <span className="ml-auto text-sun">Finish both today, by {time(timing.day_deadline)}</span>
+  </div>
+}
+
 export default function MockExamPage({ notify }: { notify: Notify }) {
   const [exams, setExams] = useState<Mock[] | null>(null)
   const [exam, setExam] = useState<Mock | null>(null)
@@ -50,14 +111,21 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
   const [task, setTask] = useState(0)
   const [part, setPart] = useState(0)
   const [busy, setBusy] = useState(false)
+  const [confirmEnd, setConfirmEnd] = useState(false)
+  const [confirmSubmit, setConfirmSubmit] = useState(false)
+  const [confirmNext, setConfirmNext] = useState(false)
   const [now, setNow] = useState(Date.now())
   const saveTimer = useRef(0)
+  const timedOut = useRef<number | string | null>(null)
   const clips = useClipPlayer('exam')
-  useExamLock('mock', Boolean(exam && !exam.legacy && exam.status === 'IN_PROGRESS'))
+  const timing = exam?.status === 'IN_PROGRESS' ? exam.timing : null
+  // IELTS: locked only while the written test runs (the speaking studio locks itself during the speaking test).
+  useExamLock('mock', Boolean(exam && !exam.legacy && exam.status === 'IN_PROGRESS' && (exam.timing ? exam.timing.current : true)))
 
   const open = (item: Mock) => {
     setExam(item)
     setAnswers(Object.fromEntries(SECTIONS.filter(s => s !== 'speaking').map(s => [s, parse(item.answers[s])])))
+    if (item.timing?.current) setSection(item.timing.current)
   }
   useEffect(() => {
     request<Mock[]>('/mock-exams').then(list => { setExams(list); const active = list.find(m => m.status === 'IN_PROGRESS' && !m.legacy); if (active) open(active) }).catch(e => notify(e.message, 'error'))
@@ -67,7 +135,7 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
 
   const create = async (length: 'short' | 'full') => {
     setBusy(true)
-    try { const created = await post<Mock>('/mock-exams', { length }); open(created); setSection('listening'); setExams(prev => [created, ...(prev || [])]); notify(`${length === 'full' ? 'Full-length' : 'Short'} mock started — good luck!`) }
+    try { const created = await post<Mock>('/mock-exams', { length, tz_offset_minutes: -new Date().getTimezoneOffset() }); open(created); setSection('listening'); setExams(prev => [created, ...(prev || [])]); notify(`${length === 'full' ? 'Full-length' : 'Short'} mock created — good luck!`) }
     catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
   }
   const save = (skill: string, value: Answers) => {
@@ -88,16 +156,75 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
     } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
   }
 
+  // IELTS written test: start it, or finish the running section and move on (saving its answers first).
+  const flush = async (skill?: string | null) => { window.clearTimeout(saveTimer.current); if (exam && skill) await put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(answers[skill] || {}) }).catch(() => {}) }
+  const startWritten = async () => {
+    if (!exam) return
+    setBusy(true)
+    try { const view = await post<Mock>(`/mock-exams/${exam.id}/written/start`); open(view); notify('Listening has started. Each section has its own clock.') }
+    catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const nextSection = async () => {
+    if (!exam?.timing?.current) return
+    setBusy(true); setConfirmNext(false)
+    try {
+      const finished = exam.timing.current
+      await flush(finished)
+      const view = await post<Mock>(`/mock-exams/${exam.id}/written/next`)
+      open(view); setExams(prev => (prev || []).map(m => m.id === view.id ? view : m))
+      notify(view.status === 'SUBMITTED' ? 'Your mock exam has been marked' : view.timing?.current ? `${nice(finished)} closed. ${nice(view.timing.current)} has started.` : 'Written test complete')
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const sectionTimeUp = async () => {
+    if (!exam?.timing?.current) return
+    await flush(exam.timing.current)
+    const view = await request<Mock>(`/mock-exams/${exam.id}`)
+    open(view); notify(view.timing?.current ? `Time is up. ${nice(view.timing.current)} has started.` : view.status === 'SUBMITTED' ? 'Time is up. Your mock exam has been marked.' : 'Time is up. Written test complete.')
+  }
+
+  const end = async (reason: 'time' | 'learner') => {
+    if (!exam) return
+    setBusy(true); setConfirmEnd(false)
+    try {
+      window.clearTimeout(saveTimer.current)
+      for (const skill of ['listening', 'reading', 'writing']) await put(`/mock-exams/${exam.id}/${skill}`, { answer: JSON.stringify(answers[skill] || {}) })
+      const done = await post<Mock>(`/mock-exams/${exam.id}/end`, { reason })
+      open(done); setExams(prev => (prev || []).map(m => m.id === done.id ? done : m))
+      notify(done.status === 'INCOMPLETE' ? (reason === 'time' ? 'Time is up: the mock was recorded as incomplete' : 'Mock ended and recorded as incomplete') : 'Time is up: your mock was marked', done.status === 'INCOMPLETE' ? 'error' : 'success')
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+
   const listening: ObjectiveTest | undefined = exam?.sections.listening
   const reading: ObjectiveTest | undefined = exam?.sections.reading
   const tasks: WritingTask[] = exam?.sections.writing?.tasks || []
-  const remaining = exam ? Math.max(0, Math.round((new Date(exam.created_at).getTime() + exam.duration_seconds * 1000 - now) / 1000)) : 0
+  const remaining = exam ? Math.max(0, Math.round(((timing ? (timing.current_deadline ? new Date(timing.current_deadline).getTime() : now) : new Date(exam.created_at).getTime() + exam.duration_seconds * 1000) - now) / 1000)) : 0
   const progress = useMemo(() => exam ? {
     listening: listening ? `${answeredCount(listening.sections, answers.listening || {})}/${questionCount(listening.sections)}` : '',
     reading: reading ? `${answeredCount(reading.sections, answers.reading || {})}/${questionCount(reading.sections)}` : '',
     writing: tasks.map(t => words(answers.writing?.[t.task] || '')).join(' + ') + ' words',
     speaking: exam.answers.speaking ? 'saved' : 'not started',
   } : {}, [exam, answers]) as Record<string, string>
+  // Blank answers do not stop marking (they count as wrong, as in the real test); only the speaking test must be taken.
+  const speakingDone = Boolean(exam?.answers.speaking)
+  const blanks = [
+    ...(listening ? [[questionCount(listening.sections) - answeredCount(listening.sections, answers.listening || {}), 'listening']] : []),
+    ...(reading ? [[questionCount(reading.sections) - answeredCount(reading.sections, answers.reading || {}), 'reading']] : []),
+  ].filter(([n]) => Number(n) > 0).map(([n, s]) => `${nice(String(s))}: ${n} unanswered`)
+    .concat(tasks.filter(t => !(answers.writing?.[t.task] || '').trim()).map(t => `${t.task === 'task1' ? 'Writing Task 1' : t.task === 'task2' ? 'Writing Task 2' : nice(t.task)} blank`))
+  const trySubmit = () => { if (!speakingDone || blanks.length) setConfirmSubmit(true); else void submit() }
+  const sectionBlanks = (skill?: string | null) => skill === 'listening' && listening ? questionCount(listening.sections) - answeredCount(listening.sections, answers.listening || {})
+    : skill === 'reading' && reading ? questionCount(reading.sections) - answeredCount(reading.sections, answers.reading || {})
+      : skill === 'writing' ? tasks.filter(t => !(answers.writing?.[t.task] || '').trim()).length : 0
+  useEffect(() => {
+    if (!exam || exam.status !== 'IN_PROGRESS' || exam.legacy || remaining !== 0 || busy) return
+    if (timing) {
+      // IELTS: a section's time is up -> the next one starts (the server moves the clock on).
+      if (timing.current && timedOut.current !== `${exam.id}:${timing.current}`) { timedOut.current = `${exam.id}:${timing.current}`; void sectionTimeUp() }
+      return
+    }
+    // When the clock reaches zero the exam ends: marked if every section is done, otherwise recorded as incomplete.
+    if (timedOut.current !== exam.id) { timedOut.current = exam.id; void end('time') }
+  }, [remaining, exam?.id, exam?.status, timing?.current])
 
   if (!exams) return <Spinner label="Loading the exam hall…" />
   if (!exam || exam.legacy) return <>
@@ -106,8 +233,8 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
       <div className="panel panel-cyan space-y-4 p-7"><h2 className="heading text-2xl">Short mock · ~90 min</h2><p className="font-read text-mist">2 listening parts (20 questions), 1 reading passage, Writing Task 2, full speaking test. Ideal weekly check-in.</p><button className="btn-cyan" disabled={busy} onClick={() => create('short')}>Start short mock <ChevronRight size={17} /></button></div>
       <div className="panel panel-hot space-y-4 p-7"><h2 className="heading text-2xl">Full mock · ~2 h 45 min</h2><p className="font-read text-mist">All 4 listening parts (40 questions), 3 reading passages (40 questions), Writing Task 1 + Task 2 and the full speaking test — like test day.</p><button className="btn-primary" disabled={busy} onClick={() => create('full')}>Start full mock <ChevronRight size={17} /></button></div>
     </div>
-    <p className="mt-4 font-read text-sm text-fog">You need an active learning plan first. <Link to="/plans" className="text-cyan underline">Open learning plan</Link>. Results are unofficial estimates.</p>
-    {exams.filter(m => m.result).length > 0 && <div className="panel mt-8 p-6"><h2 className="section-title">Past mocks</h2><div className="mt-4 space-y-2">{exams.filter(m => m.result).map(m => <button key={m.id} className="tile flex w-full items-center justify-between text-left" onClick={() => open(m)}><span className="font-pixel">#{m.id} · {m.exam} {m.length} · {new Date(m.created_at).toLocaleDateString()}</span><span className="flex items-center gap-3">{m.result?.payload?.estimated_overall !== undefined && <b className="num text-3xl text-magenta">{m.result.payload.estimated_overall}</b>}<Status value={m.result!.state} /></span></button>)}</div></div>}
+    <p className="mt-4 font-read text-sm text-fog">Before a mock you need an active <Link to="/plans" className="text-cyan underline">learning plan</Link> and at least one finished <Link to="/practice/writing" className="text-cyan underline">practice task</Link>, so the result can be compared with your preparation. Results are unofficial estimates.</p>
+    {exams.filter(m => m.result || m.status === 'INCOMPLETE').length > 0 && <div className="panel mt-8 p-6"><h2 className="section-title">Past mocks</h2><div className="mt-4 space-y-2">{exams.filter(m => m.result || m.status === 'INCOMPLETE').map(m => <button key={m.id} className="tile flex w-full items-center justify-between text-left" onClick={() => open(m)}><span className="font-pixel">#{m.id} · {m.exam} {m.length} · {new Date(m.created_at).toLocaleDateString()}</span><span className="flex items-center gap-3">{m.result?.payload?.estimated_overall !== undefined && <b className="num text-3xl text-magenta">{m.result.payload.estimated_overall}</b>}<Status value={m.result ? m.result.state : 'INCOMPLETE'} /></span></button>)}</div></div>}
   </>
 
   const submitted = exam.status !== 'IN_PROGRESS'
@@ -115,12 +242,48 @@ export default function MockExamPage({ notify }: { notify: Notify }) {
     <div className="panel panel-hot sticky top-2 z-20 flex flex-wrap items-center justify-between gap-4 p-4">
       <div><p className="eyebrow">Unofficial computer-delivered practice</p><h1 className="mt-2 font-pixel text-xl">{exam.exam} {exam.length === 'full' ? 'full-length' : 'short'} mock #{exam.id}</h1></div>
       <div className="flex flex-wrap items-center gap-3">
-        {!submitted && <span className={`flex items-center gap-2 px-3 py-1 ${remaining < 600 ? 'bg-rose text-night' : 'bg-abyss'}`} style={{ boxShadow: '0 0 0 3px #3ef0ff' }}><Clock3 size={18} /><span className="num text-4xl">{clock(remaining)}</span></span>}
-        {!submitted ? <button className="btn-primary" disabled={busy} onClick={submit}><Send size={16} /> {busy ? 'Marking…' : 'Submit all sections'}</button> : <button className="btn-secondary" onClick={() => setExam(null)}>Back to exam hall</button>}
+        {!submitted && (!timing || timing.current) && <span className={`flex items-center gap-2 px-3 py-1 ${remaining < 300 ? 'bg-rose text-night' : 'bg-abyss'}`} style={{ boxShadow: '0 0 0 3px #3ef0ff' }}><Clock3 size={18} />{timing?.current && <span className="font-pixel text-sm">{nice(timing.current)}</span>}<span className="num text-4xl">{clock(remaining)}</span></span>}
+        {!submitted && <button className="btn-secondary" disabled={busy} onClick={() => setConfirmEnd(true)}><Flag size={16} /> End exam</button>}
+        {timing?.current && <button className="btn-primary" disabled={busy} onClick={() => setConfirmNext(true)}>Finish {nice(timing.current)} <ChevronRight size={16} /></button>}
+        {submitted ? <button className="btn-secondary" onClick={() => setExam(null)}>Back to exam hall</button> : !timing && <button className="btn-primary" disabled={busy} onClick={trySubmit}><Send size={16} /> {busy ? 'Marking…' : 'Submit all sections'}</button>}
       </div>
     </div>
-    {submitted ? (exam.result ? <Results exam={exam} /> : <Spinner />) : <>
-      <nav className="flex flex-wrap gap-1" aria-label="Exam sections">{SECTIONS.map((s, i) => <button key={s} onClick={() => setSection(s)} className={section === s ? 'btn-primary' : 'btn-secondary'}>
+    {confirmEnd && !submitted && <div role="alertdialog" aria-label="End the exam" className="panel panel-sun anim-pop flex flex-wrap items-center justify-between gap-4 p-5">
+      <p className="font-read">{!speakingDone ? <>You haven't taken the <b>speaking test</b> yet. If you end now the mock is <b>recorded as incomplete</b> and you get no final result.</>
+        : <>Ending now marks your mock.{blanks.length > 0 && <> Still blank: <b>{blanks.join(' · ')}</b>, which count as wrong.</>}</>}</p>
+      <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmEnd(false)}>Keep working</button><button className="btn-sun" onClick={() => void end('learner')}>End exam</button></div>
+    </div>}
+    {confirmNext && timing?.current && <div role="alertdialog" aria-label="Finish this section" className="panel panel-sun anim-pop flex flex-wrap items-center justify-between gap-4 p-5">
+      <p className="font-read">{sectionBlanks(timing.current) > 0 ? <>{nice(timing.current)}: <b>{sectionBlanks(timing.current)} {timing.current === 'writing' ? 'task(s) blank' : 'unanswered'}</b>, which count as wrong. </> : null}
+        Once you finish <b>{nice(timing.current)}</b> you cannot come back to it{timing.current === 'writing' ? '' : `, and ${nice(WRITTEN[WRITTEN.indexOf(timing.current) + 1])} starts straight away`}.</p>
+      <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmNext(false)}>Keep working</button><button className="btn-primary" onClick={() => void nextSection()}>Finish {nice(timing.current)}</button></div>
+    </div>}
+    {confirmSubmit && !submitted && <div role="alertdialog" aria-label="Check before submitting" className="panel panel-sun anim-pop flex flex-wrap items-center justify-between gap-4 p-5">
+      {!speakingDone ? <>
+        <p className="font-read">Take the <b>speaking test</b> before submitting: it is the one section that cannot be marked without you. Blank answers elsewhere are fine.</p>
+        <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmSubmit(false)}>Close</button><button className="btn-cyan" onClick={() => { setConfirmSubmit(false); setSection('speaking') }}>Go to speaking</button></div>
+      </> : <>
+        <p className="font-read">Still blank: <b>{blanks.join(' · ')}</b>. Blank answers are marked as wrong, as in the real test. Submit anyway?</p>
+        <div className="flex gap-2"><button className="btn-secondary" onClick={() => setConfirmSubmit(false)}>Go back and check</button><button className="btn-primary" onClick={() => { setConfirmSubmit(false); void submit() }}>Submit</button></div>
+      </>}
+    </div>}
+    {timing && !submitted && <TestDayStrip timing={timing} />}
+    {timing && !submitted && !timing.current && <div className="grid gap-5 lg:grid-cols-2">
+      <div className="panel panel-cyan space-y-3 p-6">
+        <h2 className="section-title flex items-center gap-2"><PenLine className="text-cyan" /> Written test</h2>
+        {timing.written_done ? <p className="font-read text-lime">Complete. {timing.speaking_done ? '' : 'Now take your speaking test.'}</p> : <>
+          <p className="font-read text-mist">Listening ({timing.minutes.listening} min) → Reading ({timing.minutes.reading} min) → Writing ({timing.minutes.writing} min), straight after each other. Each section has its own clock: when its time is up the next one starts, and you cannot go back.</p>
+          <button className="btn-cyan" disabled={busy} onClick={startWritten}>Start written test <ChevronRight size={16} /></button></>}
+      </div>
+      <div className="panel panel-hot space-y-3 p-6">
+        <h2 className="section-title flex items-center gap-2"><Mic className="text-magenta" /> Speaking test</h2>
+        {timing.speaking_done ? <p className="font-read text-lime">Complete. {timing.written_done ? '' : 'Now take the written test.'}</p>
+          : <p className="font-read text-mist">A separate interview with your examiner, about {timing.minutes.speaking} minutes. Take it before or after the written test, today by {time(timing.day_deadline)}.</p>}
+      </div>
+    </div>}
+    {timing && !submitted && !timing.current && !timing.speaking_done && <SpeakingStudio notify={notify} mockId={exam.id} onSaved={reload} />}
+    {submitted ? (exam.result ? <Results exam={exam} /> : exam.status === 'INCOMPLETE' ? <IncompleteNotice exam={exam} /> : <Spinner />) : (timing && !timing.current) ? null : <>
+      <nav className="flex flex-wrap gap-1" aria-label="Exam sections">{SECTIONS.filter(s => !timing || s === timing.current).map((s, i) => <button key={s} onClick={() => setSection(s)} className={section === s ? 'btn-primary' : 'btn-secondary'}>
         <span className="font-arcade text-[10px]">{i + 1}</span> {nice(s)} <span className="font-read text-xs normal-case opacity-80">{progress[s]}</span>{s === 'speaking' && exam.answers.speaking && <Check size={15} />}
       </button>)}</nav>
 

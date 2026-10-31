@@ -16,3 +16,6 @@ tmp/
 # Canvas package: generate with python scripts/package_source.py when submitting
 ELEC5620-Stage2-Source.zip
 docs/jira-archive/
+
+# Offline speech model (downloaded on first use)
+models/
