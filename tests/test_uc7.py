@@ -61,6 +61,8 @@ def test_basic_flow_proposes_rationale_per_change_and_resources_then_activates_a
         by_skill = {c["skill"]: c for c in content["change_details"]}
         assert by_skill["reading"]["change"] == "raised" and by_skill["reading"]["to_priority"] == 1 and "4.5" in by_skill["reading"]["reason"]
         assert by_skill["writing"]["change"] == "lowered" and all(c["reason"] for c in content["change_details"])
+        assert "further behind" in by_skill["writing"]["reason"]  # below target but lowered: the reason must not contradict itself
+        assert "at or above your target" in by_skill["speaking"]["reason"] and "less of your week" in by_skill["speaking"]["reason"]
         assert len(content["changes"]) == len(content["change_details"])
         # step 5: relevant resources for the new focus
         assert [r["skill"] for r in content["resources"]] == content["priorities"][:3]

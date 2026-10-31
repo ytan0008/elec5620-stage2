@@ -85,6 +85,10 @@ class MockEndInput(BaseModel):
     reason: Literal["time", "learner"] = "learner"
 
 
+class AvailabilityInput(BaseModel):
+    available: bool
+
+
 class ReviewInput(BaseModel):
     decision: Literal["approve", "correct", "request_information"]
     note: str = Field(min_length=3, max_length=2000)
