@@ -74,15 +74,18 @@ The CSV backlog (`docs/jira-backlog.csv`) is an import aid, not a record of Jira
   - PR #10 (KAN-9) by bluepheonix9: UC9 retries the LLM once before the rule-based checks, as in the Stage 1 spec, plus a README table mapping every use case and class to the code. Merged by ytan0008.
   - bluepheonix9 checked UC1–UC8 against the Stage 1 use case specs, resolved PR #8's conflicts with `main`, and opened PR #11 (KAN-5: two bugs when a teacher releases a held mock) and PR #12 (KAN-3, KAN-4, KAN-6: retry and "temporarily unavailable" flows, the word-minimum choice, the report page's Try again, and an updated status document).
   - With `main`, #8, #11 and #12 combined: 69 backend tests and all 3 browser tests pass, and the frontend builds.
-- **Group to add:** live demo rehearsal (Docker from the Canvas zip), Jira sprint board or burndown screenshot, and who accepted which stories.
+  - bluepheonix9 merged PRs #8, #11 and #12 once their checks passed (`main` at `e89bd4b`). A Canvas-style zip built from `main` with `scripts/package_source.py` (110 files) passes all 69 backend tests after unzipping, and `docker compose up --build` from the unzipped copy built and started the app in about 5 minutes from scratch (sign-in page on port 8080, offline engine, offline speech recognition on).
+  - First test of cloud AI mode (`gpt-6-luna`, OpenAI key in a local `.env` only). The Learning Coordinator called four of its tools (plan history, notebook statistics, materials search for writing and speaking) before proposing a plan, which the Quality Manager held for the teacher because the model's confidence was below 0.7. The AI Tutor's writing feedback noticed that the essay answered a different question (Task Response 2), and the Quality Manager released it after an LLM consistency check.
+- **Group to add:** Jira sprint board or burndown screenshot, and who accepted which stories.
 
 ### Retrospective
 
 - What helped: one branch and pull request per use case, named with its Jira key; one test file per use case with one test per spec flow (`test_uc7.py`, `test_uc8.py`, `test_uc9_uc10.py`); checking the code against the Stage 1 specs found two real bugs (PR #11).
 - What slowed or broke integration: PR #8 waited three days and picked up conflicts after PR #9 was merged; PRs #3 and #6 stayed open for 14 days; no pull request had a review comment, and PRs #7 and #9 were merged by their author within two minutes of opening.
 - Quality issues:
-  - The same browser test timed out on a click again (main after PR #7, run 40620767247; PR #10, which passed on a re-run). Five CI runs failed in total; four were this test.
+  - The same browser test timed out on a click again (main after PR #7, run 40620767247; PR #10, which passed on a re-run). Across the project this click timeout appeared in four CI runs (15, 17, 28 and 31 October).
   - PR #12 first broke the browser test, because the new word-minimum step changed the writing flow. The test was updated to follow the new step.
+  - Cloud AI mode was first tried on 31 October, the day before submission. Until then every demo and test ran on the offline engine.
 - Action, owner, due date: **Group to add.** Suggestion from the record: one teammate reviews each pull request before it's merged.
 - Did the previous action help? **Group to add.**
 
