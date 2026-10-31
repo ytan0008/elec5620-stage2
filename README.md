@@ -202,7 +202,7 @@ After pulling changes that add database tables, run `alembic upgrade head` again
 | **Agent memory** | What each of the four agents remembers (episodes and lessons). |
 | **Anomalies** | Automatic detection of model failures, provider outages, quality holds, high hold rates, slow steps, speech failures, sudden score drops, curriculum gaps, inactive learners and learner reports. Each can be acknowledged. |
 | **Learner reports** | Problem reports from learners, with replies. |
-| **Review queue** | Results held by the Quality Manager. The teacher can approve, correct or request more information. |
+| **Review queue** | Results held by the Quality Manager. The teacher is notified, sees the learner's earlier results, previous decisions and highlighted conflicts, and can approve, override with a corrected result, or request more information. Marking yourself away queues new cases until you are available again. |
 | **Quality operations** | Quality-check history and the adjustable confidence threshold (default 0.70). |
 
 ---
@@ -320,6 +320,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 | `QUALITY_THRESHOLD` | `0.70` | Initial confidence threshold (also adjustable in the console). |
 | `INSTRUCTOR_EMAIL` / `INSTRUCTOR_PASSWORD` | `instructor@example.com` / `ChangeMe123!` | Teacher account created at startup. |
 | `JWT_SECRET` | placeholder | **Change before any public deployment.** |
+| `SESSION_DAYS` | `7` | Days a sign-in stays valid. When it expires the app returns to the sign-in page. |
 | `DATABASE_URL` | `sqlite:///./elec5620.db` | Database (Docker uses its own volume). |
 | `CORS_ORIGINS` | localhost:5173 | Allowed browser origins in development. |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Used in password-reset links. |
@@ -331,7 +332,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 ## 11. Testing
 
 ```powershell
-# Backend: 38 tests (workflows, quality gate, plan adaptation (UC7), agents' memory and tools, notebooks, console, exam lock)
+# Backend: 48 tests (workflows, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock)
 .\.venv\Scripts\python -m pytest tests -q
 
 # Frontend type-check and production build

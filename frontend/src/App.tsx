@@ -302,36 +302,68 @@ function MaterialsPage({ notify }: { notify: Notify }) {
   </>
 }
 
+const HIGHLIGHT_LABEL: Record<string, string> = { low_confidence: 'Low confidence', conflict: 'Conflicting result', quality_issue: 'Held by the quality check' }
+
 function InstructorPage({ notify }: { notify: Notify }) {
   const { data, reload, loading } = useLoad<any[]>('/instructor/cases')
+  const presence = useLoad<{ available: boolean; queued: number; notifications: { case_id: number; kind: string; reason: string }[] }>('/instructor/availability')
   const [selected, setSelected] = useState<any>(null)
+  const detail = useLoad<any>(selected ? `/instructor/cases/${selected.id}` : null, [selected?.id])
+  const view = detail.data && detail.data.id === selected?.id ? detail.data : null
   const [decision, setDecision] = useState('approve')
   const [note, setNote] = useState('')
   const [correction, setCorrection] = useState('')
-  const submit = async () => {
+  const [busy, setBusy] = useState(false)
+  const refresh = () => { reload(); presence.reload(); detail.reload() }
+  const run = async (fn: () => Promise<void>) => { setBusy(true); try { await fn() } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) } }
+  const toggle = () => run(async () => {
+    const result = await put<{ released: number }>('/instructor/availability', { available: !presence.data?.available })
+    refresh(); notify(presence.data?.available ? 'You are away. New cases will wait in the queue.' : result.released ? `You are available. ${result.released} queued case${result.released > 1 ? 's' : ''} released to you.` : 'You are available')
+  })
+  const requestEvidence = () => run(async () => { await post(`/instructor/cases/${selected.id}/request-evidence`); refresh(); notify('Evidence gathered') })
+  const retryDelivery = () => run(async () => { const result = await post<{ notifications_pending: string[] }>(`/instructor/cases/${selected.id}/retry-notifications`); refresh(); notify(result.notifications_pending.length ? 'Some agents still could not be reached' : 'All agents have the outcome') })
+  const submit = () => run(async () => {
     if (!selected) return
-    try {
-      let corrected: Record<string, any> | null = null
-      if (decision === 'correct') { try { corrected = correction.trim().startsWith('{') ? JSON.parse(correction) : { summary: correction } } catch { notify('Correction JSON is invalid', 'error'); return } }
-      await post(`/instructor/cases/${selected.id}/decision`, { decision, note, correction: corrected })
-      notify('Decision recorded'); setSelected(null); reload()
-    } catch (e) { notify((e as Error).message, 'error') }
-  }
+    let corrected: Record<string, any> | null = null
+    if (decision === 'correct') { try { corrected = correction.trim().startsWith('{') ? JSON.parse(correction) : { summary: correction } } catch { notify('Correction JSON is invalid', 'error'); return } }
+    const result = await post<{ notifications_pending: string[] }>(`/instructor/cases/${selected.id}/decision`, { decision, note, correction: corrected })
+    notify(result.notifications_pending?.length ? 'Decision recorded. Some agents will get the outcome shortly.' : 'Decision recorded'); setNote(''); setCorrection(''); refresh()
+  })
+  const open = view && ['PENDING', 'MORE_INFO'].includes(view.status)
+  const waiting = presence.data?.notifications.length ?? 0
   return <>
-    <PageTitle eyebrow="Human oversight" title="Instructor review queue" subtitle="Inspect held results and evidence before releasing a decision." action={<button onClick={reload} className="btn-secondary">Refresh queue</button>} />
+    <PageTitle eyebrow="Human oversight" title="Instructor review queue" subtitle="Inspect held results and evidence before releasing a decision."
+      action={<div className="flex flex-wrap gap-2"><button onClick={toggle} disabled={busy || !presence.data} className={presence.data?.available ? 'btn-lime' : 'btn-secondary'}>{presence.data?.available ? 'Available for review' : 'Away: mark me available'}</button><button onClick={refresh} className="btn-secondary">Refresh queue</button></div>} />
+    {presence.data && (waiting > 0 || presence.data.queued > 0) && <div className="panel panel-cyan mb-5 p-5" role="status">
+      {waiting > 0 && <p className="font-read">{waiting === 1 ? '1 case needs' : `${waiting} cases need`} your review.</p>}
+      {presence.data.queued > 0 && <p className="font-read text-sun">{presence.data.queued === 1 ? '1 case is' : `${presence.data.queued} cases are`} waiting in the queue until an instructor is available.</p>}</div>}
     {loading ? <Spinner /> : !data?.length ? <Empty title="No escalations" body="Low-confidence or contradictory results will appear here." /> : <div className="grid gap-5 lg:grid-cols-[.75fr_1.25fr]">
       <div className="space-y-3">{data.map(item => <button key={item.id} className={`panel w-full p-5 text-left ${selected?.id === item.id ? 'panel-hot' : ''}`} onClick={() => { setSelected(item); setNote(''); setCorrection('') }}>
         <div className="flex justify-between"><span className="eyebrow">Case #{item.id}</span><Status value={item.status} /></div><p className="mt-3 font-pixel text-lg">{nice(item.package.kind)} result</p><p className="mt-1 line-clamp-2 font-read text-sm text-mist">{item.reason}</p></button>)}</div>
-      {selected ? <div className="panel p-6">
-        <div className="flex justify-between"><div><span className="eyebrow">Evidence review</span><h2 className="heading mt-2 text-2xl">Case #{selected.id}</h2></div><Status value={selected.status} /></div>
-        <p className="tile mt-4 font-read text-sm text-sun">{selected.reason}</p>
-        <div className="mt-5 grid gap-4 sm:grid-cols-2"><div><h3 className="font-pixel">AI output</h3><pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap bg-abyss/80 p-4 font-terminal text-base">{JSON.stringify(selected.package.payload, null, 2)}</pre></div>
+      {selected ? <div className="panel space-y-5 p-6">
+        <div className="flex justify-between"><div><span className="eyebrow">Evidence review</span><h2 className="heading mt-2 text-2xl">Case #{selected.id}</h2></div><Status value={view?.status ?? selected.status} /></div>
+        <p className="tile font-read text-sm text-sun">{selected.reason}</p>
+        {!view ? <Spinner label="Loading the case…" /> : <>
+          {view.highlights.length > 0 && <div><h3 className="font-pixel">What needs your attention</h3><ul className="mt-2 space-y-2">{view.highlights.map((h: any, i: number) => <li key={i} className="tile tile-hot font-read text-sm"><span className="pill mr-2 text-sun">{HIGHLIGHT_LABEL[h.type] ?? h.type}</span>{h.detail}</li>)}</ul></div>}
+          {view.missing_context.length > 0 && <div><h3 className="font-pixel">Missing context</h3><ul className="mt-2 space-y-1 font-read text-sm text-mist">{view.missing_context.map((m: string) => <li key={m}>▸ {m}</li>)}</ul>
+            {open && <button className="btn-secondary mt-3" disabled={busy} onClick={requestEvidence}>Request missing evidence</button>}</div>}
+          {view.additional_evidence.length > 0 && <div><h3 className="font-pixel">Additional evidence</h3><ul className="mt-2 space-y-2">{view.additional_evidence.map((e: any, i: number) => <li key={i} className="tile font-read text-sm"><b className="font-pixel">{e.label}</b><p className="mt-1 text-mist">{e.detail}</p></li>)}</ul></div>}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div><h3 className="font-pixel">This learner{view.learner.exam ? ` · ${view.learner.exam}, target ${view.learner.target_score}` : ''}</h3>
+              {view.recent_results.length ? <ul className="mt-2 space-y-1 font-read text-sm">{view.recent_results.map((r: any, i: number) => <li key={i} className="tile">{nice(r.kind)}: {r.estimate ?? 'no estimate'} <span className="text-fog">· {r.date}</span>{r.issues.length > 0 && <span className="text-mist"> · {r.issues.join(', ')}</span>}</li>)}</ul> : <p className="mt-2 font-read text-sm text-mist">No earlier verified results.</p>}</div>
+            <div><h3 className="font-pixel">Previous decisions</h3>
+              {view.previous_decisions.length ? <ul className="mt-2 space-y-1 font-read text-sm">{view.previous_decisions.map((d: any) => <li key={d.case_id} className="tile">{nice(d.decision)} · {nice(d.kind)}{d.same_learner ? ' · same learner' : ''}<p className="text-mist">{d.note}</p></li>)}</ul> : <p className="mt-2 font-read text-sm text-mist">No earlier decisions on similar results.</p>}</div>
+          </div></>}
+        <div className="grid gap-4 sm:grid-cols-2"><div><h3 className="font-pixel">AI output</h3><pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap bg-abyss/80 p-4 font-terminal text-base">{JSON.stringify(selected.package.payload, null, 2)}</pre></div>
           <div><h3 className="font-pixel">Confidence and issues</h3><pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap bg-abyss/80 p-4 font-terminal text-base">{JSON.stringify({ confidence: selected.package.confidence, issues: selected.package.issues, source: selected.package.source_mode }, null, 2)}</pre></div></div>
-        {selected.decisions?.length > 0 && <div className="mt-5"><h3 className="font-pixel">Decision history</h3>{selected.decisions.map((d: any, i: number) => <p key={i} className="mt-2 font-read text-sm">{nice(d.decision)} — {d.note} · {stamp(d.created_at)}</p>)}</div>}
-        {selected.status !== 'RESOLVED' && <div className="mt-6 border-t-4 border-plum pt-5"><h3 className="font-pixel">Instructor decision</h3>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2"><select className="input" value={decision} onChange={e => setDecision(e.target.value)}><option value="approve">Approve AI result</option><option value="correct">Correct result</option><option value="request_information">Request more information</option></select><input className="input" placeholder="Decision note (required)" value={note} onChange={e => setNote(e.target.value)} /></div>
+        {view && <div><h3 className="font-pixel">Case history</h3><ol className="mt-2 space-y-2">{view.history.map((h: any, i: number) => <li key={i} className="font-read text-sm"><span className="text-fog">{h.at ? stamp(h.at) : ''}</span> · {h.detail}</li>)}</ol></div>}
+        {view?.agent_delivery.length > 0 && <div><h3 className="font-pixel">Outcome sent to agents</h3><div className="mt-2 flex flex-wrap items-center gap-2">{view.agent_delivery.map((a: any) => <span key={a.key} className={`pill ${a.status === 'delivered' ? 'text-lime' : 'text-sun'}`}>{a.agent}: {a.status}</span>)}
+          {view.agent_delivery.some((a: any) => a.status !== 'delivered') && <button className="btn-secondary" disabled={busy} onClick={retryDelivery}>Retry delivery</button>}</div></div>}
+        {view?.status === 'QUEUED' && <p className="tile font-read text-sm text-sun">This case is queued. Mark yourself available to review it.</p>}
+        {open && <div className="border-t-4 border-plum pt-5"><h3 className="font-pixel">Instructor decision</h3>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2"><select className="input" value={decision} onChange={e => setDecision(e.target.value)}><option value="approve">Approve AI result</option><option value="correct">Override with a corrected result</option><option value="request_information">Request more information</option></select><input className="input" placeholder="Decision note (required)" value={note} onChange={e => setNote(e.target.value)} /></div>
           {decision === 'correct' && <textarea className="input mt-3 min-h-24" placeholder="Corrected summary, or full JSON for incomplete results (required)" value={correction} onChange={e => setCorrection(e.target.value)} />}
-          <button disabled={note.length < 3 || (decision === 'correct' && !correction.trim())} className="btn-primary mt-4" onClick={submit}>Record decision</button></div>}
+          <button disabled={busy || note.length < 3 || (decision === 'correct' && !correction.trim())} className="btn-primary mt-4" onClick={submit}>Record decision</button></div>}
       </div> : <Empty title="Select a case" body="Review evidence, confidence values and the AI output before deciding." />}
     </div>}
   </>
@@ -416,6 +448,13 @@ function AppInner() {
   const markProfileComplete = () => setUser(previous => { if (!previous) return previous; const updated = { ...previous, profile_complete: true }; localStorage.setItem('certifyai_user', JSON.stringify(updated)); return updated })
   const logout = () => { ['certifyai_token', 'certifyai_user', 'last-listening', 'last-reading', 'last-writing'].forEach(key => localStorage.removeItem(key)); setUser(null); navigate('/') }
   const home = user ? (user.role === 'learner' ? (user.profile_complete === false ? '/onboarding' : '/dashboard') : '/console') : '/'
+  useEffect(() => {
+    const expired = () => { setUser(previous => { if (previous) { notify('Your session has expired. Please sign in again.', 'error'); navigate('/') } return null }) }
+    window.addEventListener('session-expired', expired)
+    // A stored user without a token cannot make requests: start at sign-in instead of an endless loading screen.
+    if (user && !localStorage.getItem('certifyai_token')) expired()
+    return () => window.removeEventListener('session-expired', expired)
+  }, [])
   return <div className="scanlines">
     <Scene />
     {user ? <PersonaProvider initial={user.avatar || 'witch'} onChange={avatar => store({ ...user, avatar })}>

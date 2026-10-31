@@ -32,6 +32,12 @@ export async function request<T = any>(path: string, options: RequestInit = {}):
   const auth = token()
   const headers: Record<string, string> = { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...(auth ? { Authorization: `Bearer ${auth}` } : {}) }
   const response = await fetch(`/api${path}`, { ...options, headers: { ...headers, ...(options.headers as Record<string, string> | undefined) } })
+  if (response.status === 401 && auth && !path.startsWith('/auth/')) {
+    // The sign-in token expired (SESSION_DAYS, 7 by default) or was revoked: drop it and let the app return to the sign-in page.
+    localStorage.removeItem('certifyai_token')
+    localStorage.removeItem('certifyai_user')
+    window.dispatchEvent(new Event('session-expired'))
+  }
   if (!response.ok) {
     let detail = `Request failed (${response.status})`
     try {

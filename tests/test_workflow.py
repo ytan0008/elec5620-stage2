@@ -1065,3 +1065,14 @@ def test_plan_update_notice_survives_any_marking_path():
         view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
         assert view["status"] == "SUBMITTED" and view["adaptation"]["outcome"] == "PROPOSED" and view["adaptation"]["plan_id"]
         assert client.get("/api/mock-exams", headers=headers).json()[0]["adaptation"]["plan_id"] == view["adaptation"]["plan_id"]
+
+
+def test_sign_in_lasts_seven_days():
+    import jwt
+    from datetime import datetime, timezone
+    from backend.config import settings
+    with TestClient(app) as client:
+        token = auth(client, "session.days@example.com")["Authorization"].split()[1]
+        days = (datetime.fromtimestamp(jwt.decode(token, settings().jwt_secret, algorithms=["HS256"])["exp"], timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 86400
+        assert 6.9 < days <= 7
+        assert client.get("/api/me", headers={"Authorization": "Bearer not-a-token"}).status_code == 401

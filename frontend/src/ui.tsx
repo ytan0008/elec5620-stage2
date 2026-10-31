@@ -51,7 +51,7 @@ export function PageTitle({ eyebrow, title, subtitle, action }: { eyebrow: strin
 
 export function Status({ value }: { value: string }) {
   const good = ['ACTIVE', 'RELEASED', 'RESOLVED', 'VERIFIED', 'VERIFY', 'HUMAN_APPROVED', 'CURATED', 'SUBMITTED'].includes(value)
-  const wait = ['HELD', 'PENDING', 'MORE_INFO', 'HUMAN_REVIEW', 'PROPOSED', 'IN_PROGRESS', 'HOLD'].includes(value)
+  const wait = ['HELD', 'PENDING', 'QUEUED', 'MORE_INFO', 'HUMAN_REVIEW', 'PROPOSED', 'IN_PROGRESS', 'HOLD'].includes(value)
   return <span className={`pill ${good ? 'text-lime' : wait ? 'text-sun' : 'text-mist'}`}>{nice(value)}</span>
 }
 

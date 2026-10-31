@@ -33,6 +33,7 @@ from backend import content as bank
 from backend import local_tutor
 from backend import adaptation
 from backend import analytics
+from backend import escalation
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
@@ -943,7 +944,10 @@ class OpsQualityManager(Agent):
 
     def notify_escalation(self, state: FlowState, package: ResultPackage, issues: list[str]):
         """UC8 extends UC9 at "issue detected"."""
-        self.db.add(Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues)))
+        case = Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues))
+        self.db.add(case)
+        self.db.flush()
+        escalation.route(self.db, case)  # UC8 steps 1-2: notify the instructor, or queue the case when none is available (2a)
         self.event(state, "handoff", {"next_agent": "Human Instructor", "package_id": package.id})
 
     def record_issue(self, state: FlowState, payload: dict):
