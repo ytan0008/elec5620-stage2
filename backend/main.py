@@ -14,7 +14,7 @@ from backend.config import settings
 from backend.db import get_db
 from backend.auth import current_user, learner, instructor, hasher, hash_password, token_for
 from backend.models import User, PasswordReset, Profile, OnboardingSession, AgentConversation, LearnerPortrait, QuestionItem, Plan, StudyTask, Practice, Submission, MockExam, ExamResponse, ResultPackage, Escalation, InstructorDecision, Material, MaterialInteraction, PerformanceReport, AgentEvent, AuditLog, QualityCheck, SystemSetting, SpeakingSession, NotebookEntry, LearnerMemory, IssueReport, AgentMemory
-from backend.schemas import AvailabilityInput, RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput, MockEndInput
+from backend.schemas import RegisterInput, LoginInput, PasswordResetRequest, PasswordResetConfirm, ProfileInput, SubmitInput, ExamAnswerInput, ReviewInput, ThresholdInput, ChangeRequestInput, OnboardingTurn, QuestionGenerationInput, AgentChatTurn, AvatarInput, SpeakingStartInput, SpeakingTurnInput, TTSInput, MockCreateInput, MockEndInput, NotebookAddInput, NotebookUpdateInput, NotebookReviewInput, NotebookRetryInput, MemoryInput, IssueReportInput, IssueResolveInput, AnomalyAckInput, AvailabilityInput
 from backend.recovery import mail_ready, new_reset_token, reset_path, send_reset_email, token_digest
 from backend.onboarding import FIELDS, QUESTIONS as ONBOARDING_QUESTIONS, clean_extraction, next_field
 from backend.knowledge import build_graph
@@ -1306,7 +1306,7 @@ def _grade_mock(db: Session, exam: MockExam, user: User) -> dict:
         confidence["speaking"] = min(speaking.confidence.values()) if speaking.confidence else .5
         details["speaking"] = {"criteria": speaking.criteria, "summary": speaking.summary, "comments": speaking.comments, "metrics": spoken.get("metrics"), "pronunciation_note": speaking.pronunciation_note,
                                "analysis": speaking.analysis, "improved_sentences": speaking.improved_sentences, "improvements": speaking.improvements}
-    overall = (overall_band(list(scores.values()), exam.exam) if exam.exam == "IELTS" else round(sum(scores.values()) / len(scores) * 2) / 2) if scores else 0
+    overall = mock_overall(scores, exam.exam)
     target = db.scalar(select(Profile.target_score).where(Profile.user_id == user.id))
     current_issues = [c.get("issue") for fb in writing_feedback.values() for c in fb["comments"]] + [c.get("issue") for c in details["speaking"]["comments"]]
     insights = runtime.assessment.analyse_mock(user.id, scores, overall, target, [issue for issue in current_issues if issue], partial=bool(unscored))
@@ -1323,13 +1323,17 @@ def _grade_mock(db: Session, exam: MockExam, user: User) -> dict:
     exam.status = "SUBMITTED"
     db.commit()
     if package.state == "RELEASED":
-        after_mock_release(db, exam, user)
+        after_mock_released(db, exam)
     return mock_view(exam, db)
 
 
-def after_mock_release(db: Session, exam: MockExam, user: User) -> None:
-    """What follows a verified mock result, whether released at once or after the teacher's review:
-    notebooks and progress memory, the full report (UC6) and the UC7 plan adaptation."""
+def mock_overall(scores: dict, exam: str) -> float:
+    return (overall_band(list(scores.values()), exam) if exam == "IELTS" else round(sum(scores.values()) / len(scores) * 2) / 2) if scores else 0
+
+
+def after_mock_released(db: Session, exam: MockExam) -> None:
+    """What follows a released mock, whether it passed the quality gate or the teacher released it (UC8):
+    notebook entries, the progress memory, the full report (UC6) and the plan adaptation (UC7)."""
     payload = db.get(ResultPackage, exam.package_id).payload or {}
     details = payload.get("details", {})
     for skill in ("listening", "reading"):
@@ -1344,7 +1348,7 @@ def after_mock_release(db: Session, exam: MockExam, user: User) -> None:
     db.commit()
     report_after_mock(db, exam)
     # UC7: keep the outcome with the mock so every view shows it, however the mock was marked.
-    exam.sections = {**exam.sections, "adaptation": adapt_after_major_assessment(db, user)}
+    exam.sections = {**exam.sections, "adaptation": adapt_after_major_assessment(db, db.get(User, exam.user_id))}
     db.commit()
 
 
@@ -1610,11 +1614,17 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
             raise HTTPException(422, "Plan is incomplete; supply a complete correction")
         if package.kind == "recommendations" and not corrected.get("items"):
             raise HTTPException(422, "Recommendations are incomplete")
-        if package.kind == "mock_exam":
-            missing = [s for s in ("listening", "reading", "writing", "speaking") if not isinstance((corrected.get("section_scores") or {}).get(s), (int, float))]
-            if missing:
-                raise HTTPException(422, f"Score the unscored section(s) first: correct the result with section_scores for {', '.join(missing)} and the estimated_overall")
-            corrected["unscored_sections"] = []
+        if package.kind == "mock_exam":  # UC5 success condition: scored across all four skills
+            if data.decision == "correct":  # the teacher may send only the missing section, e.g. {"section_scores": {"speaking": 6}}
+                corrected["section_scores"] = {**(package.payload.get("section_scores") or {}), **(corrected.get("section_scores") or {})}
+            scores = corrected.get("section_scores") or {}
+            ielts = str(corrected.get("score_scale", "")).startswith("IELTS")
+            if set(scores) != set(SKILLS) or any(not isinstance(v, (int, float)) or not 0 <= v <= (9 if ielts else 6) for v in scores.values()):
+                raise HTTPException(422, "Mock result needs all four section scores; supply a complete correction")
+            if data.decision == "correct":  # 5a: the teacher's scores complete the result, so the overall and the note follow them
+                corrected["estimated_overall"] = mock_overall(scores, "IELTS" if ielts else "TOEFL")
+                corrected.pop("unscored_sections", None)
+                corrected["summary"] = str(corrected.get("summary", "")).split(" Not scored yet:")[0]
         if data.decision == "correct":
             package.payload = corrected
             package.confidence = corrected["confidence"]
@@ -1643,8 +1653,8 @@ def decide_case(case_id: int, data: ReviewInput, user: User = Depends(instructor
     db.commit()
     if package.kind == "mock_exam" and package.state == "RELEASED":
         mock = db.scalar(select(MockExam).where(MockExam.package_id == package.id))
-        if mock:  # the teacher-approved mock gets the same follow-up as one released at once
-            after_mock_release(db, mock, db.get(User, mock.user_id))
+        if mock:
+            after_mock_released(db, mock)  # the same follow-up as a mock that passed the quality gate
     return {"status": case.status, "package": package_view(package, True), "notifications_pending": undelivered}
 
 

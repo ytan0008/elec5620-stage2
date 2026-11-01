@@ -51,6 +51,9 @@ test('learner practises all four skills, talks to the examiner and starts a mock
   await page.locator('article').filter({ hasText: 'Working from home' }).getByRole('button', { name: 'Start practice' }).click()
   await page.getByLabel('Essay editor').fill('Working from home saves commuting time. For example, a consultant can use that extra hour to give more thoughtful advice to clients. However, clear communication routines are needed to support teamwork.')
   await page.getByRole('button', { name: /Submit for feedback/ }).click()
+  // UC4 5a: the essay is under the word minimum, so the learner chooses to submit it as incomplete practice.
+  await expect(page.getByText(/may not receive a reliable full assessment/)).toBeVisible()
+  await page.getByRole('button', { name: 'Submit as incomplete practice' }).click()
   await expect(page.getByText('Verified feedback')).toBeVisible()
 
   await page.getByRole('navigation').getByRole('link', { name: 'Speaking', exact: true }).click()

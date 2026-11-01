@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Clock3, RotateCcw, Send } from 'lucide-react'
-import { Practice, Result, post, request } from '../api'
+import { Practice, Result, post, request, retryOnce } from '../api'
 import { Countdown, Empty, FeedbackPanel, Notify, PageTitle, Spinner, Status, words } from '../ui'
 import ChartView from './ChartView'
 import { useExamLock } from '../examLock'
@@ -18,6 +18,7 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
   const [busy, setBusy] = useState(false)
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
+  const [short, setShort] = useState(false)
   useExamLock('writing', running && !result)
 
   const load = async (fresh = false) => {
@@ -26,7 +27,7 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
       const stored = !params.get('question') ? localStorage.getItem('last-writing') : null
       const sessionId = !fresh && (params.get('session') || stored)
       const question = !fresh && params.get('question')
-      const item = sessionId ? await request<Practice>(`/practice/${sessionId}`) : await post<Practice>(`/practice/writing${question ? `?question_id=${question}` : ''}`)
+      const item = await retryOnce(() => sessionId ? request<Practice>(`/practice/${sessionId}`) : post<Practice>(`/practice/writing${question ? `?question_id=${question}` : ''}`))
       setPractice(item)
       localStorage.setItem('last-writing', String(item.id))
       if (String(item.id) !== params.get('session')) navigate(`/practice/writing?session=${item.id}`, { replace: true })
@@ -41,10 +42,12 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
   }
   useEffect(() => { void load() }, [])
 
-  const update = (value: string) => { setText(value); if (practice) localStorage.setItem(`draft-${practice.id}`, value) }
-  const submit = async () => {
+  const update = (value: string) => { setText(value); setShort(false); if (practice) localStorage.setItem(`draft-${practice.id}`, value) }
+  const submit = async (incomplete = false) => {
     if (!practice) return
-    setBusy(true); setRunning(false)
+    // UC4 5a: a response under the word minimum may not get a reliable full assessment, so the learner chooses.
+    if (!incomplete && words(text) < (practice.prompt.min_words || 250)) { setShort(true); return }
+    setShort(false); setBusy(true); setRunning(false)
     try {
       const response = await post<{ result: Result }>(`/practice/${practice.id}/submit`, { text, task: practice.prompt.task })
       setResult(response.result)
@@ -53,7 +56,8 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
     } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
   }
 
-  if (error) return <Empty title="Could not load the task" body={error} action={<button className="btn-primary" onClick={() => load(true)}>Try another task</button>} />
+  // UC4 4a: the task still could not be loaded after one retry.
+  if (error) return <Empty title="Writing practice is temporarily unavailable" body={`${error}. Your saved drafts are kept.`} action={<button className="btn-primary" disabled={busy} onClick={() => load(true)}>{busy ? 'Trying…' : 'Try again'}</button>} />
   if (!practice) return <Spinner label="Opening your writing desk…" />
   const prompt = practice.prompt
   const minimum = prompt.min_words || 250
@@ -78,8 +82,13 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
           <textarea id="essay" className="input min-h-[22rem] resize-y leading-7" value={text} onChange={e => { update(e.target.value); if (!running && !result) setRunning(true) }} placeholder="Start writing here… paragraphs separated by a blank line." spellCheck={false} />
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <span className={`font-pixel ${count >= minimum ? 'text-lime' : 'text-sun'}`}>{count} / {minimum} words · draft autosaved</span>
-            <button className="btn-primary" disabled={busy || text.trim().length < 8} onClick={submit}><Send size={16} /> {busy ? 'Assessing…' : 'Submit for feedback'}</button>
+            <button className="btn-primary" disabled={busy || text.trim().length < 8} onClick={() => submit()}><Send size={16} /> {busy ? 'Assessing…' : 'Submit for feedback'}</button>
           </div>
+          {short && <div role="alert" className="tile mt-3 space-y-3 font-read text-sm">
+            <p className="text-sun">Your response has {count} of {minimum} words, so it may not receive a reliable full assessment.</p>
+            <div className="flex flex-wrap gap-2"><button className="btn-secondary" onClick={() => setShort(false)}>Keep editing</button>
+              <button className="btn-primary" disabled={busy} onClick={() => submit(true)}>Submit as incomplete practice</button></div>
+          </div>}
         </div>
       </div>
       <div className="space-y-5">

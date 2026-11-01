@@ -2,11 +2,12 @@
 import os
 os.environ["DATABASE_URL"] = "sqlite:///./test_suite.db"
 os.environ["DEMO_MODE"] = "true"
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from backend.main import app
 from backend.db import Base, SessionLocal, engine
-from backend.models import AgentEvent, Escalation, Material, ResultPackage, User
+from backend.models import AgentEvent, Escalation, Material, QualityCheck, ResultPackage, User
 from backend.agents import Agent, AgentRuntime, LLMProviderAdapter, OpsQualityManager
 from backend.llm_service import LLMService, ResultStatus
 
@@ -68,6 +69,41 @@ def test_uc9_still_incomplete_after_regeneration_is_held_and_escalated():
         assert package.state == "HELD" and "Recommendation list is incomplete" in package.issues
         assert db.scalar(select(Escalation).where(Escalation.package_id == package.id)) is not None
         assert states(db, package.id).count("REGENERATING") == 1
+
+
+def test_uc9_llm_failure_is_retried_once_then_rule_checks_decide(monkeypatch):
+    with TestClient(app) as client:
+        auth(client, "uc9-retry@example.com")
+    calls = []
+
+    def unavailable(self, *args, **kwargs):
+        calls.append(1)
+        raise TimeoutError("LLM service did not respond")
+    monkeypatch.setattr(LLMProviderAdapter, "check_consistency", unavailable)
+    with SessionLocal() as db:
+        uid = user_id(db, "uc9-retry@example.com")
+        package = AgentRuntime(db).verify_output(uid, "portrait", {"summary": "Clear goals", "focus_areas": ["writing"], "next_steps": ["Practise Task 2"], "confidence": {"overall": .9}})
+        db.commit()
+        assert len(calls) == 2  # The first try and one retry.
+        assert db.scalar(select(QualityCheck).where(QualityCheck.package_id == package.id)).method == "FALLBACK_RULES"
+        assert package.state == "RELEASED"  # LOCAL mode: the rule checks found nothing to hold.
+
+
+def test_uc9_adapter_makes_one_call_per_attempt():
+    calls = []
+
+    class Unreachable:
+        def with_structured_output(self, schema):
+            return self
+
+        def invoke(self, messages):
+            calls.append(1)
+            raise TimeoutError("LLM service did not respond")
+    provider = LLMProviderAdapter()
+    provider.mode, provider.verifier = "REAL", Unreachable()
+    with pytest.raises(TimeoutError):
+        provider.check_consistency({"summary": "Clear essay", "criteria": {"grammar": 6}})
+    assert len(calls) == 1  # No hidden retry inside the adapter.
 
 
 def test_uc10_new_learner_gets_general_starter_list():
