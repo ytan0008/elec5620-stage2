@@ -176,6 +176,8 @@ After pulling changes that add database tables, run `alembic upgrade head` again
 
 ## 6. Features in detail
 
+Automatic Speaking and Writing practice selects from the learner's exam using their self-reported level and the lowest criterion below their target in up to five recent, released assessments of that skill. These can include same-exam practice and mock results. If no recent criterion is below target, a released active plan with verified exam provenance can supply a focus or task type; if no suitable evidence exists, the selector falls back to the exam and stated level. Unseen tasks are preferred, and a previously seen question is repeated only after the available bank is exhausted. The practice page explains the selection. These task tags are project-authored heuristics, not official difficulty ratings or calibrated assessments. Older plans without verifiable exam provenance and corrected mock results with potentially stale criterion details are excluded from the evidence; manually selected questions and mock exams are unchanged.
+
 ### Learner side
 
 | Area | What you get |

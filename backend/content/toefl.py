@@ -165,5 +165,39 @@ SPEAKING = [{
     "answer_seconds": 45,
 }]
 
+# Original practice material, not official TOEFL questions. Each remains a full
+# Listen and Repeat + Interview sequence; only the topic and wording change.
+SPEAKING += [{
+    "id": "toefl-speaking-volunteer", "kind": "speaking", "exam": "TOEFL", "title": "Listen and Repeat + Interview: volunteering", "topic": "volunteering",
+    "repeat": [{"text": text} for text in [
+        "The volunteer meeting starts at nine.", "Please bring a reusable water bottle.",
+        "You can sign up at the student centre.", "The team will meet outside the main library.",
+        "Everyone should wear comfortable shoes for the activity.",
+        "If you cannot attend, please let the organiser know in advance.",
+        "After the event, volunteers will share their experiences with the group.",
+    ]],
+    "interview": {"scenario": "A student organiser is asking about volunteering in the community.", "questions": [
+        "What kind of activity would you like to volunteer for?",
+        "Would you prefer to volunteer alone or with a group? Why?",
+        "How could universities encourage more students to help their communities?",
+        "Some people think volunteering should be required at university. What do you think?",
+    ]}, "answer_seconds": 45,
+}, {
+    "id": "toefl-speaking-transport", "kind": "speaking", "exam": "TOEFL", "title": "Listen and Repeat + Interview: transport", "topic": "transport",
+    "repeat": [{"text": text} for text in [
+        "The campus bus leaves every twenty minutes.", "The next stop is the science building.",
+        "Students can collect a timetable at reception.", "The bus route will change during the holiday.",
+        "Cyclists should leave their bicycles in the marked area.",
+        "If the bus is full, please wait for the following service.",
+        "The university is considering several ways to make travel more sustainable.",
+    ]],
+    "interview": {"scenario": "A campus planner is interviewing students about transport choices.", "questions": [
+        "How do you usually travel to university?",
+        "What is one advantage or disadvantage of that way of travelling?",
+        "What could the university do to improve transport for students?",
+        "Should universities spend more on public transport than on parking? Explain your view.",
+    ]}, "answer_seconds": 45,
+}]
+
 LISTENING = [LISTENING_RESPONSE, LISTENING_CONVERSATION, LISTENING_ANNOUNCEMENT, LISTENING_TALK]
 READING = [READING_CWORDS, READING_DAILY, READING_ACADEMIC]

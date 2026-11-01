@@ -31,6 +31,7 @@ from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, Recommen
                              QuestionOutput, AgentChatReply, ExaminerTurn, ListeningGen, ReadingGen, SpeakingGen, WordInfo, CoachOutput)
 from backend.onboarding import parse_demo_message
 from backend import content as bank
+from backend import practice_selection
 from backend import local_tutor
 from backend import adaptation
 from backend import analytics
@@ -379,8 +380,14 @@ class LLMProviderAdapter(LLMService):
                                "priority or weekly minutes you changed, with a reason that cites the learner's verified scores.",
                                {"profile": profile, "progress": progress, "adaptation": adaptation}, local, toolkit, scoring=True)
 
-    def prompt(self, exam: str, skill: str, avoid: set[str] | None = None) -> dict:
-        """Pick an item from the curated bank, preferring ones the learner has not seen."""
+    def prompt(self, exam: str, skill: str, avoid: set[str] | None = None, selection_context: dict | None = None) -> dict:
+        """Pick an unseen bank item; personalise production skills when context is supplied."""
+        if skill in ("speaking", "writing") and selection_context is not None:
+            item, selection = practice_selection.select_question(
+                exam, skill, avoid, selection_context.get("proficiency", "intermediate"),
+                selection_context.get("weak_criteria", []), plan_focus=selection_context.get("plan"),
+                evidence_count=selection_context.get("evidence_count", 0))
+            return {**practice_prompt(item, "ORIGINAL"), "selection": selection}
         item = bank.pick(exam, skill, avoid)
         return practice_prompt(item, "ORIGINAL")
 
@@ -514,6 +521,9 @@ class LearningCoordinatorAgent(Agent):
             output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": error}
         if output.get("priorities"):
             profile, progress = state["profile"], state.get("progress", {})
+            # Exam provenance is application-supplied, not inferred from an
+            # LLM title. It lets future practice avoid cross-exam plan leakage.
+            output["exam"] = profile["exam"]
             if adapting:  # UC7 step 3 and 4: which priorities should change, and why
                 derived = adaptation.describe_changes(progress.get("current_plan", {}), output, progress, progress.get("target_score"))
                 output["change_details"] = adaptation.merge_reasons(derived, output.get("change_details", []))

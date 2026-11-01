@@ -49,16 +49,20 @@ test('learner practises all four skills, talks to the examiner and starts a mock
 
   await page.getByRole('navigation').getByRole('link', { name: 'Question bank', exact: true }).click()
   await page.locator('article').filter({ hasText: 'Working from home' }).getByRole('button', { name: 'Start practice' }).click()
+  await expect(page.locator('[aria-label="Why this task was selected"]')).toHaveCount(0) // Explicit question-bank choice is not described as automatic selection.
   await page.getByLabel('Essay editor').fill('Working from home saves commuting time. For example, a consultant can use that extra hour to give more thoughtful advice to clients. However, clear communication routines are needed to support teamwork.')
   await page.getByRole('button', { name: /Submit for feedback/ }).click()
   // UC4 5a: the essay is under the word minimum, so the learner chooses to submit it as incomplete practice.
   await expect(page.getByText(/may not receive a reliable full assessment/)).toBeVisible()
   await page.getByRole('button', { name: 'Submit as incomplete practice' }).click()
   await expect(page.getByText('Verified feedback')).toBeVisible()
+  await page.getByRole('button', { name: 'New task' }).click()
+  await expect(page.locator('[aria-label="Why this task was selected"]')).toBeVisible()
 
   await page.getByRole('navigation').getByRole('link', { name: 'Speaking', exact: true }).click()
   await page.getByRole('button', { name: 'Start speaking test' }).click()
   await expect(page.getByText(/I'll be your examiner today/)).toBeVisible()
+  await expect(page.locator('[aria-label="Why this task was selected"]')).toBeVisible()
   await page.getByLabel('Type your answer').fill('My name is Browser Learner.')
   await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect(page.getByText(/in this first part/)).toBeVisible()

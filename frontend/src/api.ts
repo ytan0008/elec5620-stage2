@@ -16,7 +16,8 @@ export type ObjectiveTest = { kind: 'listening' | 'reading'; exam: string; title
 export type Chart = { type: 'bar' | 'line' | 'pie'; title: string; unit: string; categories: string[]; series: { name: string; values: number[] }[] }
 export type WritingTask = { id: string; task: string; title: string; prompt: string; chart?: Chart | null; min_words: number; minutes: number }
 export type SpeakingTest = Record<string, any>
-export type PracticePrompt = { title: string; text: string; mode: string; task_type?: string; duration_seconds: number; test?: any; task?: string; min_words?: number; chart?: Chart | null; content_id?: string }
+export type TaskSelection = { rationale: string; profile_level: 'beginner' | 'intermediate' | 'advanced'; focus: string | null; evidence_count: number; variety: 'unseen' | 'repeat'; fallback: string | null }
+export type PracticePrompt = { title: string; text: string; mode: string; task_type?: string; duration_seconds: number; test?: any; task?: string; min_words?: number; chart?: Chart | null; content_id?: string; selection?: TaskSelection }
 export type Practice = { id: number; skill: string; prompt: PracticePrompt }
 export type Mock = { id: number; exam: string; status: string; length: string; legacy: boolean; created_at: string; duration_seconds: number; sections: Record<string, any>; answers: Record<string, string>; result: Result | null; adaptation?: AdaptationOutcome | null
   ended?: { reason: string; at: string; completed: string[]; missing: string[] } | null; report_id?: number | null
@@ -24,7 +25,7 @@ export type Mock = { id: number; exam: string; status: string; length: string; l
 export type MockTiming = { current: 'listening' | 'reading' | 'writing' | null; current_deadline: string | null; closed: string[]; written_started: boolean; written_done: boolean
   speaking_done: boolean; day_deadline: string; day_over: boolean; minutes: Record<string, number> }
 export type Event = { id: number; workflow: string; agent: string; phase: string; detail: Record<string, any>; mode: string; duration_ms: number; created_at: string }
-export type SpeakingView = { id: number; exam: string; status: string; practice_id: number | null; mock_id: number | null; persona: Persona; log: { role: string; text: string; stage?: string; part?: string; seconds?: number; repeat_accuracy?: number; repeat_target?: string; follow_up?: boolean }[]; ui: { part: string; stage: string; progress?: string; cue_card?: { topic: string; cue: string; bullets: string[]; closing: string }; timer?: { kind: string; seconds: number } }; test_title?: string; reply?: string; done?: boolean; result?: Result | null; metrics?: Record<string, number>; saved_to_mock?: boolean; submission_id?: number; feedback_unavailable?: boolean; message?: string }
+export type SpeakingView = { id: number; exam: string; status: string; practice_id: number | null; mock_id: number | null; persona: Persona; selection?: TaskSelection | null; log: { role: string; text: string; stage?: string; part?: string; seconds?: number; repeat_accuracy?: number; repeat_target?: string; follow_up?: boolean }[]; ui: { part: string; stage: string; progress?: string; cue_card?: { topic: string; cue: string; bullets: string[]; closing: string }; timer?: { kind: string; seconds: number } }; test_title?: string; reply?: string; done?: boolean; result?: Result | null; metrics?: Record<string, number>; saved_to_mock?: boolean; submission_id?: number; feedback_unavailable?: boolean; message?: string }
 
 export const token = () => localStorage.getItem('certifyai_token')
 
