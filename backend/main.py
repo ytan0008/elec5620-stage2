@@ -938,8 +938,15 @@ def speaking_turn(session_id: int, data: SpeakingTurnInput, user: User = Depends
         session.status = "FINISHED"
     db.commit()
     return {**speaking_view(session), "reply": reply, "done": done}
+@app.post("/api/speaking/sessions/{session_id}/incomplete")
+def incomplete_speaking(session_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    session = owned(db, SpeakingSession, session_id, user)
+    if session.status != "ACTIVE":
+        raise HTTPException(409, "This speaking session is no longer active")
 
-
+    session.status = "INCOMPLETE"
+    db.commit()
+    return speaking_view(session)
 @app.post("/api/speaking/sessions/{session_id}/finish")
 def finish_speaking(session_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     session = owned(db, SpeakingSession, session_id, user)
