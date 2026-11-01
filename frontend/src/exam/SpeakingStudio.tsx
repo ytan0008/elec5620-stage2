@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { Keyboard, Mic, MicOff, Play, RotateCcw, Square, Volume2 } from 'lucide-react'
-import { Result, SpeakingView, health, post, request, retryOnce } from '../api'
+import { DoorOpen, Keyboard, Mic, MicOff, Play, RotateCcw, Square, Volume2 } from 'lucide-react'
+import { Result, SpeakingView, health, post, request, retryOnce, token } from '../api'
 import { PixelAvatar, personaName } from '../pixel/Avatar'
 import { moodFor, usePersona } from '../persona'
 import { Listener, listen, monitorLevel, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
-import { Countdown, FeedbackPanel, Notify, clock } from '../ui'
+import { Countdown, FeedbackPanel, FeedbackUnavailable, Notify, clock } from '../ui'
 import { useExamLock } from '../examLock'
 
 type Props = { notify: Notify; mockId?: number; questionId?: string | null; onSaved?: () => void; onResult?: (result: Result) => void }
@@ -23,6 +23,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   const [elapsed, setElapsed] = useState(0)
   const [prep, setPrep] = useState(false)
   const [result, setResult] = useState<Result | null>(null)
+  const [pending, setPending] = useState<number | null>(null)  // a kept test still waiting for feedback (6a)
   const [metrics, setMetrics] = useState<Record<string, number> | null>(null)
   const [handsFree, setHandsFree] = useState(prefs.handsFree)
   const [serverStt, setServerStt] = useState(false)
@@ -47,6 +48,16 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
 
   const chooseMode = (next: 'server' | 'browser' | 'none') => { modeRef.current = next; setMode(next) }
   useEffect(() => { health().then(h => { setServerStt(h.server_stt); if (h.server_stt) chooseMode('server') }).catch(() => {}) }, [])
+  // UC3 5a: leaving a practice test before asking for feedback (another page, closing the tab) records it as incomplete.
+  useEffect(() => {
+    const leave = () => {
+      const view = sessionRef.current
+      if (view && !view.mock_id && (view.status === 'ACTIVE' || view.status === 'FINISHED'))
+        void fetch(`/api/speaking/sessions/${view.id}/leave`, { method: 'POST', keepalive: true, headers: { Authorization: `Bearer ${token()}` } }).catch(() => {})
+    }
+    window.addEventListener('pagehide', leave)
+    return () => { window.removeEventListener('pagehide', leave); leave() }
+  }, [])
   useEffect(() => () => { alive.current = false; listener.current?.abort(); stopSpeaking(); stopLevel.current?.(); window.clearTimeout(silenceTimer.current); window.clearInterval(tickTimer.current); void recorder.current?.stop(); void sttRecorder.current?.stop() }, [])
 
   const stage = session?.ui.stage || 'intro'
@@ -65,7 +76,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
   }
 
   const begin = async () => {
-    setError(''); setResult(null); setStarting(true)
+    setError(''); setResult(null); setPending(null); setStarting(true)
     try { recorder.current = await recordMicrophone() } catch { recorder.current = null }
     try {
       const view = await retryOnce(() => post<SpeakingView>('/speaking/sessions', { persona, ...(mockId ? { mock_id: mockId } : {}), ...(questionId ? { question_id: Number(questionId) } : {}) }))
@@ -213,7 +224,24 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
       setMetrics(done.metrics || null)
       if (done.saved_to_mock) { notify('Speaking section saved to your mock exam'); onSaved?.() }
       if (done.result) { setResult(done.result); onResult?.(done.result) }
+      if (done.feedback_unavailable && done.submission_id) { setPending(done.submission_id); notify(done.message || 'Feedback is temporarily unavailable', 'error') }
     } catch (e) { notify((e as Error).message, 'error') } finally { setThinking(false) }
+  }
+  const retryFeedback = async () => {
+    if (!pending) return
+    setThinking(true)
+    try {
+      const done = await post<{ result: Result }>(`/submissions/${pending}/feedback`)
+      setPending(null); setResult(done.result); onResult?.(done.result)
+    } catch (e) { notify((e as Error).message, 'error') } finally { setThinking(false) }
+  }
+  const leaveTest = async () => {
+    const view = sessionRef.current
+    if (!view) return
+    stopListening(); stopSpeaking()
+    void recorder.current?.stop(); recorder.current = null
+    try { await post(`/speaking/sessions/${view.id}/leave`); notify('Test left. Your answers so far are saved as incomplete practice.') } catch (e) { notify((e as Error).message, 'error') }
+    setSession(null); sessionRef.current = null; setResult(null); setPending(null); setPrep(false)
   }
 
   const toggleHandsFree = () => { prefs.handsFree = !handsFree; setHandsFree(!handsFree) }
@@ -250,7 +278,8 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
         <button className="btn-ghost justify-center" onClick={toggleHandsFree}>{handsFree ? <Mic size={14} /> : <MicOff size={14} />} Hands-free {handsFree ? 'on' : 'off'}</button>
       </div>}
       {session.status === 'FINISHED' && !result && !session.saved_to_mock && <button className="btn-primary" disabled={thinking} onClick={finish}>Get my feedback</button>}
-      {(result || session.saved_to_mock) && !mockId && <button className="btn-sun" onClick={() => { setSession(null); sessionRef.current = null; setResult(null) }}><RotateCcw size={16} /> New test</button>}
+      {!mockId && (session.status === 'ACTIVE' || (session.status === 'FINISHED' && !result)) && <button className="btn-ghost justify-center" disabled={thinking} onClick={leaveTest}><DoorOpen size={14} /> Leave test</button>}
+      {(result || pending || session.saved_to_mock) && !mockId && <button className="btn-sun" onClick={() => { setSession(null); sessionRef.current = null; setResult(null); setPending(null) }}><RotateCcw size={16} /> New test</button>}
     </aside>
 
     <section className="space-y-5">
@@ -286,7 +315,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
 
       {metrics && <div className="flex flex-wrap gap-2">{Object.entries(metrics).map(([k, v]) => <span key={k} className="pill text-cyan">{k.replaceAll('_', ' ')}: {v}</span>)}</div>}
       {session.saved_to_mock && <div className="panel panel-lime p-5 font-pixel text-lime">Speaking section saved. Scores are calculated when you submit the whole mock exam.</div>}
-      <FeedbackPanel result={result} />
+      {pending ? <FeedbackUnavailable busy={thinking} onRetry={retryFeedback} /> : <FeedbackPanel result={result} />}
     </section>
   </div>
 }

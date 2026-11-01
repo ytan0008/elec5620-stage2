@@ -788,7 +788,7 @@ def get_practice(practice_id: int, user: User = Depends(learner), db: Session = 
 def attempts(practice_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
     practice = owned(db, Practice, practice_id, user)
     submissions = db.scalars(select(Submission).where(Submission.practice_id == practice.id).order_by(Submission.attempt)).all()
-    return [{"id": sub.id, "text": sub.text, "attempt": sub.attempt, "audio_available": bool(sub.audio_path), "created_at": sub.created_at, "result": package_view(db.get(ResultPackage, sub.package_id))} for sub in submissions]
+    return [{"id": sub.id, "text": sub.text, "attempt": sub.attempt, "audio_available": bool(sub.audio_path), "created_at": sub.created_at, "result": package_view(db.get(ResultPackage, sub.package_id) if sub.package_id else None)} for sub in submissions]
 
 
 @app.get("/api/practice/submissions/{submission_id}/audio")
@@ -851,10 +851,8 @@ def submit_practice(practice_id: int, data: SubmitInput, user: User = Depends(le
         if data.scenario == "invalid" and runtime.provider.local:
             package = runtime.verify_output(user.id, practice.skill, {"summary": "Malformed output", "criteria": {}, "confidence": {}})
         else:
-            state = runtime.practice_graph().invoke({"user_id": user.id, "workflow": practice.skill, "profile": profile_data(profile), "skill": practice.skill, "text": text,
-                                                     "prompt": prompt.get("text", ""), "task": data.task or prompt.get("task") or ("speaking" if practice.skill == "speaking" else "task2"),
-                                                     "metrics": data.metrics, "scenario": data.scenario})
-            package = db.get(ResultPackage, state["package_id"])
+            package = practice_feedback(db, runtime, user.id, profile, practice.skill, text, prompt.get("text", ""),
+                                        data.task or prompt.get("task") or ("speaking" if practice.skill == "speaking" else "task2"), data.metrics, data.scenario)
     elif isinstance(prompt.get("test"), dict):
         answers = {str(k): str(v)[:200] for k, v in (data.answers or {}).items()}
         output = objective_output(prompt, answers, practice.skill, profile.exam)
@@ -865,14 +863,60 @@ def submit_practice(practice_id: int, data: SubmitInput, user: User = Depends(le
         correct = bool(key) and key in text.lower()
         score = (6.5 if correct else 4.5) if profile.exam == "IELTS" else (4.5 if correct else 3.0)
         package = runtime.verify_output(user.id, practice.skill, {"summary": "Correct answer supported by the text" if correct else f"Review the evidence and try identifying: {key}", "criteria": {practice.skill: score}, "estimated_overall": score, "official": False, "confidence": {practice.skill: .90}, "comments": [{"issue": "Check source evidence", "suggestion": key}]})
-    attempt = (db.scalar(select(func.max(Submission.attempt)).where(Submission.practice_id == practice.id)) or 0) + 1
     audio_path = latest_unused_audio(db, user.id, practice.id) if practice.skill == "speaking" else None
-    sub = Submission(practice_id=practice.id, user_id=user.id, text=text or "(no answers)", audio_path=audio_path, attempt=attempt, package_id=package.id)
+    return save_submission(db, user, practice, package, text or "(no answers)", audio_path, prompt.get("title", practice.skill), prompt.get("test"))
+
+
+FEEDBACK_UNAVAILABLE = "Feedback is temporarily unavailable. Your response has been saved; ask for feedback again later."
+
+
+def practice_feedback(db: Session, runtime: AgentRuntime, user_id: int, profile: Profile, skill: str, text: str, prompt: str, task: str,
+                      metrics: dict | None = None, scenario: str | None = None) -> ResultPackage | None:
+    """UC3/UC4: Tutor feedback, scoring and the quality gate. None when feedback still failed after one retry (6a)."""
+    state = runtime.practice_graph().invoke({"user_id": user_id, "workflow": skill, "profile": profile_data(profile), "skill": skill, "text": text,
+                                             "prompt": prompt, "task": task, "metrics": metrics, "scenario": scenario})
+    return None if state.get("feedback_unavailable") else db.get(ResultPackage, state["package_id"])
+
+
+def save_submission(db: Session, user: User, practice: Practice, package: ResultPackage | None, text: str, audio_path: str | None, title: str, test: dict | None = None) -> dict:
+    """Keep the learner's response; a response without feedback (6a) is kept so feedback can be requested again."""
+    attempt = (db.scalar(select(func.max(Submission.attempt)).where(Submission.practice_id == practice.id)) or 0) + 1
+    sub = Submission(practice_id=practice.id, user_id=user.id, text=text, audio_path=audio_path, attempt=attempt, package_id=package.id if package else None)
     db.add(sub)
     practice.status = "SUBMITTED"
-    record_release(db, user.id, package, practice.skill, prompt.get("title", practice.skill), prompt.get("test"))
+    if package:
+        record_release(db, user.id, package, practice.skill, title, test)
     db.commit()
+    if not package:
+        return {"submission_id": sub.id, "attempt": attempt, "result": None, "feedback_unavailable": True, "message": FEEDBACK_UNAVAILABLE}
     return {"submission_id": sub.id, "attempt": attempt, "result": package_view(package)}
+
+
+@app.post("/api/submissions/{submission_id}/feedback")
+def retry_feedback(submission_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    """UC3/UC4 6a: ask again for feedback on a response that was kept without it."""
+    sub = owned(db, Submission, submission_id, user)
+    if sub.package_id:
+        raise HTTPException(409, "This response already has feedback")
+    practice = owned(db, Practice, sub.practice_id, user)
+    runtime = AgentRuntime(db)
+    if practice.skill == "speaking":
+        session = db.scalar(select(SpeakingSession).where(SpeakingSession.practice_id == practice.id, SpeakingSession.status == "COMPLETED").order_by(SpeakingSession.id.desc()))
+        if not session:
+            raise HTTPException(409, "The speaking test for this response was not found")
+        _, metrics = examiner.transcript_for_assessment(session.test, session.log)
+        prompt, task, title = speaking_question(session.test), "speaking", f"Speaking test · {session.test.get('title', '')}"
+    elif practice.skill == "writing":
+        metrics, prompt, task, title = None, practice.prompt.get("text", ""), practice.prompt.get("task") or "task2", practice.prompt.get("title", "writing")
+    else:
+        raise HTTPException(409, "Only writing and speaking responses get Tutor feedback")
+    package = practice_feedback(db, runtime, user.id, profile_for(db, user), practice.skill, sub.text, prompt, task, metrics)
+    if not package:
+        raise HTTPException(503, FEEDBACK_UNAVAILABLE)
+    sub.package_id = package.id
+    record_release(db, user.id, package, practice.skill, title, None if practice.skill == "speaking" else practice.prompt.get("test"))
+    db.commit()
+    return {"submission_id": sub.id, "attempt": sub.attempt, "result": package_view(package)}
 
 
 @app.get("/api/results/{package_id}")
@@ -909,6 +953,10 @@ def start_speaking(data: SpeakingStartInput, user: User = Depends(learner), db: 
                 raise HTTPException(409, "The speaking test had to be taken on the day the mock was started")
         test = exam.sections["speaking"]["test"]
     else:
+        # 5a: a practice test left without asking for feedback (page closed, network lost) is recorded as incomplete.
+        for left in db.scalars(select(SpeakingSession).where(SpeakingSession.user_id == user.id, SpeakingSession.mock_id.is_(None),
+                                                             SpeakingSession.status.in_(("ACTIVE", "FINISHED")))):
+            leave_speaking(db, left)
         practice = start_practice("speaking", data.question_id, user, db)
         practice_id = practice["id"]
         test = db.get(Practice, practice_id).prompt.get("test")
@@ -979,20 +1027,33 @@ def finish_speaking(session_id: int, user: User = Depends(learner), db: Session 
         run_mock_clock(db, exam, user)  # IELTS: if the written test is already done, the mock is marked now
         return {**speaking_view(session), "saved_to_mock": True, "metrics": metrics, "mock_status": exam.status}
     practice = owned(db, Practice, session.practice_id, user)
-    profile = profile_for(db, user)
-    runtime = AgentRuntime(db)
-    test = session.test
-    question = (test.get("part2", {}).get("cue") or "") + " " + " ".join(test.get("part3", {}).get("questions", []) or test.get("interview", {}).get("questions", []))
-    state = runtime.practice_graph().invoke({"user_id": user.id, "workflow": "speaking", "profile": profile_data(profile), "skill": "speaking", "text": text,
-                                             "prompt": question, "task": "speaking", "metrics": metrics})
-    package = db.get(ResultPackage, state["package_id"])
-    attempt = (db.scalar(select(func.max(Submission.attempt)).where(Submission.practice_id == practice.id)) or 0) + 1
-    sub = Submission(practice_id=practice.id, user_id=user.id, text=text, audio_path=latest_unused_audio(db, user.id, practice.id), attempt=attempt, package_id=package.id)
-    db.add(sub)
-    practice.status = "SUBMITTED"
-    record_release(db, user.id, package, "speaking", f"Speaking test · {test.get('title', '')}")
-    db.commit()
-    return {**speaking_view(session), "submission_id": sub.id, "attempt": attempt, "metrics": metrics, "result": package_view(package)}
+    package = practice_feedback(db, AgentRuntime(db), user.id, profile_for(db, user), "speaking", text, speaking_question(session.test), "speaking", metrics)
+    saved = save_submission(db, user, practice, package, text, latest_unused_audio(db, user.id, practice.id), f"Speaking test · {session.test.get('title', '')}")
+    return {**speaking_view(session), **saved, "metrics": metrics}
+
+
+def speaking_question(test: dict) -> str:
+    return (test.get("part2", {}).get("cue") or "") + " " + " ".join(test.get("part3", {}).get("questions", []) or test.get("interview", {}).get("questions", []))
+
+
+def leave_speaking(db: Session, session: SpeakingSession) -> None:
+    """UC3 5a: a practice test left before feedback was requested keeps its transcript and is recorded as incomplete."""
+    session.status = "INCOMPLETE"
+    practice = db.get(Practice, session.practice_id)
+    if practice and practice.status != "SUBMITTED":
+        practice.status = "INCOMPLETE"
+    db.add(AgentEvent(user_id=session.user_id, workflow="speaking", agent="AI Tutor", phase="decision",
+                      detail={"decision": "speaking practice left before submitting; recorded as incomplete", "session_id": session.id, "answers": sum(1 for item in session.log if item["role"] == "learner")},
+                      mode=settings().ai_mode))
+
+
+@app.post("/api/speaking/sessions/{session_id}/leave")
+def leave_speaking_session(session_id: int, user: User = Depends(learner), db: Session = Depends(get_db)):
+    session = owned(db, SpeakingSession, session_id, user)
+    if session.mock_id is None and session.status in ("ACTIVE", "FINISHED"):
+        leave_speaking(db, session)
+        db.commit()
+    return speaking_view(session)
 
 
 # ---------------------------------------------------------------- speech services

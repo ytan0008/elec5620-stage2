@@ -2,11 +2,12 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Clock3, RotateCcw, Send } from 'lucide-react'
 import { Practice, Result, post, request, retryOnce } from '../api'
-import { Countdown, Empty, FeedbackPanel, Notify, PageTitle, Spinner, Status, words } from '../ui'
+import { Countdown, Empty, FeedbackPanel, FeedbackUnavailable, Notify, PageTitle, Spinner, Status, words } from '../ui'
 import ChartView from './ChartView'
 import { useExamLock } from '../examLock'
 
-type Attempt = { id: number; attempt: number; text: string; result: Result; created_at: string }
+type Attempt = { id: number; attempt: number; text: string; result: Result | null; created_at: string }
+type Submitted = { submission_id: number; result: Result | null; feedback_unavailable?: boolean; message?: string }
 
 export default function WritingPractice({ notify }: { notify: Notify }) {
   const [params] = useSearchParams()
@@ -19,10 +20,11 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
   const [short, setShort] = useState(false)
+  const [pending, setPending] = useState<number | null>(null)  // a kept response still waiting for feedback (6a)
   useExamLock('writing', running && !result)
 
   const load = async (fresh = false) => {
-    setBusy(true); setError(''); setResult(null); setRunning(false)
+    setBusy(true); setError(''); setResult(null); setPending(null); setRunning(false)
     try {
       const stored = !params.get('question') ? localStorage.getItem('last-writing') : null
       const sessionId = !fresh && (params.get('session') || stored)
@@ -34,7 +36,8 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
       setText(localStorage.getItem(`draft-${item.id}`) || '')
       const history = await request<Attempt[]>(`/practice/${item.id}/attempts`)
       setAttempts(history)
-      if (history.length) setResult(history[history.length - 1].result)
+      const last = history[history.length - 1]
+      if (last) { setResult(last.result); setPending(last.result ? null : last.id) }
     } catch (e) {
       if (!fresh && !params.get('session') && localStorage.getItem('last-writing')) { localStorage.removeItem('last-writing'); return load(true) }
       setError((e as Error).message)
@@ -49,10 +52,21 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
     if (!incomplete && words(text) < (practice.prompt.min_words || 250)) { setShort(true); return }
     setShort(false); setBusy(true); setRunning(false)
     try {
-      const response = await post<{ result: Result }>(`/practice/${practice.id}/submit`, { text, task: practice.prompt.task })
-      setResult(response.result)
+      showFeedback(await post<Submitted>(`/practice/${practice.id}/submit`, { text, task: practice.prompt.task }))
       setAttempts(await request<Attempt[]>(`/practice/${practice.id}/attempts`))
-      notify(response.result.state === 'RELEASED' ? 'Feedback released' : 'Held for quality review')
+    } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
+  }
+  const showFeedback = (response: Submitted) => {
+    setResult(response.result)
+    setPending(response.result ? null : response.submission_id)
+    notify(!response.result ? response.message || 'Feedback is temporarily unavailable' : response.result.state === 'RELEASED' ? 'Feedback released' : 'Held for quality review', response.result ? undefined : 'error')
+  }
+  const retryFeedback = async () => {
+    if (!practice || !pending) return
+    setBusy(true)
+    try {
+      showFeedback(await post<Submitted>(`/submissions/${pending}/feedback`))
+      setAttempts(await request<Attempt[]>(`/practice/${practice.id}/attempts`))
     } catch (e) { notify((e as Error).message, 'error') } finally { setBusy(false) }
   }
 
@@ -62,8 +76,8 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
   const prompt = practice.prompt
   const minimum = prompt.min_words || 250
   const count = words(text)
-  const verified = attempts.filter(a => a.result.state === 'RELEASED' && a.result.payload?.estimated_overall !== undefined)
-  const delta = verified.length >= 2 ? Number(verified[verified.length - 1].result.payload!.estimated_overall) - Number(verified[verified.length - 2].result.payload!.estimated_overall) : null
+  const verified = attempts.filter(a => a.result?.state === 'RELEASED' && a.result.payload?.estimated_overall !== undefined)
+  const delta = verified.length >= 2 ? Number(verified[verified.length - 1].result!.payload!.estimated_overall) - Number(verified[verified.length - 2].result!.payload!.estimated_overall) : null
   return <>
     <PageTitle eyebrow={`Writing · ${prompt.task_type || ''}`} title={prompt.title} subtitle={`Write at least ${minimum} words. Suggested time: ${Math.round(prompt.duration_seconds / 60)} minutes.`}
       action={<div className="flex flex-wrap gap-2"><Link to="/questions" className="btn-secondary">Question bank</Link><button className="btn-sun" onClick={() => load(true)} disabled={busy}><RotateCcw size={16} /> New task</button></div>} />
@@ -92,17 +106,17 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
         </div>
       </div>
       <div className="space-y-5">
-        <FeedbackPanel result={result} />
+        {pending ? <FeedbackUnavailable busy={busy} onRetry={retryFeedback} /> : <FeedbackPanel result={result} />}
         {attempts.length > 0 && <div className="panel p-6">
           <h3 className="section-title">Revision history</h3>
           {delta !== null && <p className={`mt-3 font-pixel ${delta >= 0 ? 'text-lime' : 'text-rose'}`}>Change since previous verified attempt: {delta > 0 ? '+' : ''}{delta.toFixed(1)}</p>}
-          <div className="mt-4 space-y-3">{attempts.map(a => <button key={a.id} className="tile w-full text-left" onClick={() => { setResult(a.result); update(a.text) }}>
-            <div className="flex justify-between font-pixel"><span>Attempt {a.attempt}</span><Status value={a.result.state} /></div>
+          <div className="mt-4 space-y-3">{attempts.map(a => <button key={a.id} className="tile w-full text-left" onClick={() => { setResult(a.result); setPending(a.result ? null : a.id); update(a.text) }}>
+            <div className="flex justify-between font-pixel"><span>Attempt {a.attempt}</span>{a.result ? <Status value={a.result.state} /> : <span className="pill text-sun">No feedback yet</span>}</div>
             <p className="mt-1 line-clamp-2 font-read text-sm text-mist">{a.text}</p>
-            {a.result.payload?.estimated_overall !== undefined && <p className="mt-1 font-pixel text-cyan">Estimate {a.result.payload.estimated_overall}</p>}
+            {a.result?.payload?.estimated_overall !== undefined && <p className="mt-1 font-pixel text-cyan">Estimate {a.result.payload.estimated_overall}</p>}
           </button>)}</div>
         </div>}
-        {!result && <div className="panel panel-flat p-6 font-read text-sm text-mist">
+        {!result && !pending && <div className="panel panel-flat p-6 font-read text-sm text-mist">
           <h3 className="font-pixel text-lg text-sun">Checklist</h3>
           <ul className="mt-2 space-y-1">{prompt.task === 'task1'
             ? ['Paraphrase the chart in your first sentence', 'Write an overview of the main trends', 'Compare figures — no opinions'].map(t => <li key={t}>▸ {t}</li>)
