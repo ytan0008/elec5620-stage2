@@ -20,6 +20,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from backend.config import settings
@@ -66,6 +67,7 @@ class FlowState(TypedDict, total=False):
     regen_attempts: int
     can_regenerate: bool
     generation_failed: bool
+    feedback_unavailable: bool
 
 
 @tool
@@ -635,6 +637,7 @@ class LearningCoordinatorAgent(Agent):
 
 class TutorAgent(Agent):
     name, memory_key = "AI Tutor", "tutor"
+    ATTEMPTS = 2  # first try plus one retry (UC3 6a, UC4 6a)
 
     def give_feedback(self, state: FlowState) -> dict:
         t = time.perf_counter()
@@ -644,11 +647,22 @@ class TutorAgent(Agent):
         scenario = state.get("scenario", "normal")
         if scenario == "incomplete_once":  # Demo of UC9 2a: the first result is incomplete, the regenerated one is not.
             scenario = "normal" if state.get("regen_attempts") else "invalid"
-        try:
-            result = self.llm.feedback(state["profile"]["exam"], state["skill"], state["text"], scenario,
-                                       state.get("prompt", ""), state.get("task") or "task2", state.get("metrics"), kit).model_dump()
-        except Exception as exc:
-            result = {"summary": "Feedback generation failed structured validation", "criteria": {}, "comments": [], "confidence": {}, "error_type": type(exc).__name__}
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                result = self.llm.feedback(state["profile"]["exam"], state["skill"], state["text"], scenario,
+                                           state.get("prompt", ""), state.get("task") or "task2", state.get("metrics"), kit).model_dump()
+                break
+            except ValidationError as exc:  # malformed output: UC9 2a sends the incomplete result back for regeneration once
+                result = {"summary": "Feedback generation failed structured validation", "criteria": {}, "comments": [], "confidence": {}, "error_type": type(exc).__name__}
+                break
+            except Exception as exc:  # the model did not answer (timeout, connection, provider error)
+                self.event(state, "decision", {"decision": "feedback generation failed", "attempt": attempt, "error_type": type(exc).__name__})
+        else:
+            # 6a: still failing after one retry. The response is kept by the caller and the learner is told
+            # feedback is temporarily unavailable; nothing goes to scoring or the quality gate.
+            kit.log(state["workflow"], self.llm.mode)
+            self.event(state, "handoff", {"decision": "feedback temporarily unavailable", "next_agent": "Learner"}, t)
+            return {"feedback_unavailable": True}
         kit.log(state["workflow"], self.llm.mode)
         if isinstance(previous, dict) and previous.get("criteria") and result.get("criteria"):
             before = {item["issue"] for item in previous.get("issues", []) if item.get("issue")}
@@ -1062,7 +1076,7 @@ class AgentRuntime:
         graph.add_node("release", self.quality_manager.release)
         graph.add_node("human_wait", self.quality_manager.wait_for_instructor)
         graph.add_edge(START, "tutor")
-        graph.add_edge("tutor", "assessment")
+        graph.add_conditional_edges("tutor", lambda s: "unavailable" if s.get("feedback_unavailable") else "assessment", {"unavailable": END, "assessment": "assessment"})
         graph.add_edge("assessment", "quality")
         graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait", "regenerate": "tutor"})
         graph.add_edge("release", END)

@@ -100,6 +100,15 @@ export function HeldNotice({ result }: { result: Result }) {
   </div>
 }
 
+/* UC3/UC4 6a: feedback still failed after one retry; the response is kept and feedback can be asked for again. */
+export function FeedbackUnavailable({ busy, onRetry }: { busy: boolean; onRetry: () => void }) {
+  return <div role="alert" className="panel panel-sun p-5">
+    <div className="flex items-center gap-2 font-pixel text-lg text-sun"><ShieldCheck size={20} /> Feedback is temporarily unavailable</div>
+    <p className="mt-2 font-read text-mist">Your response has been saved. Ask for feedback again in a moment.</p>
+    <button className="btn-primary mt-3" disabled={busy} onClick={onRetry}>{busy ? 'Trying…' : 'Try again'}</button>
+  </div>
+}
+
 /* Feedback for writing / speaking results */
 export function FeedbackPanel({ result }: { result: Result | null }) {
   if (!result) return null
