@@ -31,12 +31,18 @@ from backend.schemas import (FeedbackOutput, PlanOutput, VerdictOutput, Recommen
 from backend.onboarding import parse_demo_message
 from backend import content as bank
 from backend import local_tutor
+from backend import adaptation
+from backend import analytics
+from backend import escalation
 from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
 
+
 class MockUnavailable(Exception):
     """UC5 3a: the mock examination could not be prepared."""
+
+
 class LocalGenerationUnavailable(Exception):
     """Raised when a request needs a cloud model in LOCAL mode."""
 
@@ -59,6 +65,7 @@ class FlowState(TypedDict, total=False):
     source_mode: str
     regen_attempts: int
     can_regenerate: bool
+    generation_failed: bool
 
 
 @tool
@@ -90,13 +97,15 @@ class LLMProviderAdapter(LLMService):
     def __init__(self):
         self.config = settings()
         self.mode = self.config.ai_mode
-        self.llm = self.scorer = None
+        self.llm = self.scorer = self.verifier = None
         if self.mode == "REAL":
             self.llm = self._client(self.config.llm_reasoning_effort)
             self.scorer = self._client(self.config.llm_scoring_effort) if self.config.llm_scoring_effort != self.config.llm_reasoning_effort else self.llm
+            # UC9 4a: the Quality Manager owns the single retry, so its client has no hidden retries of its own.
+            self.verifier = self._client(self.config.llm_scoring_effort, retries=0)
 
-    def _client(self, effort: str) -> ChatOpenAI:
-        options = {"model": self.config.llm_model, "api_key": self.config.openai_api_key, "base_url": self.config.openai_base_url or None, "timeout": 90, "max_retries": 1}
+    def _client(self, effort: str, retries: int = 1) -> ChatOpenAI:
+        options = {"model": self.config.llm_model, "api_key": self.config.openai_api_key, "base_url": self.config.openai_base_url or None, "timeout": 90, "max_retries": retries}
         if self.config.llm_use_responses_api:
             options["use_responses_api"] = True
         if effort:
@@ -107,12 +116,13 @@ class LLMProviderAdapter(LLMService):
     def local(self) -> bool:
         return self.mode == "LOCAL"
 
-    def structured(self, schema, system: str, user: dict, local: dict, toolkit: Toolkit | None = None, scoring: bool = False):
+    def structured(self, schema, system: str, user: dict, local: dict, toolkit: Toolkit | None = None, scoring: bool = False, once: bool = False):
         """Structured output from the cloud model. With a toolkit the agent sees its memory, may call its tools,
-        and then submits the answer through a final tool shaped like the schema."""
+        and then submits the answer through a final tool shaped like the schema. `once` makes a single attempt
+        with no fallback or retry, for callers that own their retry policy."""
         if self.local:
             return schema.model_validate(local)
-        llm = self.scorer if scoring else self.llm
+        llm = (self.verifier or self.scorer) if once else self.scorer if scoring else self.llm
         # Callers pass only exam goals, learning text and scores; account identity is excluded.
         if toolkit:
             user = {**user, "your_memory": agent_core.recall(toolkit.db, toolkit.agent, toolkit.user_id, 8, include_cohort=True)}
@@ -123,8 +133,12 @@ class LLMProviderAdapter(LLMService):
             try:
                 return self._agent_loop(llm, schema, messages, toolkit)
             except Exception:
+                if once:
+                    raise
                 pass  # Fall back to a plain structured call with the tool results gathered so far.
         chain = llm.with_structured_output(schema)
+        if once:
+            return chain.invoke(messages)
         try:
             return chain.invoke(messages)
         except Exception:
@@ -358,7 +372,9 @@ class LLMProviderAdapter(LLMService):
                  "priorities": priorities, "activities": activities,
                  "changes": (["Increase practice on recent weak skills"] if adaptation else []) + ([f"Consider learner request: {change_request}"] if change_request else []), "confidence": {"plan": .87}}
         return self.structured(PlanOutput, "You are the Learning Coordinator. Propose actionable IELTS or TOEFL weekly study activities (skill, title, minutes_per_week, reason) whose minutes sum to the "
-                               "learner's weekly hours. Use the learner's earlier plan decisions and notebook patterns when they help. Return confidence as a self-reported heuristic, not a calibrated probability.",
+                               "learner's weekly hours. Use the learner's earlier plan decisions and notebook patterns when they help. Return confidence as a self-reported heuristic, not a calibrated probability. "
+                               "When adaptation is true, compare progress.current_plan with progress.skill_scores and progress.target_score, and return change_details: one {skill, reason} for each skill whose "
+                               "priority or weekly minutes you changed, with a reason that cites the learner's verified scores.",
                                {"profile": profile, "progress": progress, "adaptation": adaptation}, local, toolkit, scoring=True)
 
     def prompt(self, exam: str, skill: str, avoid: set[str] | None = None) -> dict:
@@ -395,13 +411,14 @@ class LLMProviderAdapter(LLMService):
         return output
 
     def check_consistency(self, payload: dict, toolkit: Toolkit | None = None) -> VerdictOutput:
+        """One attempt only; OpsQualityManager retries once (UC9 4a)."""
         scores = payload.get("criteria", {})
         summary = payload.get("summary", "").lower()
         issues = bool(scores) and ("excellent" in summary or "no weaknesses" in summary) and min(scores.values()) <= 3
         local = {"consistent": not issues, "reason": "Praise conflicts with a very low criterion score" if issues else "No obvious score and feedback contradiction", "confidence": .85}
         return self.structured(VerdictOutput, "You are the Operations & Quality Manager. Check whether feedback statements contradict criterion scores. Be conservative and return a short reason. "
                                "Learn from earlier instructor decisions: if the instructor approved similar results you held, do not repeat that false alarm.",
-                               {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True)
+                               {"summary": payload.get("summary"), "criteria": scores, "comments": payload.get("comments", [])}, local, toolkit, scoring=True, once=True)
 
     def rank_and_explain(self, weaknesses: list[str], candidates: list[dict], toolkit: Toolkit | None = None) -> RecommendationOutput:
         ranked = sorted(candidates, key=lambda item: item["skill"] not in weaknesses)[:5]
@@ -478,13 +495,30 @@ class LearningCoordinatorAgent(Agent):
         t = time.perf_counter()
         self.event(state, "perception", {"exam": state["profile"]["exam"], "priorities": state["profile"]["priority_skills"]})
         kit = self.toolkit(state["user_id"], state["profile"]["exam"])
-        try:
-            output = self.llm.plan(state["profile"], state.get("progress", {}), state["workflow"] == "adaptation", kit).model_dump()
-        except Exception as exc:
-            output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": type(exc).__name__}
+        adapting = state["workflow"] == "adaptation"
+        output = None
+        for attempt in range(2 if adapting else 1):  # UC7 4a: when the model does not respond, retry once
+            try:
+                output = self.llm.plan(state["profile"], state.get("progress", {}), adapting, kit).model_dump()
+                break
+            except Exception as exc:
+                error = type(exc).__name__
+                self.event(state, "decision", {"decision": "plan generation failed", "attempt": attempt + 1, "error": error})
         kit.log(state["workflow"], self.llm.mode)
+        if output is None:
+            if adapting and not state.get("package_id"):  # 4a: nothing to check or release; the existing plan stays active
+                self.event(state, "handoff", {"decision": "keep existing plan", "reason": "adaptation could not be generated", "next_agent": "Learner"}, t)
+                return {"generation_failed": True}
+            output = {"summary": "Plan generation failed structured validation", "confidence": {}, "error_type": error}
         if output.get("priorities"):
-            request = state.get("progress", {}).get("change_request")
+            profile, progress = state["profile"], state.get("progress", {})
+            if adapting:  # UC7 step 3 and 4: which priorities should change, and why
+                derived = adaptation.describe_changes(progress.get("current_plan", {}), output, progress, progress.get("target_score"))
+                output["change_details"] = adaptation.merge_reasons(derived, output.get("change_details", []))
+                output["changes"] = adaptation.change_summaries(output["change_details"])
+                output["trigger"] = progress.get("trigger")
+            output["resources"] = adaptation.select_resources(self.db, state["user_id"], profile["exam"], output["priorities"], profile.get("proficiency"))  # step 5 / 5a
+            request = progress.get("change_request")
             agent_core.remember(self.db, self.memory_key, state["user_id"], f"Proposed {state['workflow']} plan '{output.get('title')}' with priorities {', '.join(output['priorities'][:4])}"
                                 + (f" after the learner asked: {request}" if request else "") + ".", data={"priorities": output["priorities"]})
         self.event(state, "handoff", {"decision": "submit proposed plan", "next_agent": "Quality Manager", "tool": "LLM adapter"}, t)
@@ -601,6 +635,7 @@ class LearningCoordinatorAgent(Agent):
 
 class TutorAgent(Agent):
     name, memory_key = "AI Tutor", "tutor"
+
     def give_feedback(self, state: FlowState) -> dict:
         t = time.perf_counter()
         self.event(
@@ -762,28 +797,114 @@ class TutorAgent(Agent):
 
 class AssessmentAgent(Agent):
     name, memory_key = "Assessment & Analytics", "assessment"
-    ATTEMPTS = 2
+    ATTEMPTS = 2  # first try plus one retry (UC5 3a/5a, UC6 3a)
 
+    # ---- UC5 Take Mock Examination
     def prepare_mock(self, user_id: int, exam: str, length: str) -> dict:
+        """Step 3: assemble the four sections from the exam bank. 3a: retry once, then report the mock as unavailable."""
         state: FlowState = {"user_id": user_id, "workflow": "mock_exam"}
         for attempt in range(1, self.ATTEMPTS + 1):
             try:
                 sections = bank.mock_sections(exam, length)
-                self.event(state, "action", {
-                    "decision": "prepared mock examination",
-                    "exam": exam,
-                    "length": length,
-                    "attempt": attempt,
-                    "next_agent": "Learner",
-                })
+                self.event(state, "action", {"decision": "prepared mock examination", "exam": exam, "length": length, "attempt": attempt, "next_agent": "Learner"})
                 return sections
             except Exception as exc:
-                self.event(state, "decision", {
-                    "decision": "mock preparation failed",
-                    "attempt": attempt,
-                    "error_type": type(exc).__name__,
-                })
+                self.event(state, "decision", {"decision": "mock preparation failed", "attempt": attempt, "error_type": type(exc).__name__})
         raise MockUnavailable("The mock exam is temporarily unavailable. Please try again later.")
+
+    def score_section(self, user_id: int, exam: str, skill: str, text: str, prompt: str = "", task: str = "task2", metrics: dict | None = None) -> FeedbackOutput | None:
+        """Step 5: score a writing task or the speaking test against the rubric with the Assessment tools
+        (band descriptors, score history, text measures). 5a: retry once; None means the section could not be scored."""
+        state: FlowState = {"user_id": user_id, "workflow": "mock_exam"}
+        kit = self.toolkit(user_id, exam)
+        for attempt in range(1, self.ATTEMPTS + 1):
+            started = time.perf_counter()
+            try:
+                result = self.llm.feedback(exam, skill, text, "normal", prompt, task, metrics, kit)
+                kit.log("mock_exam", self.llm.mode)
+                self.event(state, "action", {"decision": f"scored {skill} ({task}) against the {exam} rubric", "attempt": attempt, "criteria": result.criteria}, started)
+                return result
+            except Exception as exc:
+                kit.log("mock_exam", self.llm.mode)
+                self.event(state, "decision", {"decision": f"{skill} ({task}) could not be scored", "attempt": attempt, "error_type": type(exc).__name__}, started)
+        return None
+
+    def score_objective(self, user_id: int, exam: str, skill: str, test: dict, answers: dict) -> dict:
+        """Step 5: mark listening or reading against the answer key and convert the raw score to a band."""
+        started = time.perf_counter()
+        graded = analytics.objective_output(test | {"test": test}, answers, skill, exam)
+        self.event({"user_id": user_id, "workflow": "mock_exam"}, "action", {"decision": f"marked {skill} against the answer key",
+                   "raw_score": graded["raw_score"], "total": graded["total"], "band": graded["estimated_overall"]}, started)
+        return graded
+
+    def record_incomplete(self, exam_record, reason: str, attempted: list[str]) -> None:
+        """4a: a mock left before the speaking test is recorded as incomplete and gets no final result. Saved answers are kept."""
+        missing = [skill for skill in ("listening", "reading", "writing", "speaking") if skill not in attempted]
+        exam_record.status = "INCOMPLETE"
+        exam_record.sections = {**exam_record.sections, "ended": {"reason": reason, "at": datetime.now(timezone.utc).isoformat(), "missing": missing,
+                                                                  "completed": attempted}}
+        self.db.add(AuditLog(user_id=exam_record.user_id, action="mock_incomplete", detail={"exam_id": exam_record.id, "reason": reason, "missing": missing}))
+        self.event({"user_id": exam_record.user_id, "workflow": "mock_exam"}, "decision",
+                   {"decision": "recorded as incomplete; no final result", "exam_id": exam_record.id, "reason": reason, "missing": missing})
+
+    def recommend(self, user_id: int, progress: dict) -> list[str]:
+        """UC6 step 6 on the Performance page: recommendations from skill gaps, declining trends and repeated problems."""
+        tips = analytics.progress_recommendations(progress) if progress["sample_count"] else ["Complete a practice session to unlock personalised insights"]
+        self.event({"user_id": user_id, "workflow": "report"}, "action", {"decision": "recommended next steps", "count": len(tips)})
+        return tips
+
+    def analyse_mock(self, user_id: int, scores: dict, overall: float, target: float | None, issues: list[str]) -> dict:
+        """Steps 6-7: strengths and weaknesses, comparison with earlier assessments and readiness."""
+        insights = analytics.mock_insights(self.db, user_id, scores, overall, target, issues)
+        readiness = insights["readiness_detail"]
+        self.event({"user_id": user_id, "workflow": "mock_exam"}, "decision", {"decision": "estimated readiness", "readiness": readiness["level"], "gap": readiness["gap"],
+                   "weaknesses": [w["skill"] for w in insights["weaknesses"]], "compared_with": (insights["comparison"] or {}).get("against"), "next_agent": "Quality Manager"})
+        agent_core.remember(self.db, self.memory_key, user_id, f"Mock estimate {overall}: {readiness['level']}" + (f", weakest {insights['weaknesses'][0]['skill']}" if insights["weaknesses"] else "") + ".",
+                            data={"overall": overall, "readiness": readiness["level"]})
+        return insights
+
+    # ---- UC6 View Performance Report and Identify Weaknesses
+    def analyse_progress(self, user_id: int) -> dict:
+        """Steps 2-5: verified results across the four skills, strengths, weaknesses, repeated problems and trends.
+        3a: retry the analysis once before giving up."""
+        state: FlowState = {"user_id": user_id, "workflow": "report"}
+        for attempt in range(1, self.ATTEMPTS + 1):
+            started = time.perf_counter()
+            try:
+                progress = analytics.latest_progress(self.db, user_id)
+                self.event(state, "perception", {"decision": "analysed verified results", "results": progress["sample_count"], "weaknesses": progress["weaknesses"],
+                                                 "trends": {skill: t["direction"] for skill, t in progress["trends"].items()}, "attempt": attempt}, started)
+                return progress
+            except Exception as exc:
+                self.db.rollback()
+                if attempt == self.ATTEMPTS:
+                    raise
+                self.event(state, "decision", {"decision": "performance analysis failed; retrying", "attempt": attempt, "error_type": type(exc).__name__})
+
+    def diagnose_sections(self, user_id: int, target: float | None, mock_payload: dict | None = None, texts: dict | None = None) -> dict:
+        """Section by section: what went well, what to improve, missed question types and words, grammar by type."""
+        sections = analytics.mock_section_report(mock_payload, texts or {}, target) if mock_payload else analytics.practice_section_report(self.db, user_id, target)
+        self.event({"user_id": user_id, "workflow": "report"}, "decision", {"decision": "diagnosed each section", "sections": sorted(sections),
+                   "source": "mock exam" if mock_payload else "latest practice"})
+        return sections
+
+    def write_report(self, user_id: int, exam: str, progress: dict) -> dict:
+        """Step 6: the report narrative and recommendations. 6a: if they fail, keep the verified analysis without recommendations."""
+        state: FlowState = {"user_id": user_id, "workflow": "report"}
+        kit = self.toolkit(user_id, exam)
+        data = dict(progress)
+        try:
+            data.update(self.llm.report(data, kit).model_dump())
+            kit.log("report", self.llm.mode)
+            self.event(state, "action", {"decision": "wrote performance report", "recommendations": len(data.get("recommendations", [])), "next_agent": "Quality Manager"})
+        except Exception as exc:
+            kit.log("report", self.llm.mode)
+            scores = ", ".join(f"{skill} {score}" for skill, score in data["skill_scores"].items())
+            data.update({"summary": f"Verified estimates: {scores}. {data['readiness_note']} {data['trend_note']}".strip(), "recommendations": [], "recommendations_unavailable": True,
+                         "confidence": {"report": .8}})
+            self.db.add(AuditLog(user_id=user_id, action="report_recommendations_failed", detail={"error_type": type(exc).__name__}))
+            self.event(state, "decision", {"decision": "report saved without recommendations; retry later", "error_type": type(exc).__name__, "next_agent": "Quality Manager"})
+        return data
 
     def provide_insights(self, state: FlowState) -> dict:
         self.event(state, "handoff", {"decision": "return verified progress insights", "weaknesses": state.get("progress", {}).get("weaknesses", []), "next_agent": "Learning Coordinator"})
@@ -895,6 +1016,8 @@ class OpsQualityManager(Agent):
                 issues.append("Criterion score outside exam scale")
         if workflow in ("plan", "adaptation") and (not payload.get("priorities") or not payload.get("activities") or not payload.get("rationale")):
             issues.append("Plan is incomplete")
+        if workflow == "adaptation" and any(not str(item.get("reason", "")).strip() for item in payload.get("change_details", []) if isinstance(item, dict)):
+            issues.append("Plan is incomplete: a major change has no rationale")
         # Items ranked by tags only (UC10 4a) deliberately carry no reason.
         if workflow == "recommendations" and (not payload.get("items") or any(not item.get("reason") and payload.get("basis") != "tags" for item in payload.get("items", []))):
             issues.append("Recommendation list is incomplete")
@@ -936,16 +1059,21 @@ class OpsQualityManager(Agent):
         if payload.get("basis") in ("tags", "starter"):
             return [], "RULES", False  # No AI-written text to check; the rule checks above cover it.
         kit = Toolkit(self.db, self.memory_key, state["user_id"], (state.get("profile") or {}).get("exam", "IELTS"))
-        issues = []
-        try:
-            verdict = self.llm.check_consistency(payload, kit)
+        issues, verdict = [], None
+        for attempt in (1, 2):  # 4a: retry once, then fall back to the rule-based checks
+            try:
+                verdict = self.llm.check_consistency(payload, kit)
+                break
+            except Exception as exc:
+                self.event(state, "decision", {"decision": "consistency verdict failed", "attempt": attempt, "error": type(exc).__name__})
+        if verdict:
             if not verdict.consistent:
                 issues.append(verdict.reason)
             if verdict.confidence < self.threshold():
                 issues.append("Consistency verdict confidence below threshold")
             method = "LLM" if self.llm.mode == "REAL" else "DEMO_RULES"
             unchecked = False
-        except Exception:
+        else:
             method, unchecked = "FALLBACK_RULES", True
             if self.llm.mode == "REAL":
                 issues.append("LLM consistency verification unavailable")
@@ -960,7 +1088,10 @@ class OpsQualityManager(Agent):
 
     def notify_escalation(self, state: FlowState, package: ResultPackage, issues: list[str]):
         """UC8 extends UC9 at "issue detected"."""
-        self.db.add(Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues)))
+        case = Escalation(package_id=package.id, status="PENDING", reason="; ".join(issues))
+        self.db.add(case)
+        self.db.flush()
+        escalation.route(self.db, case)  # UC8 steps 1-2: notify the instructor, or queue the case when none is available (2a)
         self.event(state, "handoff", {"next_agent": "Human Instructor", "package_id": package.id})
 
     def record_issue(self, state: FlowState, payload: dict):
@@ -1048,7 +1179,7 @@ class AgentRuntime:
         graph.add_conditional_edges(START, lambda s: "request_insights" if s["workflow"] == "adaptation" else "coordinator", {"request_insights": "request_insights", "coordinator": "coordinator"})
         graph.add_edge("request_insights", "assessment_insights")
         graph.add_edge("assessment_insights", "coordinator")
-        graph.add_edge("coordinator", "quality")
+        graph.add_conditional_edges("coordinator", lambda s: "failed" if s.get("generation_failed") else "quality", {"failed": END, "quality": "quality"})
         graph.add_conditional_edges("quality", lambda s: s["route"], {"release": "release", "hold": "human_wait", "regenerate": "coordinator"})
         graph.add_edge("release", END)
         graph.add_edge("human_wait", END)
