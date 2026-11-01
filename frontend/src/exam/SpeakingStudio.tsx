@@ -6,6 +6,7 @@ import { moodFor, usePersona } from '../persona'
 import { Listener, listen, monitorLevel, prefs, recognitionSupported, recordMicrophone, speak, stopSpeaking, transcribeOnServer } from '../voice'
 import { Countdown, FeedbackPanel, FeedbackUnavailable, Notify, clock } from '../ui'
 import { useExamLock } from '../examLock'
+import SelectionNotice from './SelectionNotice'
 
 type Props = { notify: Notify; mockId?: number; questionId?: string | null; onSaved?: () => void; onResult?: (result: Result) => void }
 const SILENCE: Record<string, number> = { p2_talk: 7000, repeat: 2500, interview: 4500 }
@@ -283,6 +284,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     </aside>
 
     <section className="space-y-5">
+      <SelectionNotice selection={session.selection} />
       {prep && cue && <div className="panel panel-sun space-y-4 p-6 anim-rise">
         <div className="flex flex-wrap items-center justify-between gap-3"><span className="eyebrow">Part 2 · cue card</span><span className="font-pixel">Preparation <Countdown seconds={60} running={prep} className="text-4xl" onDone={startLongTurn} /></span></div>
         <p className="font-pixel text-2xl text-moon">{cue.cue}</p>

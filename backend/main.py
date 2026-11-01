@@ -22,6 +22,7 @@ from backend import analytics as analytics_module
 from backend import mock_timing
 from backend.analytics import objective_output, latest_progress, split_skills, mock_insights, progress_recommendations, issue_history, skill_trends, progress_readiness
 from backend.agents import AgentRuntime, MockUnavailable, LocalGenerationUnavailable, practice_prompt
+from backend import practice_selection
 from backend import adaptation
 from backend import escalation
 from backend import agent_core
@@ -769,11 +770,18 @@ def start_practice(skill: str, question_id: int | None = None, user: User = Depe
             prompt = {"title": item.title, "text": item.prompt, "answer_key": item.answer_key, "mode": item.source_kind,
                       "task_type": item.task_type, "duration_seconds": 900 if skill == "speaking" else 2400 if skill == "writing" else 600}
     else:
-        prompt = runtime.provider.prompt(profile.exam, skill, seen_content(db, user.id, skill))
+        seen = seen_content(db, user.id, skill)
+        if skill in ("speaking", "writing"):
+            weakness, evidence_count = practice_selection._recent_evidence(db, user.id, profile.exam, skill, profile.target_score)
+            plan_context = practice_selection.active_plan_context(db, user.id, profile.exam, skill)
+            prompt = runtime.provider.prompt(profile.exam, skill, seen, {"proficiency": profile.proficiency,
+                "weak_criteria": weakness, "evidence_count": evidence_count, "plan": plan_context})
+        else:
+            prompt = runtime.provider.prompt(profile.exam, skill, seen)
     practice = Practice(user_id=user.id, exam=profile.exam, skill=skill, prompt=prompt)
     db.add(practice)
     db.flush()
-    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "selected question bank task", "tool": "question bank", "practice_id": practice.id, "question_id": question_id, "content_id": prompt.get("content_id")}, mode=runtime.provider.mode))
+    db.add(AgentEvent(user_id=user.id, workflow=skill, agent="AI Tutor", phase="action", detail={"decision": "selected question bank task", "tool": "question bank", "practice_id": practice.id, "question_id": question_id, "content_id": prompt.get("content_id"), "selection": prompt.get("selection")}, mode=runtime.provider.mode))
     db.commit()
     return {"id": practice.id, "prompt": public_prompt(prompt), "skill": skill}
 
@@ -927,9 +935,12 @@ def result(package_id: int, user: User = Depends(learner), db: Session = Depends
 # ---------------------------------------------------------------- live speaking examiner
 
 def speaking_view(session: SpeakingSession) -> dict:
-    return {"id": session.id, "exam": session.exam, "status": session.status, "practice_id": session.practice_id, "mock_id": session.mock_id, "persona": session.persona,
+    result = {"id": session.id, "exam": session.exam, "status": session.status, "practice_id": session.practice_id, "mock_id": session.mock_id, "persona": session.persona,
             "log": [{k: v for k, v in item.items() if k != "repeat_target" or session.status == "COMPLETED"} for item in session.log],
             "ui": examiner.ui(session.test, session.state), "test_title": session.test.get("title")}
+    if session.mock_id is None and isinstance(session.test.get("_selection"), dict):
+        result["selection"] = session.test["_selection"]
+    return result
 
 
 @app.post("/api/speaking/sessions")
@@ -962,6 +973,8 @@ def start_speaking(data: SpeakingStartInput, user: User = Depends(learner), db: 
         test = db.get(Practice, practice_id).prompt.get("test")
         if not test:
             raise HTTPException(409, "This speaking task does not support the live examiner")
+        if practice["prompt"].get("selection"):
+            test = {**test, "_selection": practice["prompt"]["selection"]}
     state, text, _ = examiner.start(test, data.persona)
     session = SpeakingSession(user_id=user.id, practice_id=practice_id, mock_id=data.mock_id, exam=test["exam"], persona=data.persona, test=test, state=state,
                               log=[{"role": "examiner", "text": text, "stage": state["stage"], "part": examiner.ui(test, state)["part"]}])

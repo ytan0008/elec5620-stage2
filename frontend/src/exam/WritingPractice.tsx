@@ -4,6 +4,7 @@ import { Clock3, RotateCcw, Send } from 'lucide-react'
 import { Practice, Result, post, request, retryOnce } from '../api'
 import { Countdown, Empty, FeedbackPanel, FeedbackUnavailable, Notify, PageTitle, Spinner, Status, words } from '../ui'
 import ChartView from './ChartView'
+import SelectionNotice from './SelectionNotice'
 import { useExamLock } from '../examLock'
 
 type Attempt = { id: number; attempt: number; text: string; result: Result | null; created_at: string }
@@ -90,6 +91,7 @@ export default function WritingPractice({ notify }: { notify: Notify }) {
           </div>
           <p className="reading whitespace-pre-line">{prompt.text}</p>
           {prompt.chart && <ChartView chart={prompt.chart} />}
+          <SelectionNotice selection={prompt.selection} />
         </div>
         <div className="panel p-6">
           <label className="label" htmlFor="essay">Essay editor</label>
