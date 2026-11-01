@@ -263,10 +263,10 @@ Where each Stage 1 use case lives. Pages without their own file are components i
 |---|---|---|---|---|
 | UC1 Register and create learner profile | Learning Coordinator onboarding interview: `onboarding.py` | `POST /api/auth/register`, `/api/onboarding/*`, `PUT /api/profile` | `AuthPage.tsx`, `OnboardingPage.tsx`, Profile | `test_workflow.py` |
 | UC2 Create personalised learning plan | `LearningCoordinatorAgent.create_plan` | `POST /api/plans/generate`, `/api/plans/{id}/decision`, `/api/plans/{id}/request-changes` | Plans | `test_workflow.py` |
-| UC3 Complete speaking practice | `TutorAgent.give_feedback`, `examiner.py` (speaking-test state machine), `speech.py` | `/api/speaking/sessions/*`, `POST /api/practice/{id}/audio` | `exam/SpeakingStudio.tsx`, `exam/SpeakingPage.tsx` | `test_workflow.py` |
-| UC4 Writing practice with feedback | `TutorAgent.give_feedback`, `scoring.py` | `POST /api/practice/{skill}`, `POST /api/practice/{id}/submit`, `GET /api/practice/{id}/attempts` | `exam/WritingPractice.tsx` | `test_workflow.py`, `test_uc9_uc10.py` |
-| UC5 Take mock examination | `AssessmentAgent.score`, `scoring.py` | `/api/mock-exams/*` | `MockExamPage.tsx` | `test_workflow.py` |
-| UC6 View performance report | `AssessmentAgent.provide_insights`, `LearningCoordinatorAgent.request_insights` | `GET /api/analytics`, `/api/reports` | Analytics, `KnowledgeGraphPage.tsx` | `test_workflow.py` |
+| UC3 Complete speaking practice | `practice_selection.py` (task choice by level and recent weakness), `TutorAgent.give_feedback`, `examiner.py` (speaking-test state machine), `speech.py` (offline recognition) | `/api/speaking/sessions/*` (including `/leave`), `POST /api/submissions/{id}/feedback`, `POST /api/practice/{id}/audio` | `exam/SpeakingStudio.tsx`, `exam/SpeakingPage.tsx` | `test_workflow.py`, `test_uc3_uc4.py`, `test_kan70_selection.py`, `test_speech.py` |
+| UC4 Writing practice with feedback | `practice_selection.py`, `TutorAgent.give_feedback`, `scoring.py` | `POST /api/practice/{skill}`, `POST /api/practice/{id}/submit`, `GET /api/practice/{id}/attempts`, `POST /api/submissions/{id}/feedback` | `exam/WritingPractice.tsx` | `test_workflow.py`, `test_uc3_uc4.py`, `test_kan70_selection.py`, `test_uc9_uc10.py` |
+| UC5 Take mock examination | `AssessmentAgent`: `prepare_mock`, `score_objective`, `score_section`, `analyse_mock`, `record_incomplete`; `mock_timing.py` (IELTS test-day timing), `scoring.py` | `/api/mock-exams/*` (including `/written/start`, `/written/next`, `/end`) | `MockExamPage.tsx` | `test_workflow.py` |
+| UC6 View performance report | `AssessmentAgent`: `analyse_progress`, `diagnose_sections`, `write_report`, `provide_insights`; `analytics.py` (trends, readiness, section-by-section diagnosis) | `GET /api/analytics`, `POST /api/reports`, `GET /api/reports/{id}` | Analytics, `ReportPage.tsx`, `KnowledgeGraphPage.tsx` | `test_workflow.py` |
 | UC7 Receive adapted learning plan | `adaptation.py` (one flow for all three triggers), `scheduled_review.py` (weekly trigger) | `GET /api/plans/adaptation-notice`, `POST /api/plans/{id}/decision` | Plans | `test_uc7.py` |
 | UC8 Review escalated case | `escalation.py`; `OpsQualityManager.notify_escalation` opens the case | `/api/instructor/cases/*`, `/api/instructor/availability` | Instructor | `test_uc8.py` |
 | UC9 Check agent output quality | `OpsQualityManager`: `submit_result`, `validate`, `check_confidence`, `rule_based_check`, `release`; states in `ResultStatus` (`llm_service.py`) | `GET /api/instructor/quality`, `PUT /api/instructor/quality/threshold`, `GET /api/results/{id}` | Quality | `test_uc9_uc10.py` |
@@ -302,6 +302,9 @@ Class diagram names that differ in code (all database models are in `backend/mod
 │   ├── adaptation.py        UC7 plan adaptation (learner request, weekly review, completed mock)
 │   ├── escalation.py        UC8 review queue, instructor availability and outcome delivery
 │   ├── materials.py         UC10 MaterialLibrary (search, starter materials, dismissed items)
+│   ├── analytics.py         UC5/UC6 progress, trends, readiness and section-by-section diagnosis
+│   ├── mock_timing.py       UC5 IELTS test-day timing (sections in order, speaking on the same day)
+│   ├── practice_selection.py UC3/UC4 task choice by level and recent weakness
 │   ├── models.py            Database models
 │   ├── schemas.py           Pydantic request and structured-output schemas
 │   ├── config.py            Settings loaded from .env
@@ -311,7 +314,7 @@ Class diagram names that differ in code (all database models are in `backend/mod
 │   ├── local_tutor.py       Offline tutor replies
 │   ├── notebook.py          Notebooks, tutor memory, dictionary
 │   ├── monitoring.py        Teacher console metrics and anomaly detection
-│   ├── speech.py            Cloud text-to-speech and transcription
+│   ├── speech.py            Offline Whisper recognition, cloud text-to-speech and transcription
 │   ├── onboarding.py        Setup-assistant questions and parsing
 │   ├── knowledge.py         Knowledge graph
 │   ├── recovery.py          Password reset (on-screen link or SMTP)
@@ -327,6 +330,7 @@ Class diagram names that differ in code (all database models are in `backend/mod
 ├── migrations/              Alembic database migrations
 ├── tests/                   Backend tests (pytest)
 ├── scripts/package_source.py  Builds the Canvas zip
+├── scripts/benchmark.py     Repeats the measurements in docs/PERFORMANCE.md
 ├── docs/                    Implementation status, agile evidence, Jira backlog
 ├── compose.yaml             Docker Compose (backend + frontend on port 8080)
 ├── Dockerfile.backend
@@ -372,7 +376,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 ## 11. Testing
 
 ```powershell
-# Backend: 76 tests (workflows, alternative flows of UC3-UC9, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock, offline speech)
+# Backend: 105 tests (workflows, alternative flows of UC3-UC9, task selection, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock, offline speech)
 .\.venv\Scripts\python -m pytest tests -q
 
 # Frontend type-check and production build
@@ -451,6 +455,8 @@ KAN-3 #comment Examiner now asks follow-ups #time 2h #done
 - All scores are **unofficial estimates**, not official IELTS or TOEFL results.
 - Confidence values are the model's self-reports, not calibrated probabilities. The instructor adjusts the threshold.
 - Pronunciation is never scored from a transcript; there is no acoustic pronunciation scorer.
+- Band conversion has not been validated against official papers or real candidates' results.
+- The level and focus tags used to choose practice tasks are project-authored heuristics, not official difficulty levels; the learner sees the reason for each choice.
 - All exam content is original and written for this project. Official IELTS samples are linked, not republished.
 - Cloud AI and cloud speech need your own API key and cost money per use. LOCAL mode is free.
 
