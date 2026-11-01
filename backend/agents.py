@@ -35,7 +35,8 @@ from backend import agent_core
 from backend.agent_core import Toolkit
 from backend.scoring import analyse_response, validate_test
 
-
+class MockUnavailable(Exception):
+    """UC5 3a: the mock examination could not be prepared."""
 class LocalGenerationUnavailable(Exception):
     """Raised when a request needs a cloud model in LOCAL mode."""
 
@@ -761,6 +762,28 @@ class TutorAgent(Agent):
 
 class AssessmentAgent(Agent):
     name, memory_key = "Assessment & Analytics", "assessment"
+    ATTEMPTS = 2
+
+    def prepare_mock(self, user_id: int, exam: str, length: str) -> dict:
+        state: FlowState = {"user_id": user_id, "workflow": "mock_exam"}
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                sections = bank.mock_sections(exam, length)
+                self.event(state, "action", {
+                    "decision": "prepared mock examination",
+                    "exam": exam,
+                    "length": length,
+                    "attempt": attempt,
+                    "next_agent": "Learner",
+                })
+                return sections
+            except Exception as exc:
+                self.event(state, "decision", {
+                    "decision": "mock preparation failed",
+                    "attempt": attempt,
+                    "error_type": type(exc).__name__,
+                })
+        raise MockUnavailable("The mock exam is temporarily unavailable. Please try again later.")
 
     def provide_insights(self, state: FlowState) -> dict:
         self.event(state, "handoff", {"decision": "return verified progress insights", "weaknesses": state.get("progress", {}).get("weaknesses", []), "next_agent": "Learning Coordinator"})
