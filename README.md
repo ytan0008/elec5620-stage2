@@ -251,7 +251,7 @@ Key rules:
 - **Answer keys stay on the server** until a test is submitted.
 - **Privacy.** Account identity is not sent to the model; requests contain only exam goals, learning text and scores.
 
-Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`, `langchain-core`), Pydantic, React 19, TypeScript, Vite, Tailwind CSS, Recharts, Playwright, Docker Compose with nginx.
+Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`, `langchain-core`), Pydantic, faster-whisper (offline speech recognition), React 19, TypeScript, Vite, Tailwind CSS, Recharts, Playwright, Docker Compose with nginx, GitHub Actions. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) lists what each one contributes, with measurements.
 
 ### Stage 1 design → code
 
@@ -370,7 +370,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 ## 11. Testing
 
 ```powershell
-# Backend: 48 tests (workflows, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock)
+# Backend: 76 tests (workflows, alternative flows of UC3-UC9, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock, offline speech)
 .\.venv\Scripts\python -m pytest tests -q
 
 # Frontend type-check and production build
@@ -382,6 +382,8 @@ npm.cmd run test:e2e
 ```
 
 On macOS/Linux use `.venv/bin/python` and `npm` instead of `npm.cmd`. The end-to-end tests start their own backend (LOCAL mode, separate `e2e.db`) and frontend. GitHub Actions runs the backend and frontend checks on every push (`.github/workflows/ci.yml`).
+
+Measured performance (offline speech recognition speed and accuracy, API and agent response times, start-up and CI times) and what each technology contributes are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `scripts/benchmark.py` repeats the measurements.
 
 ---
 
