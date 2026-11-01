@@ -924,6 +924,8 @@ def test_verified_mock_generates_its_performance_report(monkeypatch):
         assert released.status_code == 200, released.text
         after = client.get(f"/api/mock-exams/{held['id']}", headers=headers).json()
         assert after["result"]["state"] == "RELEASED" and after["report_id"]
+        memories = [m["text"] for m in client.get("/api/tutor/memory", headers=headers).json()]
+        assert any(f"Mock exam #{held['id']}" in text for text in memories)  # progress and notebooks are recorded after the teacher's release too
 
 
 def test_report_breaks_down_every_section():
@@ -1066,6 +1068,59 @@ def test_plan_update_notice_survives_any_marking_path():
         view = client.get(f"/api/mock-exams/{mock['id']}", headers=headers).json()
         assert view["status"] == "SUBMITTED" and view["adaptation"]["outcome"] == "PROPOSED" and view["adaptation"]["plan_id"]
         assert client.get("/api/mock-exams", headers=headers).json()[0]["adaptation"]["plan_id"] == view["adaptation"]["plan_id"]
+
+
+def test_review_fixes_for_speaking_sessions_lock_and_double_marking():
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select, func
+    from backend.db import SessionLocal
+    from backend.models import MockExam, SpeakingSession, ResultPackage, User
+    from backend.main import grade_mock
+    with TestClient(app) as client:
+        headers = auth(client, "review.fixes@example.com")
+        active_plan(client, headers)
+        practise_once(client, headers)
+        mock = client.post("/api/mock-exams", headers=headers).json()
+        # A speaking session left open (page reloaded) neither blocks the written test nor keeps things locked.
+        assert client.post("/api/speaking/sessions", headers=headers, json={"mock_id": mock["id"]}).status_code == 200
+        with SessionLocal() as db:
+            for left in db.scalars(select(SpeakingSession).where(SpeakingSession.mock_id == mock["id"])):
+                left.created_at = datetime.now(timezone.utc) - timedelta(hours=1)
+            db.commit()
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 200
+        # The speaking test can be restarted after a reload, but taken only once.
+        speak_mock(client, headers, mock["id"])
+        assert client.post("/api/speaking/sessions", headers=headers, json={"mock_id": mock["id"]}).status_code == 409
+        # The lock follows the clock: Listening ran out with no request, Reading is running, so it is still locked.
+        assert client.post(f"/api/mock-exams/{mock['id']}/written/start", headers=headers).status_code == 200
+        with SessionLocal() as db:
+            row = db.get(MockExam, mock["id"])
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current_started": (datetime.now(timezone.utc) - timedelta(minutes=18)).isoformat()}}
+            db.commit()
+            assert row.sections["timing"]["current"] == "listening"  # nothing has moved the stored clock yet
+        assert client.get("/api/dictionary?word=resilient", headers=headers).status_code == 423
+        # Two requests marking the same mock produce one result.
+        with SessionLocal() as db:
+            row, learner = db.get(MockExam, mock["id"]), db.scalar(select(User).where(User.email == "review.fixes@example.com"))
+            row.sections = {**row.sections, "timing": {**row.sections["timing"], "current": None, "closed": ["listening", "reading", "writing"]}}
+            db.commit()
+            before = db.scalar(select(func.count()).select_from(ResultPackage).where(ResultPackage.kind == "mock_exam", ResultPackage.user_id == learner.id))
+            first, second = grade_mock(db, row, learner), grade_mock(db, row, learner)
+            after = db.scalar(select(func.count()).select_from(ResultPackage).where(ResultPackage.kind == "mock_exam", ResultPackage.user_id == learner.id))
+            assert after - before == 1 and first["status"] == second["status"] == "SUBMITTED"
+
+
+def test_grammar_rule_ignores_objects_and_offline_model_failure_falls_back(monkeypatch):
+    from backend.scoring import find_errors
+    from backend import speech
+    from backend.config import settings
+    assert not [e for e in find_errors("The advice I give you is useful. The teacher who helps students is kind.") if "plural subject" in e["issue"]]
+    assert any("plural subject" in e["issue"] for e in find_errors("Most students is busy and they works hard."))
+    monkeypatch.setattr(settings(), "local_stt", True)
+    monkeypatch.setattr(speech, "_local_model", lambda: (_ for _ in ()).throw(OSError("model files missing")))
+    speech._safe(speech._local_model)  # the background warm-up fails
+    assert speech.local_stt_available() is False  # so the browser's own recognition is offered instead
+    monkeypatch.setattr(speech, "_load_failed_at", None)
 
 
 def test_sign_in_lasts_seven_days():

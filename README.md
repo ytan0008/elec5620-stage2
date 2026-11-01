@@ -251,7 +251,7 @@ Key rules:
 - **Answer keys stay on the server** until a test is submitted.
 - **Privacy.** Account identity is not sent to the model; requests contain only exam goals, learning text and scores.
 
-Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`, `langchain-core`), Pydantic, React 19, TypeScript, Vite, Tailwind CSS, Recharts, Playwright, Docker Compose with nginx.
+Stack: FastAPI, SQLAlchemy 2, Alembic, LangGraph, LangChain (`langchain-openai`, `langchain-core`), Pydantic, faster-whisper (offline speech recognition), React 19, TypeScript, Vite, Tailwind CSS, Recharts, Playwright, Docker Compose with nginx, GitHub Actions. [docs/PERFORMANCE.md](docs/PERFORMANCE.md) lists what each one contributes, with measurements.
 
 ### Stage 1 design → code
 
@@ -370,7 +370,7 @@ All settings live in `.env`; `.env.example` lists every one of them with default
 ## 11. Testing
 
 ```powershell
-# Backend: 48 tests (workflows, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock)
+# Backend: 76 tests (workflows, alternative flows of UC3-UC9, quality gate, plan adaptation (UC7), instructor review (UC8), agents' memory and tools, notebooks, console, exam lock, offline speech)
 .\.venv\Scripts\python -m pytest tests -q
 
 # Frontend type-check and production build
@@ -382,6 +382,8 @@ npm.cmd run test:e2e
 ```
 
 On macOS/Linux use `.venv/bin/python` and `npm` instead of `npm.cmd`. The end-to-end tests start their own backend (LOCAL mode, separate `e2e.db`) and frontend. GitHub Actions runs the backend and frontend checks on every push (`.github/workflows/ci.yml`).
+
+Measured performance (offline speech recognition speed and accuracy, API and agent response times, start-up and CI times) and what each technology contributes are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md); `scripts/benchmark.py` repeats the measurements.
 
 ---
 
@@ -455,5 +457,14 @@ KAN-3 #comment Examiner now asks follow-ups #time 2h #done
 ## 15. Credits and licences
 
 - Group 3, ELEC5620 (Wednesday 09–11): Naratorn Pisedtasalasai, Menglu Lin, Yuxuan Tang, Mohamed Azim, Suhani Saha.
+- **Team and contributions.** The group agreed an equal contribution (20% each on every assessment criterion). Each member's areas follow their Jira issues (project KAN); the full statement with every completed issue is in [docs/CONTRIBUTION_STATEMENT.md](docs/CONTRIBUTION_STATEMENT.md).
+
+  | Member | Areas (Jira) |
+  |---|---|
+  | Menglu Lin | UC1 registration and profile, UC2 learning plan, onboarding assistant, learning portrait, account recovery, listening practice, teacher developer console, pixel-art interface |
+  | Suhani Saha | UC3 speaking practice, UC4 writing practice (including 5a and 6a), reading practice, anomaly detection and problem reports, Docker deployment |
+  | Yuxuan Tang | UC5 mock examination, UC6 performance report, Assessment & Analytics agent, AI Tutor memory, knowledge graph, question bank, offline speech recognition, automated tests and CI |
+  | Mohamed Azim Mohamed Isny | UC7 adapted learning plan, UC8 instructor review, notebooks, per-agent memory and tools, README and Canvas package |
+  | Naratorn Pisedtasalasai | UC9 output quality, UC10 study materials, agent classes, test-mode word lock, cloud model configuration, retry flows, use-case checks, demo deployment |
 - Offline dictionary: a 43,000-entry subset of [ECDICT](https://github.com/skywind3000/ECDICT), MIT licence (`backend/data/ECDICT-LICENSE`).
 - Pixel fonts: Pixelify Sans, Press Start 2P and VT323 (Google Fonts, SIL Open Font License).
