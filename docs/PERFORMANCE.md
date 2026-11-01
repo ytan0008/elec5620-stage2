@@ -13,7 +13,7 @@ Measured on 1 November 2026 on one laptop (Intel Core i9-14900HX, 24 GB RAM, Win
 | 5 | **Local AI model: offline Whisper speech recognition** (faster-whisper `base.en`, int8 on the CPU) | `backend/speech.py` | Spoken answers are recognised on our own server, without the browser's online service or a cloud key, so speaking practice works offline and recordings stay private | Speed and accuracy tables below |
 | 6 | **Microphone devices in the browser** (MediaRecorder, Web Audio level metering, Web Speech API) | `frontend/src/voice.ts`, `exam/SpeakingStudio.tsx` | Hands-free spoken tests: the answer is sent after a pause, with a live microphone level and session recording for replay | Checked in a real browser with a fake microphone (Playwright) |
 | 7 | **Docker Compose + nginx** | `compose.yaml`, `Dockerfile.*` | One command builds and runs the whole system; the speech model is built into the image so the first recognition needs no download | Start-up and first-recognition figures below |
-| 8 | **CI/CD: GitHub Actions + Playwright end-to-end tests, linked to Jira** | `.github/workflows/ci.yml`, `frontend/e2e/` | Every push runs 76 backend tests, the frontend build and 3 browser tests; branch, commit and pull request names carry Jira keys, so Jira shows the code for each story | CI timings below |
+| 8 | **CI/CD: GitHub Actions + Playwright end-to-end tests, linked to Jira** | `.github/workflows/ci.yml`, `frontend/e2e/` | Every push runs the backend tests (105 on 1 November), the frontend build and 3 browser tests; branch, commit and pull request names carry Jira keys, so Jira shows the code for each story | CI timings below |
 
 ## Offline speech recognition
 
