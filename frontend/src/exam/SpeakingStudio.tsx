@@ -194,6 +194,29 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
     catch (e) { setThinking(false); notify((e as Error).message, 'error') }
   }
 
+  // End an active test without requesting assessment; the backend records it as INCOMPLETE.
+  const endIncomplete = async () => {
+    const view = sessionRef.current
+    if (!view || view.status !== 'ACTIVE') return
+    stopListening()
+    stopLevel.current?.(); stopLevel.current = null
+    window.clearTimeout(silenceTimer.current); window.clearInterval(tickTimer.current)
+    stopSpeaking()
+    if (sttRecorder.current) { void sttRecorder.current.stop(); sttRecorder.current = null }
+    if (recorder.current) { void recorder.current.stop(); recorder.current = null }
+    setThinking(true)
+    try {
+      const ended = await post<SpeakingView>(`/speaking/sessions/${view.id}/incomplete`)
+      apply(ended)
+      setPrep(false)
+      setCaption('')
+      setTyped('')
+      notify('Speaking session saved as incomplete.')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally { setThinking(false) }
+  }
+
   const finish = async () => {
     const view = sessionRef.current
     if (!view) return
@@ -248,6 +271,7 @@ export default function SpeakingStudio({ notify, mockId, questionId, onSaved, on
           : <button className="btn-cyan" disabled={aiSpeaking || thinking} onClick={startListening}><Mic size={17} /> Answer</button>)}
         {!mockId && lastExaminer && !hideText(lastExaminer) && <button className="btn-secondary" disabled={aiSpeaking || listening} onClick={() => speak(lastExaminer.text, persona, { force: true })}><Volume2 size={16} /> Repeat question</button>}
         <button className="btn-ghost justify-center" onClick={toggleHandsFree}>{handsFree ? <Mic size={14} /> : <MicOff size={14} />} Hands-free {handsFree ? 'on' : 'off'}</button>
+        <button className="btn-danger justify-center" disabled={thinking} onClick={() => void endIncomplete()}><Square size={16} /> End session</button>
       </div>}
       {session.status === 'FINISHED' && !result && !session.saved_to_mock && <button className="btn-primary" disabled={thinking} onClick={finish}>Get my feedback</button>}
       {(result || session.saved_to_mock) && !mockId && <button className="btn-sun" onClick={() => { setSession(null); sessionRef.current = null; setResult(null) }}><RotateCcw size={16} /> New test</button>}
